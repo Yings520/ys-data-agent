@@ -1,0 +1,24 @@
+[package]
+name = "ysda"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+reqwest = { version = "0.13", features = ["json"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlparser = "0.62"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[[bin]]
+name = "ysda"
+path = "src/main.rs"

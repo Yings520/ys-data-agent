@@ -1,0 +1,4 @@
+/target
+/.ysda/
+/.env
+/examples/demo.db
