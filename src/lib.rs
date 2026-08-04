@@ -8,5 +8,6 @@ pub mod policy;
 pub mod schema;
 pub mod sqlite;
 
+pub mod agent;
 pub mod output;
 pub mod trace;
