@@ -8,7 +8,7 @@
 
 **YS Data Agent** is a safe, observable Data Query Agent written in Rust under the **YS Data** personal technology brand. It inspects a SQLite schema, asks an OpenAI-compatible model for a structured SQL candidate, validates the SQL AST, executes it through a read-only connection, renders the result, and records a local trace.
 
-This project is an independent implementation inspired by the product ideas in [Datus](https://github.com/Datus-ai/datus-agent). It does not copy or translate Datus source code.
+This project is an independent implementation inspired by the product ideas in [Datus](https://github.com/Datus-ai/datus-agent).
 
 ## Why this project exists
 

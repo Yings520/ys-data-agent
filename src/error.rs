@@ -49,9 +49,9 @@ impl AppError {
             Self::SchemaInspection(_) => "SchemaError",
             Self::LlmRequest(_) => "LlmError",
             Self::InvalidModelResponse(_) => "ModelError",
-            Self::SqlParse(_) => "SqlError",
-            Self::UnsafeSql(_) => "SqlError",
-            Self::SqlExecution(_) => "SqlError",
+            Self::SqlParse(_) => "SqlParseError",
+            Self::UnsafeSql(_) => "UnsafeSqlError",
+            Self::SqlExecution(_) => "SqlExecutionError",
             Self::Trace(_) => "TraceError",
             Self::AgentRunFailed { .. } => "AgentRunError",
         }
