@@ -84,4 +84,4 @@ Six repeatable manual questions are available in `examples/questions.txt`.
 - v0.5: metrics and semantic context
 - v0.6: YS Data Agent runtime primitives
 - v1.0: Query, Analysis, Engineering, and DataOps agents with policy-controlled collaboration
-`
+
