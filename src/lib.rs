@@ -9,5 +9,6 @@ pub mod schema;
 pub mod sqlite;
 
 pub mod agent;
+pub mod cli;
 pub mod output;
 pub mod trace;
