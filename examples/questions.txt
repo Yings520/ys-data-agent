@@ -1,0 +1,6 @@
+Which customers have the highest total order amount?
+What is total sales by region?
+How many orders did each customer place?
+What is the average order amount?
+Which APAC customers have orders and what is their total amount?
+Show daily sales in July 2026 ordered by date.
