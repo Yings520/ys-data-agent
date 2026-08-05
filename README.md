@@ -1,5 +1,11 @@
 # YS Data Agent
 
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Website](https://img.shields.io/badge/website-ys--data-orange)](https://github.com/Yings520/ys-data-agent)
+[![Docs](https://img.shields.io/badge/docs-README-green)](https://github.com/Yings520/ys-data-agent#readme)
+[![Quick Start](https://img.shields.io/badge/quick%20start-%F0%9F%9A%80-brightgreen)](https://github.com/Yings520/ys-data-agent#build-and-test)
+[![Release Notes](https://img.shields.io/badge/release-notes-lightgrey)](https://github.com/Yings520/ys-data-agent/releases)
+
 **YS Data Agent** is a safe, observable Data Query Agent written in Rust under the **YS Data** personal technology brand. It inspects a SQLite schema, asks an OpenAI-compatible model for a structured SQL candidate, validates the SQL AST, executes it through a read-only connection, renders the result, and records a local trace.
 
 This project is an independent implementation inspired by the product ideas in [Datus](https://github.com/Datus-ai/datus-agent). It does not copy or translate Datus source code.
@@ -84,4 +90,3 @@ Six repeatable manual questions are available in `examples/questions.txt`.
 - v0.5: metrics and semantic context
 - v0.6: YS Data Agent runtime primitives
 - v1.0: Query, Analysis, Engineering, and DataOps agents with policy-controlled collaboration
-
