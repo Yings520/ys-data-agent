@@ -74,7 +74,7 @@ YS Data Agent 是现有数据平台之上的控制与智能层，不重新实现
 
 ~~~text
 ┌──────────────────────────────── Interfaces ────────────────────────────────┐
-│ Claude Code / OpenCode 风格 TUI │ CLI Commands │ Web/API │ Event Sources │
+│ Claude Code / OpenCode style TUI │ CLI Commands │ Web/API │ Event Sources │
 └──────────────────────────────────────┬───────────────────────────────────────┘
                                        │
                               AgentService API
