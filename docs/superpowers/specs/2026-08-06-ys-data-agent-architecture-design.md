@@ -1,7 +1,7 @@
 # YS Data Agent 完整架构设计草案
 
 **日期：** 2026-08-06  
-**状态：** 已完成产品与架构讨论，作为 v0.2 规划基线  
+**状态：** 已按 2026-08-07 三角色 Review 修订，作为 v0.2 产品与架构基线  
 **替代范围：** 本文扩展并修正 2026-08-02 v0.1 设计中的长期架构；v0.1 文档继续作为已实现 Demo 的历史记录
 
 ---
@@ -14,11 +14,15 @@
 
 ## 2. 产品定位
 
-YS Data Agent 是一个由 Data Engineer 拥有和治理的 full-stack AI data team，面向没有预算组建完整数据团队的小型或精益组织。
+YS Data Agent 是一个由 Data Engineer 拥有和治理的 full-stack AI data team，面向没有预算组建完整数据团队的中小型公司。
 
 它的核心价值不是生成一段 SQL 或代码，而是：
 
 > 在用户已有的数据栈上，端到端完成、验证并交付可审计的数据工作结果，放大一名资深 Data Engineer 的能力。
+
+“没有完整数据团队”不等于“没有 Data Engineer”。产品成立的前提是客户至少有一名能够承担数据源接入、指标口径、权限和结果治理责任的 Data Engineer 或技术型 Data Owner。
+
+`full-stack AI data team` 是 v1.0 的长期定位。任何 v0.x 版本必须同时声明当前直接用户、前置条件、已启用 Workflow 和明确不支持的任务，不能用长期定位暗示尚未交付的能力。
 
 长期用户与能力如下：
 
@@ -28,6 +32,24 @@ YS Data Agent 是一个由 Data Engineer 拥有和治理的 full-stack AI data t
 | 数据分析师 | 指标拆解、趋势、异常和归因分析 | 只读；可以提交带证据的 ChangeRequest |
 | Data Engineer | ETL/ELT 开发、调试、维护和 DataOps | 可以在隔离环境准备变更；Merge、Deploy 和生产写入继续受策略控制 |
 | Data/ML Engineer | 数据清洗、特征定义、样本构建和质量验证 | 仅在授权数据域内工作；模型训练与 MLOps 不属于早期范围 |
+
+### 2.1 v0.2 首个用户与承诺
+
+v0.2 的直接用户是 Data Engineer 和能够理解 SQL、数据口径与权限边界的技术型数据分析师。产品或业务人员在 v0.2 主要是 QueryArtifact 的间接消费者，不是本地 TUI 的主要操作者。
+
+适合 v0.2 Pilot 的 Workspace 需要满足：
+
+- 已有可查询的 SQLite 或 Postgres 数据源；
+- 有可验证的最小权限只读身份；
+- 有人负责确认时区、新鲜度规则、敏感数据策略和查询预算；
+- 指标查询已有 Active Metric Contract；
+- dbt manifest 可选；没有 dbt 时仍可使用 ObservedSchema，但可用 Context 较少。
+
+v0.2 的产品承诺是：
+
+> 对受支持的只读问题，完成受治理的上下文解析、安全执行、确定性验证和可审计交付；无法可信回答时明确澄清、警告或拒绝。
+
+v0.2 不承诺归因分析、代码修改、Pipeline 恢复、业务用户自助 Web 入口或完整 AI data team 能力。
 
 ## 3. 五类任务产物
 
@@ -56,6 +78,20 @@ YS Data Agent 是现有数据平台之上的控制与智能层，不重新实现
 - v0.x 阶段的模型训练和完整 MLOps。
 
 系统可以在本地使用 SQLite、DuckDB、Python、Polars 或沙箱执行轻量任务，但重计算和长任务应委托给现有 Warehouse、dbt、Spark 或 Orchestrator。
+
+### 4.1 v0.2 Query 产品边界
+
+v0.2 只接受三类 QueryIntent：
+
+| QueryIntent | 目标 | 语义状态 | 完成要求 |
+|---|---|---|---|
+| GovernedMetric | 查询 Active Metric Contract 定义的指标 | Confirmed | Metric 版本、维度、时间范围、来源和新鲜度可验证 |
+| AdHocRead | 执行不改变数据的受限事实查询 | Inferred | 明确假设、来源、范围和只读 Policy 结果，不伪装成正式指标 |
+| Metadata | 查询 Schema、Owner、能力或新鲜度等元数据 | Observed | 结果来自授权 Connector 或可验证的 Context Evidence |
+
+归因、趋势解释和“为什么”类任务属于 Analysis。代码或数据修改属于 Build/Change。任务重跑、恢复和生产诊断属于 Operate。
+
+v0.2 遇到未实现能力时返回 `UnsupportedCapability`，说明当前边界、已获得的 Evidence 和对应后续 Workflow。它不得进入不存在的 Workflow、创建假的 ChangeRequest，或用普通 Query 冒充完成任务。
 
 ## 5. 架构原则
 
@@ -218,6 +254,8 @@ Step 是一次模型决策或确定性 Workflow 动作。ToolCall 是 Step 提�
 Artifact 是 Task 的可复用、可审计产物。至少包括：
 
 - QueryArtifact；
+- QueryPlan；
+- QueryPreflight；
 - VerificationReport；
 - AnalysisReport；
 - DashboardArtifact；
@@ -248,7 +286,11 @@ Data Engineer 可以使用手动 Mode Override。普通业务用户不显示 Bui
 
 ### 8.2 Workflow 切换
 
-如果目标、结果类型和权限边界保持一致，可以在同一个 Task 内切换 Workflow。例如 Query 结果不足以回答原因时，可从 Query 进入 Analysis。
+同一个 Task 内只允许改变当前 Workflow 的阶段、工具策略或执行方案，前提是 Task 目标、主要 Artifact、Completion Contract 和权限边界不变。
+
+跨 Workflow 默认创建子 Task，因为 Workflow 变化通常意味着产物、完成条件或风险边界变化。Query 结果不足以回答“为什么”时，Query Task 交付已有 QueryArtifact，再通过 TaskHandoff 创建 Analysis 子 Task；不得在原 Run 中静默改写验收条件。
+
+v0.2 尚未实现 Analysis、Build/Change、Operate 和 ML Data Prep。Coordinator 对这些请求只返回 `UnsupportedCapability`。结构化 TaskHandoff 和子 Task 自动创建从相应 Workflow 版本开始实现。
 
 如果进入 Build/Change 后产物、权限和风险边界发生变化，则创建子 Task：
 
@@ -316,6 +358,7 @@ Agent Loop 保持显式，不隐藏在通用 Agent Framework 中。
 模型允许提出的动作：
 
 - CallTool；
+- 提交 Workflow-specific typed proposal；v0.2 仅有 ProposeQueryPlan；
 - RequestCapability；
 - RequestClarification；
 - ProposeCompletion。
@@ -334,11 +377,28 @@ ProposeCompletion 只是模型建议。Workflow 使用可编码、可测试的�
 
 ### Query
 
-- SQL 或语义查询已经实际执行；
-- 指标口径与时间范围明确；
-- 数据来源和新鲜度已记录；
+所有 QueryIntent 的共同条件：
+
+- 结果来自实际 Tool 执行或确定性的授权元数据读取；
+- 数据来源、查询范围、PolicyDecision 和敏感级别已记录；
 - QueryVerifier 的硬性检查通过；
-- QueryArtifact 已持久化。
+- VerificationReport 与 QueryArtifact 已持久化。
+
+GovernedMetric 还要求 Active Metric id/version、维度、时间范围和新鲜度状态明确。AdHocRead 必须标记 `semantic_status = inferred` 并披露假设。Metadata 不得伪造 Metric Contract 或业务结论。
+
+### 11.1 澄清、警告与阻断矩阵
+
+Query Workflow 不允许静默猜测影响口径、权限、成本或结果解释的关键条件：
+
+| 情况 | 行为 |
+|---|---|
+| 指标有多个候选、时间范围或时区不明确、关键维度含义不确定 | 必须 RequestClarification，Run 进入 WaitingForInput |
+| AdHoc 语义未经确认、结果为空或截断、数据过期但用户未要求实时 | 可以完成，但 QueryArtifact 必须显示结构化 Warning |
+| Active Contract 与生产实现冲突 | 披露冲突；未获得用户或 Owner 选择时不得声称正式口径正确 |
+| 无授权数据源、非 Active 指标、SQL 不安全、预算或敏感策略超限 | 拒绝执行或阻断完成 |
+| Freshness 无法确认且问题明确要求“当前”“最新”或 SLA 内数据 | 阻断完成或请求用户接受已知限制 |
+
+空结果不得自动解释为业务值为零。系统必须区分 `empty_result`、`all_null_result`、`source_unavailable` 和 `freshness_unknown`。
 
 ### Analysis
 
@@ -434,6 +494,21 @@ ToolOutcome 至少包括：
 
 Runtime 只自动重试相同参数的安全瞬时故障。修改参数后的重试由 Agent Loop 决定。副作用状态不确定时禁止盲目重试。
 
+### 12.4 v0.2 Query 安全契约
+
+只读不是单一布尔标记。v0.2 必须同时执行以下防线：
+
+1. SqlReadOnlyPolicy 只接受单条、受支持方言的 `Statement::Query`；拒绝多语句、控制语句和策略禁止的函数。
+2. Connector 使用数据库侧最小权限身份，并为每次 Postgres 查询开启 read-only transaction。
+3. Workspace Policy 可以限制 Source、Schema、Relation、Column 和敏感级别；模型不能扩大 allowlist。
+4. QueryBudget 明确 max_sql_bytes、statement_timeout、acquire_timeout、max_rows、max_result_bytes、max_concurrency，以及可用时的 max_estimated_cost 或 max_scanned_bytes。
+5. 支持的 Connector 应在执行前使用 EXPLAIN、Dry Run 或平台等价能力做成本预检；不支持预检时必须采用更保守的静态和运行时限制。
+6. 每次远端查询记录 query_tag 和可用的 external_query_id，以支持取消、审计和恢复判断。
+7. Unknown 只读调用不得因“无写副作用”自动视为零风险。超过低成本阈值的重试必须等待用户确认，并生成新的 ToolCallId。
+8. QueryResult 在进入模型、TUI 和 Artifact Store 前执行字段级敏感策略、Preview 限制和结果大小限制。
+
+Policy 拒绝、预算超限、认证失败、查询取消、方言错误、Schema 变化和暂时性网络错误必须使用 typed error category，不依赖字符串匹配。
+
 ## 13. 权限、身份与审批
 
 ### 13.1 能力权限
@@ -480,6 +555,16 @@ DataEngineer 是 Workspace 提供的一组默认授权。
 - 申请人、审批人和实际执行 Principal。
 
 关键字段变化后必须重新审批。
+
+### 13.4 Secret、敏感数据与模型出境
+
+CredentialReference 与 Secret 值必须分离。可序列化的 Core 类型、Event、Artifact、Telemetry、ContextManifest 和 Prompt 只能保存 CredentialReference，不能保存 API Key、密码、Token 或完整 DSN。
+
+Tool Runtime 负责统一脱敏 Tool 参数、Connector 错误和结果 Preview。Tracing 默认禁止记录 Prompt body、QueryResult row 和完整数据库错误。测试必须使用 canary secret 证明这些值不会进入持久化或 Telemetry。
+
+每个 QueryArtifact 和 QueryResult Artifact 必须记录 sensitivity、owner、ACL、retention_policy 和 expires_at。默认本地文件权限仅允许当前用户访问；过期清理由显式命令或受治理的维护流程执行。
+
+Workspace Policy 决定哪些字段可以进入外部 Model Provider。不能发送的字段只允许进入确定性 Tool 与本地 Artifact；模型只获得脱敏摘要。来自 dbt docs、数据库文本和历史 Artifact 的内容一律视为不可信数据，不能覆盖 System 指令或被解释为 Tool 调用。
 
 ## 14. Data Context
 
@@ -575,6 +660,8 @@ Agent Context Lakehouse 中的数据是可重建 Projection。删除该 Store �
 
 Lance 可以作为长期 Agent Context Lakehouse 的物理实现，但不能替代 Runtime State Store、企业 Warehouse、正式语义层或 Artifact Store。
 
+本节是长期候选设计，不是 v0.2 的实现要求。启动 Spike 前应将具体 Dataset、格式版本、Compaction、迁移和恢复策略提取为独立 ADR，并以当时 SDK 与 Eval 结果重新确认，不能直接把本节字段表当作代码生成清单。
+
 Lance 是 Arrow-native 的列式文件与表格式，适合对象存储随机访问、结构化元数据、全文检索和向量检索；LanceDB 在 Lance 之上提供更直接的嵌入式检索能力。Rust 实现初期优先评估 LanceDB Rust SDK，并始终通过 ContextRepository Seam 隔离具体 SDK。参考：[Lance 文件格式](https://lance.org/format/file/)、[Lance 索引格式](https://lance.org/format/index/)和 [LanceDB Quickstart](https://docs.lancedb.com/quickstart)。
 
 建议按照更新模式、检索模式、ACL 和敏感级别拆分 Dataset，而不是建立一张万能 Context 表：
@@ -628,8 +715,9 @@ pub trait ContextRepository {
 
 ContextRepository Interface 包含查询语义、隔离要求、失效规则和错误模式，而不仅是 Rust method。Adapter 规划为：
 
-- FileContextRepository：v0.2 的确定性本地实现；
-- InMemoryContextRepository：测试和 Eval；
+- InMemoryQueryContextProvider：v0.2 测试和 Eval；
+- FileMetricRegistry 与 DbtManifestAdapter：v0.2 的确定性 Query Context Provider；
+- FileContextRepository：出现跨来源同步、失效和通用 Evidence 检索需求后的第一个 Repository 实现；
 - LanceContextRepository：规模和检索 Eval 证明需要后引入；
 - RemoteContextRepository：未来共享 Runtime 可选实现。
 
@@ -646,6 +734,15 @@ Task Intent
 ~~~
 
 ACL 和 Workspace 过滤必须在召回时生效，禁止先跨租户读取候选再在 Prompt 前过滤。易变化或高风险 Evidence 在关键决策前必须通过 Connector 回源验证。ContextPack 只包含任务所需内容，ContextManifest 保留使用、遗漏和版本证据。
+
+Context 有两条不同路径：
+
+1. ContextResolver 只读取已经同步、可重建且通过 ACL 的 Context Projection；
+2. Schema、Freshness、权限和其他易变化事实的实时回源必须经过 Tool Runtime，结果作为当前 Run 的新 Evidence 持久化。
+
+ContextRepository 不得在 `retrieve` 中隐式发起外部 I/O。v0.2 的 Query Context Provider 只支持 exact match、scalar filter 和确定性排序，不提前实现通用 ingest/invalidate Repository；全文、向量、Relation Expansion 与 Rerank 只是长期语义。
+
+所有检索内容都携带 `instruction_trust = untrusted_data`。Context Resolver 和 Prompt Builder 必须保持指令与 Evidence 的结构化分隔，并在 Eval 中覆盖 Context/Prompt Injection 样例。
 
 ## 15. 语义层与 Metric Registry
 
@@ -829,7 +926,7 @@ Runtime Store 保存 Artifact Metadata。Artifact Store 保存大型内容。两
 .ysda/
 ├── runtime.db
 ├── artifacts/
-└── context/       # v0.2 FileContextRepository 的可重建投影
+└── context/       # v0.2 Metric/dbt 等确定性 Query Context 投影
 ~~~
 
 共享模式：
@@ -841,6 +938,16 @@ Postgres Runtime Store
 ~~~
 
 业务数据源、Agent Runtime Store、Artifact Store 和 Agent Context Lakehouse 必须保持独立职责。Metadata 通过 workspace_id、task_id、artifact_id、evidence_id、source_uri 和 content_hash 关联，不通过复制完整业务数据关联。
+
+### 19.4 命令幂等、单写者与 Artifact 原子性
+
+所有会创建 Session、Task、Run 或推进 Run 的 AgentService Command 必须带 command_id。Runtime Store 对 command_id 建立唯一约束，相同命令重放返回原结果，不重复创建 Run 或执行 Tool。
+
+同一 Run 同一时刻只有一个推进者。v0.2 使用 Snapshot version 的 optimistic concurrency 保证单写者；版本冲突方重新加载 Event，不得继续使用旧状态执行外部动作。
+
+Artifact 内容先在目标目录写入临时文件、计算 Hash、fsync 并原子 rename，再在同一 Runtime 事务中提交 ArtifactMetadata、ArtifactCreated Event 和 Snapshot 引用。恢复流程清理无 Metadata 引用的临时文件，并报告有 Metadata 但内容缺失的损坏 Artifact。
+
+Event Subscription 使用单调递增 sequence 作为 cursor。广播丢失或客户端重连时，从持久化 Event 继续读取，不能把内存 Channel 当作权威来源。
 
 ## 20. 可观测性与 Eval
 
@@ -880,6 +987,8 @@ Langfuse、OpenTelemetry 等平台只接收派生 Telemetry，不能成为 Task/
 
 Model、Prompt、Tool、Context Retriever、Workflow 和 Policy 都必须版本化。核心确定性 Eval 退化时禁止发布。
 
+v0.2 Query Eval 必须覆盖 GovernedMetric、AdHocRead、Metadata、歧义澄清、UnsupportedCapability、空/全 Null、过期数据、成本超限、敏感字段、Context Injection、Unknown 重试和中断恢复。每个生产缺陷必须新增回归 case。
+
 ## 21. ModelProvider
 
 Core 定义自己的 ModelRequest、ModelAction、ModelUsage 和 ModelFailure，不暴露具体厂商消息类型。
@@ -891,6 +1000,8 @@ v0.2 实现：
 - ReplayModelProvider。
 
 OpenAI-compatible Adapter 支持配置 base_url、api_key 和 model，并要求 Tool Calling、Tool Call ID、结构化参数和多轮 Tool Result 回传。Provider 不满足能力时，在 Run 启动前拒绝。
+
+“OpenAI-compatible”只表示通过 v0.2 明确测试的协议子集，不表示所有兼容服务都可用。v0.2 禁用并行 Tool Call、Streaming 和 Provider-specific reasoning 参数；Provider Profile 必须声明 context window、Tool Schema 上限和错误语义。未知能力 fail closed。
 
 后续可以新增 AnthropicProvider、GeminiProvider 或 LocalProvider，不修改 Workflow。
 
@@ -907,7 +1018,12 @@ AgentService 是所有入口共用的应用 Interface。TUI/CLI 使用进程内 
 - cancel_run；
 - subscribe_events；
 - get_task；
-- get_artifact。
+- get_artifact；
+- export_artifact。
+
+Command 语义必须唯一：`send_message` 负责创建或继续一个 Task，并以 command_id 幂等地调度至多一个 Run；`start_run` 只用于显式启动已存在且可运行的 Task。重复命令不得创建第二个 Run。
+
+`subscribe_events` 接受持久化 event sequence cursor。`get_artifact` 默认只返回 Metadata 和受 Policy 限制的 Preview，完整内容需要再次进行身份与敏感级别检查。
 
 本地模式：
 
@@ -933,11 +1049,23 @@ v0.2 首个产品入口参考 Claude Code 和 OpenCode：
 - 最近 Task；
 - 可滚动对话与事件区；
 - 固定输入区；
-- 当前 Session、Task、Workflow 和 Run 状态栏；
+- 当前 Task 的用户可见状态；Session、Workflow、Run 和 Step 只在诊断详情显示；
 - Tool Call 折叠展示；
 - 结构化澄清；
 - Task 中断、恢复和切换；
 - Slash Command 与命令面板。
+
+首次启动必须先运行 Workspace Doctor：
+
+1. 检查 Model Provider 能力且不显示 Secret；
+2. 测试数据源连接、数据库侧只读权限和 Connector capability；
+3. 验证 Metric Registry、可选 dbt manifest、时区和 Freshness 配置；
+4. 显示阻断项、警告和具体修复动作；
+5. 提供一条 Fixture 或用户数据源上的首个可信 Query 验证路径。
+
+默认界面只突出任务目标、当前状态、是否等待用户、答案、警告和主要 Artifact。SessionId、RunId、Workflow phase、Step 和完整 Tool Event 放入诊断详情，不能要求普通用户理解内部状态模型。
+
+Query 结果默认按“答案/表格 → 范围与单位 → 新鲜度与警告 → SQL 与 Evidence”的顺序显示。v0.2 至少支持将允许导出的 QueryArtifact 转为 JSON、CSV 或 Markdown；敏感策略禁止导出时必须明确说明原因。
 
 普通用户不在首页选择 Agent。Coordinator 自动识别 Workflow。只有具备权限的 Data Engineer 可以手动 Mode Override。
 
@@ -1008,41 +1136,56 @@ Runtime、Store 和 Adapters 互不直接形成循环依赖，由 apps/ysda 负�
 
 ### 26.1 版本目标
 
-用 Query Workflow 打穿长期公共 Runtime 主干，同时交付可用的 Claude Code/OpenCode 风格 TUI。
+为 Data Engineer 和技术型分析师交付一个本地 Trustworthy Query Pilot，证明“首次配置 → 受治理 Query → 安全执行 → 确定性验证 → 可审计交付 → 中断恢复”的完整闭环。
 
-### 26.2 必须实现
+公共 Runtime 只实现 Query 真正使用的能力。v0.2 的成功不以未来类型数量衡量，而以用户能否更快、更安全地获得可信答案衡量。
+
+### 26.2 首个用户、前置条件与支持场景
+
+直接用户、Workspace 前置条件和产品承诺遵循 §2.1。Pilot 至少覆盖：
+
+- Active Metric 的时间范围与维度查询；
+- 受限 AdHocRead；
+- Schema、Owner 和 Freshness 等 Metadata；
+- 关键歧义澄清、不可支持能力提示和可信拒答；
+- 中断后继续同一个等待中 Run；
+- QueryArtifact 的安全 Preview 与 JSON/CSV/Markdown 导出。
+
+### 26.3 必须实现
 
 v0.2 只实例化 Semantic & Metric、Metadata/Freshness、Query Planning & Verification 和 Artifact Packaging 中 Query 闭环需要的行为。其他 Domain Module 保持为后续演进方向，不预建空壳。
 
 - Cargo Workspace 与四层依赖边界；
-- 本地 AgentService；
-- Session、Task、Run、Step、Event、Snapshot 和 Artifact；
+- First-run Workspace Doctor 与明确的配置诊断；
+- 带 command_id 幂等语义的本地 AgentService；
+- Query 真正使用的 Session、Task、Run、Step、Event、Snapshot 和 Artifact；
 - SQLite Runtime Store 与本地 Artifact Store；
-- Typed Event 和恢复；
-- Harness、Agent Loop 与 Query Workflow；
-- ToolCatalog、ToolView、Tool Runtime 和只读 Policy；
+- Typed Event、单 Run 乐观并发、Artifact 原子提交和恢复；
+- 显式 QueryIntent、QueryPhase、Harness、Agent Loop 和 Completion Gate；
+- Query/Clarification/UnsupportedCapability 的确定性 Coordinator；
+- ToolCatalog、按 QueryPhase 生成的静态 ToolView、Tool Runtime 和 QueryBudget；
+- SQL AST、数据库只读身份、Source ACL、成本/行数/字节/超时与敏感结果防线；
 - OpenAICompatibleProvider、FakeProvider 和 ReplayProvider；
 - SQLite 测试数据源；
 - Postgres 第一个真实数据源；
 - dbt manifest 第一个工程 Context Adapter；
 - 文件型最小 Metric Registry；
-- ContextRepository Interface、InMemoryContextRepository 和 FileContextRepository Adapter；
-- ContextManifest 与预算内 ContextPack；
-- QueryVerifier 和 Query Completion Gate；
-- 结构化 QueryArtifact；
-- TUI 交互、Task 列表、恢复与澄清；
-- Query Eval Dataset 与确定性发布门禁；
-- tracing 基础埋点和 TelemetrySink 接口。
+- 最小 ContextProvider/ContextResolver Seam、ContextManifest 与预算内 ContextPack；
+- GovernedMetric、AdHocRead 和 Metadata 的 QueryVerifier；
+- 带 sensitivity、retention 和安全 Preview 的结构化 QueryArtifact；
+- 聚焦任务、答案、警告和下一步的 TUI；
+- 用户可读错误、Task 恢复、结构化澄清和最小导出；
+- Query Eval Dataset、场景式验收和确定性发布门禁；
+- Secret canary、Context Injection 和敏感数据不进入 Telemetry 的测试；
+- tracing 基础埋点和最小 TelemetrySink 实现。
 
-### 26.3 只定义契约，不在 v0.2 完整实现
+### 26.4 长期概念不进入 v0.2 Rust 类型
 
-- Approval 的 Core 类型与 action_hash；
-- ExecutionHandle 与长任务状态；
-- ChangeRequest 与 TaskHandoff；
-- SemanticProvider 扩展接口；
-- Telemetry 外部 Adapter 接口。
+Approval、action_hash、ExecutionHandle、ChangeRequest、TaskHandoff、通用 SemanticProvider 和生产审批身份仍保留在长期架构中，但 v0.2 不创建对应空 Trait、enum variant、ArtifactKind、Event 或透传 Module。
 
-### 26.4 明确排除
+这些类型在首个真实调用者出现时，依据当时的权限、状态与错误语义设计。v0.2 只保留已经被 Query Runtime 使用的 TelemetrySink。
+
+### 26.5 明确排除
 
 - Analysis、Build/Change、Operate 和 ML Data Prep 完整 Workflow；
 - Web、Mobile、共享 Server 和多用户认证；
@@ -1055,62 +1198,105 @@ v0.2 只实例化 Semantic & Metric、Metadata/Freshness、Query Planning & Veri
 - Dashboard 生成；
 - 多种非 OpenAI 协议 Provider。
 
-### 26.5 v0.2 可信查询闭环
+### 26.6 v0.2 首次使用与可信查询闭环
 
 ~~~text
-用户在 TUI 输入问题
+ysda doctor 检查 Model、Connector、只读权限、Metric、dbt 和 Freshness
+→ 用户在 TUI 输入问题
 → AgentService 创建或继续 Task
-→ Coordinator 选择 Query Workflow
-→ Resolver 获取 Metric、dbt 和 Schema Context
+→ Coordinator 分类为 Query、Clarification 或 UnsupportedCapability
+→ QueryIntent 分类与关键歧义检查
+→ Resolver 读取已有 Metric/dbt Projection
 → Harness 生成 ToolView 与 ContextManifest
-→ Model 提出 ToolCall
-→ Tool Runtime 校验并执行
-→ QueryVerifier 检查口径、范围、来源和新鲜度
+→ Model 提出受当前 QueryPhase 允许的 ToolCall
+→ 实时 Schema/Freshness 通过 Tool Runtime 回源
+→ SQL Policy、QueryBudget 和敏感策略 Preflight
+→ Connector 安全执行
+→ QueryVerifier 检查口径、范围、来源、新鲜度、权限和结果
 → Completion Gate
 → QueryArtifact
-→ TUI 渲染答案、SQL、证据和警告
+→ TUI 渲染答案、范围、警告、SQL 和 Evidence
+→ 按 Policy 导出 JSON、CSV 或 Markdown
 ~~~
 
-### 26.6 v0.2 恢复边界
+### 26.7 Query 状态机
 
-v0.2 支持在持久化 Step 之间恢复，以及 WaitingForInput 后恢复。进程在外部 SQL 正在执行时崩溃，该 ToolCall 标记为 Unknown；由于 v0.2 只允许只读查询，可以在用户恢复 Run 时创建新的 ToolCall 安全重试。
+~~~text
+Clarify
+→ ClassifyIntent
+→ ResolveContext
+→ Plan
+→ ValidateAndPreflight
+→ Execute
+→ Verify
+→ Package
+→ ReadyToComplete
+~~~
+
+每个 QueryPhase 必须声明 typed 输入/输出、允许的转换、ToolView、可修复错误、澄清条件和进入下一阶段所需 Evidence。模型不能跳过 ValidateAndPreflight、Execute 或 Verify。
+
+### 26.8 v0.2 恢复边界
+
+v0.2 支持在持久化 Step 之间恢复，以及 WaitingForInput 后恢复。进程在外部 SQL 执行时崩溃，该 ToolCall 标记为 Unknown。
+
+恢复后只有低成本、参数相同且无远端 query_id 可核对的查询可以在显式 resume 后创建新 ToolCall。高成本查询、已有 remote query_id 或成本未知的调用必须先 Reconcile、取消或请求用户确认。
 
 精确恢复远端长任务、Webhook、Reconciler 和后台 Worker 留到 Build/Operate 阶段。
 
-### 26.7 v0.2 验收标准
+### 26.9 v0.2 验收标准
 
-1. 运行 ysda 进入全屏交互式 TUI。
-2. TUI 展示 Workspace、Model、数据连接、权限、Session 和当前 Task。
-3. 用户可以对 SQLite 和 Postgres 执行只读 Query。
-4. 注册指标查询使用 Active Metric Contract，并展示版本。
-5. dbt manifest、Schema 和 Freshness 通过 Context Tool 按需获取。
-6. 模型只看到当前 Step 的最小 ToolView。
-7. Query 失败可以在预算内由 Agent Loop 修复，不依赖字符串错误判断。
-8. SQL、结果、来源、时间范围、新鲜度和 VerificationReport 进入 QueryArtifact。
-9. 关闭并重新打开 TUI 后，可以恢复未完成 Task。
-10. /new 创建新 Session，不取消 Task。
-11. Runtime Event 与 Telemetry 分离，观测后端不可用不影响任务状态。
-12. Fake/Replay Provider 可以无网络运行核心测试。
-13. Query deterministic eval 全部通过后才允许发布。
-14. cargo fmt、cargo clippy --all-targets --all-features -- -D warnings 和 cargo test --workspace 全部通过。
+1. `ysda doctor` 能从空 Workspace 检查配置，并给出阻断项、警告和修复动作。
+2. 运行 `ysda` 进入 TUI；默认界面不要求用户理解 Session、Run、Step 或 Workflow 内部术语。
+3. 用户可以对 SQLite 和 Postgres 执行 GovernedMetric、AdHocRead 和 Metadata Query。
+4. 未实现的 Analysis、Build、Operate 和 ML Data Prep 请求得到明确 UnsupportedCapability，不假装完成。
+5. Active Metric 查询展示 Contract 版本；Draft 或冲突 Metric 不被静默使用。
+6. 关键时间、时区、指标或维度歧义进入 WaitingForInput；空结果不解释为零。
+7. dbt Projection 由 Resolver 读取；Schema 和 Freshness 实时回源通过 Tool Runtime。
+8. 模型只看到当前 QueryPhase 的最小 ToolView，不能动态解锁 v0.2 之外的能力。
+9. 单语句 AST、数据库 read-only、ACL、timeout、行数、结果字节和成本策略均有拒绝测试。
+10. Secret、敏感行和禁止出境字段不进入 Prompt、Event、Telemetry 或未授权 Preview。
+11. Query 失败可以按 typed error 在预算内修复，不依赖字符串判断。
+12. SQL、参数摘要、结果引用、来源、时间范围、新鲜度、Policy 和 VerificationReport 进入 QueryArtifact。
+13. QueryArtifact 可以在 Policy 允许时导出 JSON、CSV 或 Markdown；截断和敏感限制清晰可见。
+14. 重复 command_id 不创建第二个 Run；同一 Run 的并发推进由版本冲突阻止。
+15. 关闭并重新打开 TUI 后可以恢复 WaitingForInput；高成本 Unknown 查询不会被盲目重试。
+16. `/new` 创建新 Session，不取消 Task；`/quit` 不取消 Run。
+17. Runtime Event 与 Telemetry 分离，观测后端不可用不影响任务状态。
+18. Fake/Replay Provider 可以无网络运行核心测试。
+19. Query deterministic eval、Context Injection、安全和恢复场景全部通过后才允许发布。
+20. `cargo fmt`、`cargo clippy --all-targets --all-features -- -D warnings` 和 `cargo test --workspace` 全部通过。
+
+### 26.10 Pilot 成功指标
+
+v0.2 技术验收通过后，还必须在 Pilot 记录：
+
+- 从首次启动到首个可信答案的时间；
+- 受支持 Query 的 task success rate；
+- 无需人工修改 SQL 的完成率；
+- 正确澄清、可信拒答和错误放行比例；
+- p50/p95 首答时间、Model token 和数据库执行成本；
+- 用户相对手写 SQL 的时间节省；
+- QueryArtifact 的导出、复用与用户纠错次数。
+
+这些指标用于决定下一阶段优先 Analysis、Build/Change 还是共享入口，不能只按架构图顺序推进。
 
 ## 27. 后续演进顺序
 
 ### Agent Context Lakehouse：按条件启用的横向里程碑
 
-LanceContextRepository 不与某个业务 Workflow 版本强绑定。v0.2 之后只有同时出现以下信号，才启动独立 Spike 和正式实现：
+LanceContextRepository 不与某个业务 Workflow 版本强绑定。v0.2 之后只有同时出现以下信号，才启动独立 ADR、Spike 和正式实现：
 
-- FileContextRepository 的 Evidence 规模或检索延迟超出目标；
+- 确定性 Query Context Provider 或后续 FileContextRepository 的 Evidence 规模与检索延迟超出目标；
 - 全文、向量或多模态混合检索在 Eval 中显著优于确定性检索；
 - 已定义 Embedding 版本、增量同步、失效、重建和 Compaction 策略；
 - Workspace、ACL 和 Sensitivity 可以在召回阶段正确隔离；
 - 本地文件系统与对象存储上的版本锁定、崩溃恢复和迁移测试通过。
 
-Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索、重启恢复、索引重建和权限隔离。未达到质量和运维门槛时继续使用 FileContextRepository，不为技术选型本身扩大版本范围。
+Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索、重启恢复、索引重建和权限隔离。未达到质量和运维门槛时继续使用确定性 Provider 或 FileContextRepository，不为技术选型本身扩大版本范围。
 
 ### v0.3：Analysis Workflow
 
-- QueryArtifact 驱动分析；
+- QueryArtifact 通过 TaskHandoff 创建 Analysis 子 Task；
 - 可复现 Analysis Artifact；
 - 图表与 Dashboard Artifact；
 - 证据与假设 Eval。
@@ -1121,15 +1307,16 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 - Git Worktree 沙箱；
 - 原生 dbt/SQL Artifact 修改；
 - 测试、Diff、ImpactReport；
-- action_hash 审批。
+- action_hash 只绑定沙箱内 change.prepare；
+- 单用户本地模式不实现真实多人 Merge、Deploy 或生产审批。
 
 ### v0.5：Operate 与 Durable Execution
 
-- Worker；
-- ExecutionHandle；
-- Webhook 和 Reconciler；
+- 只读诊断、恢复计划和健康验证；
+- Worker、ExecutionHandle、Webhook 和 Reconciler；
 - Airflow/Dagster Adapter；
-- 长任务恢复和健康验证。
+- 长任务恢复；
+- 在共享身份上线前不执行需要多人审批的生产恢复动作。
 
 ### v0.6：共享 Runtime
 
@@ -1137,6 +1324,8 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 - Postgres Runtime Store；
 - Object Storage；
 - 多用户身份、授权和事件入口；
+- 申请人、审批人和执行 Principal 分离；
+- 在外部审批或共享身份支持下启用受治理的 Merge、Deploy 与 production.execute；
 - Web 客户端基础。
 
 ### v0.7：ML Data Prep 与 Python Worker
@@ -1173,6 +1362,9 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 | TUI 与 Runtime 耦合 | TUI 仅通过 AgentService 与 Event Stream |
 | 长任务占用 Loop 和 token | 持久化等待、ExecutionHandle、事件唤醒 |
 | 过早拆分服务与 crate | 模块化单体，按依赖边界演进 |
+| v0.2 基础设施挤压用户价值 | 只实现 Query 实际调用的状态、事件、类型和工具；以 Doctor、可信答案和 Pilot 指标验收 |
+| 只读查询造成资源或数据泄露 | 数据库 read-only、AST、ACL、QueryBudget、敏感策略和成本预检共同防御 |
+| Context 内容诱导模型越权 | Evidence 按 untrusted_data 隔离，Tool Runtime 仍执行独立 Policy |
 
 ## 29. 架构不变量
 
@@ -1186,13 +1378,16 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 6. Agent Runtime Store 不能与用户业务数据混用。
 7. Telemetry 平台不能成为恢复 Task 的权威状态源。
 8. Context Index 不能被当成永远正确的事实源。
-9. 非 Data Engineer 不能获得 change.prepare 能力。
+9. 没有 `change.prepare` capability 的 Principal 不能准备变更；职位名称不能替代能力检查。
 10. CLI、Web 和 Worker 不得各自复制 Agent 执行逻辑。
 11. Lance/LanceDB 不能存储 Task/Run 权威状态，也不能取代 Warehouse、语义层或 Artifact Store。
 12. Context Repository 的具体存储类型不能泄漏到 Agent Loop、Workflow 或领域类型。
 13. Domain Module 不能拥有独立 Agent Loop、Session、Task 生命周期或 Event 体系。
 14. Workflow 不能绕过 Tool Runtime 或 Execution Control Plane 直接调用外部 Adapter。
 15. Eval Runner、Telemetry 后端和 LLM Judge 不能成为在线 Task 状态或完成判断的权威来源。
+16. Secret 不能进入 Prompt、Event、Artifact、Telemetry 或可序列化 Core 类型。
+17. 只读 Tool 不能绕过 QueryBudget、数据范围和敏感策略，也不能仅因 SideEffect::None 被无条件重试。
+18. v0.2 不能为未实现 Workflow 创建假的执行结果、审批或 Handoff。
 
 ## 30. 参考项目的取舍
 
@@ -1218,4 +1413,4 @@ YS Data Agent 的长期形态不是五个独立聊天机器人，而是：
 
 > 一个受治理、可恢复、可评测的 Task-centric Data Agent Runtime，承载多个领域 Workflow，并通过共享 Data Context 和现有数据平台端到端完成数据工作。
 
-v0.2 不追求功能数量。它以 Query 为第一个垂直切片，证明公共 Harness、Tool Runtime、Context、持久化、验证、Eval 和 TUI 可以形成一个可信闭环。
+v0.2 不追求功能数量。它面向 Data Engineer Pilot，以 Query 为第一个垂直切片，证明 Doctor、Harness、Tool Runtime、Context、安全执行、验证、Artifact、恢复、Eval 和 TUI 可以形成一个可信闭环。
