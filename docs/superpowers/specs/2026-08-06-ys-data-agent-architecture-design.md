@@ -73,37 +73,57 @@ YS Data Agent 是现有数据平台之上的控制与智能层，不重新实现
 ## 6. 总体架构
 
 ~~~text
-┌──────────────────────────────── Interfaces ────────────────────────────────┐
-│ Claude Code / OpenCode style TUI │ CLI Commands │ Web/API │ Event Sources │
-└──────────────────────────────────────┬───────────────────────────────────────┘
-                                       │
-                              AgentService API
-                                       │
-┌──────────────────────────── Control Runtime ────────────────────────────────┐
-│ Harness / Run Supervisor                                                   │
-│ ├── Coordinator                                                            │
-│ ├── Workflow State Machines                                                │
-│ ├── Agent Loop                                                             │
-│ ├── Context Assembler                                                      │
-│ ├── Policy / Approval                                                      │
-│ ├── Completion Gates                                                       │
-│ └── Event / Snapshot / Artifact coordination                               │
-└───────────────────────┬──────────────────────────────┬───────────────────────┘
-                        │                              │
-                Tool Runtime                    ModelProvider
-           ToolCatalog → ToolView          OpenAI-compatible first
-                        │
-┌──────────────────── Domain Capabilities ────────────────────────────────────┐
-│ Semantic Service │ Query Service │ Pipeline Service │ Ops Service │ Eval   │
-└───────────────────────┬──────────────────────────────────────────────────────┘
-                        │
-┌──────────────────────── Ports and Adapters ─────────────────────────────────┐
-│ Data Connectors │ dbt/Git Adapters │ Orchestrator Adapters │ Stores        │
-│ SQLite/Postgres │ Airflow/Dagster  │ Spark/Python Workers  │ Telemetry     │
-└───────────────────────┬──────────────────────────────────────────────────────┘
-                        │
-       Warehouse / dbt / Git / Airflow / Dagster / Spark / Object Storage
+┌──────────────────────────── Product Interfaces ─────────────────────────────┐
+│ TUI │ CLI Commands │ Web Client │ HTTP Adapter │ Event Source Adapters     │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │
+                         AgentService Interface
+                                   │
+┌───────────────────────────── Control Runtime ────────────────────────────────┐
+│ Harness / Run Supervisor                                                    │
+│ ├── Coordinator                                                             │
+│ ├── Query │ Analysis │ Build/Change │ Operate │ ML Data Prep Workflows     │
+│ ├── Agent Loop │ Context Resolver │ Policy / Approval                      │
+│ ├── Completion Gates │ Durable Execution                                   │
+│ └── Event / Snapshot / Artifact coordination                                │
+└──────────────┬──────────────────────┬───────────────────────┬────────────────┘
+               │                      │                       │
+       deterministic calls       ModelProvider       model/effectful actions
+               │              OpenAI-compatible first          │
+               │                                              ▼
+               │                                      Tool Runtime
+               │                                ToolCatalog → ToolView
+               │                                              │
+               └──────────────────┐                      Tool Handlers
+                                  ▼                            │
+┌────────────────────────────── Domain Modules ────────────────────────────────┐
+│ Semantic & Metric          │ Metadata / Lineage / Freshness                 │
+│ Query Planning & Verification │ Data Quality & Validation                   │
+│ Artifact / Change / Impact │ Operations Diagnostics / Health                │
+│ Analysis / Data Processing                                                │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │ Ports
+┌──────────────────────────── Ports and Adapters ──────────────────────────────┐
+│ SQL / Catalog / Semantic / Lineage / Artifact / Job / Test Interfaces      │
+│ Warehouse │ dbt/Git │ Airflow/Dagster │ Spark/Python │ Store Adapters      │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │
+        Warehouse / dbt / Git / Airflow / Dagster / Spark / Object Storage
+
+┌────────────────────── Shared Knowledge and Quality Planes ──────────────────┐
+│ Data Context / Memory / ContextRepository / Agent Context Lakehouse        │
+│ Run Events / Telemetry / Eval Records / Eval Runner / Release Gates        │
+└──────────────────────────────────────────────────────────────────────────────┘
 ~~~
+
+架构有两条正交轴：
+
+- Workflow 表达用户目标、阶段、状态转换、Artifact 和完成条件；
+- Domain Module 提供可被多个 Workflow 复用的确定性数据领域规则。
+
+不得按照 Query、Pipeline、Ops 等角色再建立一组拥有自己 Loop 和状态的 Service。它们要么是 Workflow，要么拆成跨 Workflow 复用的深 Domain Module。Eval 是独立质量平面，Data Context 是共享知识平面；二者都不是某一种业务 Workflow 的下游 Service。
+
+Context Resolver 是 Control Runtime 消费 Data Context 的统一入口；Eval Runner 通过版本化 Event、Artifact、ContextManifest 和 EvalRecord 评估系统。共享知识与质量平面不位于 Tool Runtime 的线性调用链中。
 
 ## 7. 核心领域模型
 
@@ -275,7 +295,7 @@ Harness 不负责：
 - 生成 dbt 代码；
 - 判断具体 Pipeline 是否健康。
 
-这些属于 Workflow 和 Domain Service。
+这些属于 Workflow 和 Domain Module。
 
 ## 10. Agent Loop
 
@@ -354,19 +374,23 @@ ProposeCompletion 只是模型建议。Workflow 使用可编码、可测试的�
 ~~~text
 Model-visible Tool
 → Tool Runtime
-→ Domain Service
-→ Connector
-→ Execution Backend
+→ Tool Handler
+→ Domain Module + Port
+→ Adapter / Execution Backend
 → 外部数据平台
+
+Workflow / Completion Gate
+→ deterministic Domain Module
 ~~~
 
 - Tool 表达稳定的领域意图；
 - Tool Runtime 负责参数校验、权限、审批、超时、事件和结果归一化；
-- Domain Service 负责语义、查询、Pipeline 或运维规则；
-- Connector 负责平台协议和方言；
-- Execution Backend 负责实际运行。
+- Tool Handler 把模型可见意图映射为 Domain Module 调用和 Port 操作；
+- Domain Module 负责可编码、可测试的语义、查询、质量、变更、影响和验证规则；
+- Port 表达 Runtime 需要的外部能力，Adapter 负责具体平台协议和方言；
+- Execution Backend 负责实际运行，长任务通过 ExecutionHandle 脱离 Agent Loop。
 
-Connector 默认不直接暴露给模型。
+Workflow 和 Completion Gate 可以直接调用无外部副作用的确定性 Domain Module。模型提出的动作以及任何外部读取、写入、提交和取消必须经过 Tool Runtime 或 Execution Control Plane；Workflow 不得直接调用 Adapter。Port 和 Adapter 默认不直接暴露给模型。
 
 ### 12.2 ToolCatalog 与 ToolView
 
@@ -515,6 +539,114 @@ Agent 不能自动将 Inferred 提升为 Confirmed。数据采样必须受行数
 
 该设计延续 OpenAI 内部 Data Agent 的核心经验：离线聚合与索引组织知识，查询时只检索相关上下文，缺失或易过期信息通过实时工具核实，并控制模型可见工具数量。参考：https://openai.com/index/inside-our-in-house-data-agent/
 
+### 14.4 物理存储职责
+
+Data Context 是逻辑知识与检索平面，不意味着所有相关数据进入同一个物理 Store。长期存储拓扑必须拆开控制状态、权威事实、检索投影和大型 Artifact：
+
+| 数据类型 | 权威来源 | 物理存储 | Lance 的角色 |
+|---|---|---|---|
+| Task、Run、Event、Approval、Checkpoint | Agent Runtime | 本地 SQLite；共享 Runtime 使用 PostgreSQL | 不使用 |
+| 业务事实数据 | Warehouse、Lakehouse、Database | 用户现有数据平台 | 不复制，只保存引用、摘要和必要样本 |
+| 正式指标与语义契约 | 外部语义层、Git、Metric Registry | Git 或事务数据库 | 只保存可重建的检索投影 |
+| Schema、血缘、dbt 元数据和文档 | dbt、Git、Catalog、Database | Agent Context Lakehouse | 主要存储对象 |
+| 已治理的 Task 经验和运维案例 | Runtime Event 与 Artifact | Agent Context Lakehouse | 主要存储对象 |
+| SQL 结果、日志、报表、Diff 和大文件 | Artifact Store | 本地文件系统或对象存储 | 仅保存引用、摘要、元数据和可选 Embedding |
+| Trace、Token、Latency 和 Tool Call Telemetry | Runtime 派生记录 | OpenTelemetry、Langfuse 等观测后端 | 不使用 |
+| Eval 数据集 | Git、Artifact 和人工标注 | Git 或对象存储 | 可选检索投影，不是唯一副本 |
+
+因此系统包含三个相互独立的持久化职责：
+
+~~~text
+Runtime State Store                 Agent Context Lakehouse
+SQLite / PostgreSQL                 Lance / LanceDB（后续 Adapter）
+Task / Run / Event                  Context Evidence / Relations
+Approval / Checkpoint               Task Episodes / Procedural Memory
+          │                                      │
+          └────────── Artifact Reference ────────┘
+                              │
+                        Artifact Store
+                   Filesystem / S3 / MinIO
+              Result / Log / Report / Diff / File
+~~~
+
+Agent Context Lakehouse 中的数据是可重建 Projection。删除该 Store 不应丢失 Task 的权威执行状态、企业业务事实或正式语义契约；系统应能从权威来源重新同步和构建索引。
+
+### 14.5 Lance Agent Context Lakehouse
+
+Lance 可以作为长期 Agent Context Lakehouse 的物理实现，但不能替代 Runtime State Store、企业 Warehouse、正式语义层或 Artifact Store。
+
+Lance 是 Arrow-native 的列式文件与表格式，适合对象存储随机访问、结构化元数据、全文检索和向量检索；LanceDB 在 Lance 之上提供更直接的嵌入式检索能力。Rust 实现初期优先评估 LanceDB Rust SDK，并始终通过 ContextRepository Seam 隔离具体 SDK。参考：[Lance 文件格式](https://lance.org/format/file/)、[Lance 索引格式](https://lance.org/format/index/)和 [LanceDB Quickstart](https://docs.lancedb.com/quickstart)。
+
+建议按照更新模式、检索模式、ACL 和敏感级别拆分 Dataset，而不是建立一张万能 Context 表：
+
+| Dataset | 内容 | 关键字段 |
+|---|---|---|
+| context_evidence | Schema、Metric 投影、dbt 节点、代码与文档片段、质量规则和确认结论 | evidence_id、workspace_id、entity_type、source_uri、source_version、observed_at、knowledge_state、content_hash、ACL、sensitivity、embedding_version |
+| context_relations | Evidence 之间可追溯的轻量关系 | from_id、relation_type、to_id、source_version、confidence、evidence_refs |
+| task_episodes | 经压缩、验证并允许复用的历史任务经验 | task_id、task_type、summary、outcome、artifact_refs、evidence_refs、approved_for_reuse |
+| procedural_memory | 已批准的 Runbook、操作 Playbook 和开发惯例 | playbook_id、scope、preconditions、procedure_ref、owner、status、version、evidence_refs |
+| eval_cases | 可选的检索与 Context Eval 投影 | case_id、input_ref、expected_evidence、dataset_version、artifact_refs |
+
+约束如下：
+
+1. 原始对话不能默认进入长期 Memory；只有带 Evidence、Scope 和治理状态的摘要可以成为 Task Episode。
+2. 完整敏感查询结果、大型日志和二进制 Artifact 不进入 Lance Dataset，只存 ArtifactReference、Hash、Preview 和必要索引字段。
+3. 每条 Evidence 必须带 workspace_id、ACL、sensitivity、source_version、observed_at 和 content_hash。
+4. Embedding 必须记录模型、版本和维度；更新模型时建立新索引或显式迁移，不能静默覆盖。
+5. Lance 存储格式必须锁定明确的稳定版本，升级前执行兼容性和恢复测试。官方标记为不稳定的格式版本不得用于生产，参考：[Lance 格式版本说明](https://lance.org/format/file/versioning/)。
+6. Lance 虽然提供 MVCC 和 ACID 表事务，但 Runtime 的高频状态更新、唯一约束、Lease、锁、幂等键和审批状态机仍由 SQLite/PostgreSQL 负责，参考：[Lance Transaction 规范](https://lance.org/format/table/transaction/)。
+7. 索引、摘要和 Relation 全部是可重建 Projection，不能覆盖或反向篡改权威来源。
+
+### 14.6 ContextRepository Seam 与检索流程
+
+Core 定义与存储实现无关的 ContextRepository Interface：
+
+~~~rust
+#[async_trait]
+pub trait ContextRepository {
+    async fn ingest(
+        &self,
+        evidence: Vec<ContextEvidence>,
+    ) -> Result<IngestReport, ContextError>;
+
+    async fn retrieve(
+        &self,
+        query: ContextQuery,
+    ) -> Result<Vec<ContextCandidate>, ContextError>;
+
+    async fn get(
+        &self,
+        id: &EvidenceId,
+    ) -> Result<Option<ContextEvidence>, ContextError>;
+
+    async fn invalidate(
+        &self,
+        source: &SourceRef,
+    ) -> Result<InvalidationReport, ContextError>;
+}
+~~~
+
+ContextRepository Interface 包含查询语义、隔离要求、失效规则和错误模式，而不仅是 Rust method。Adapter 规划为：
+
+- FileContextRepository：v0.2 的确定性本地实现；
+- InMemoryContextRepository：测试和 Eval；
+- LanceContextRepository：规模和检索 Eval 证明需要后引入；
+- RemoteContextRepository：未来共享 Runtime 可选实现。
+
+Agent Loop 不直接调用 ContextRepository，也不能依赖 Lance、Arrow RecordBatch 或 Embedding SDK 类型。ContextResolver 是面向 Harness 的深 Module，负责在这一 Seam 后隐藏检索、去重、关系展开、重排、新鲜度和 token 预算：
+
+~~~text
+Task Intent
+→ Workspace、Identity、Workflow 和当前 Step
+→ ACL、Sensitivity、Entity 和 Freshness 过滤
+→ Scalar + Full-text + Vector 混合召回
+→ Relation Expansion 与 Rerank
+→ Token Budget Selection
+→ ContextPack + ContextManifest
+~~~
+
+ACL 和 Workspace 过滤必须在召回时生效，禁止先跨租户读取候选再在 Prompt 前过滤。易变化或高风险 Evidence 在关键决策前必须通过 Connector 回源验证。ContextPack 只包含任务所需内容，ContextManifest 保留使用、遗漏和版本证据。
+
 ## 15. 语义层与 Metric Registry
 
 YS Data Agent 必须依赖受治理的语义契约，但不要求客户预先部署特定语义产品。
@@ -547,9 +679,39 @@ YS Data Agent 必须依赖受治理的语义契约，但不要求客户预先部
 - Agent 不能替公司决定业务规则；
 - 修改通过 ChangeRequest 和 Build/Change Task 完成。
 
-## 16. Connector 与 Domain Service
+## 16. Domain Modules、Ports 与 Adapters
 
-不定义巨型 DataConnector。使用 capability-based ports：
+### 16.1 Workflow 与 Domain Module 的职责
+
+Workflow 和 Domain Module 不能按照一一对应关系设计：
+
+| 概念 | 拥有什么 | 不拥有什么 |
+|---|---|---|
+| Workflow | Task 阶段、状态转换、所需能力、Artifact 目标和 Completion Contract | 独立 Harness、独立 Event 体系、具体平台 SDK |
+| Domain Module | 可复用领域规则、Typed Input/Result、确定性校验和错误语义 | Session、Task 生命周期、Agent Loop、模型对话 |
+| Tool Handler | 模型可见 ToolIntent 到 Domain Module 与 Port 的受治理映射 | 领域规则副本、长期状态 |
+| Port | Runtime 所需的外部能力及其不变量、错误和性能语义 | 具体厂商协议 |
+| Adapter | 某个平台对 Port 的具体实现 | Workflow 状态和业务完成判断 |
+
+Domain Module 使用删除测试判断是否值得存在：删除后，如果复杂规则会散落到多个 Workflow、Tool Handler 和测试中，它是有深度的 Module；如果删除后只少一层转发，它不应存在。
+
+### 16.2 共享 Domain Modules
+
+| Domain Module | 责任 | 主要调用者 | 明确不负责 |
+|---|---|---|---|
+| Semantic & Metric | 解析、验证、编译和解释 Metric Contract | Query、Analysis、Build/Change | 未经授权发布正式指标 |
+| Metadata / Lineage / Freshness | 规范化 Schema、Owner、血缘和新鲜度 Evidence | 所有 Workflow、Context Resolver | 取代 Catalog 或成为永久事实源 |
+| Query Planning & Verification | 形成查询计划、AST/方言校验、范围与结果验证 | Query、Analysis、Operate、ML Data Prep | 直接持有 Warehouse 连接和执行查询 |
+| Data Quality & Validation | 执行质量规则、泄漏检查和健康判定 | Query、Build/Change、Operate、ML Data Prep | 让 LLM 自己定义并通过硬性规则 |
+| Artifact / Change / Impact | 构建 Typed Artifact、ChangeSet、Diff 和影响分析 | Analysis、Build/Change、Operate | 未经审批 Merge、Deploy 或生产写入 |
+| Operations Diagnostics / Health | 规范化诊断证据、验证恢复计划和执行后健康状态 | Build/Change、Operate、ML Data Prep | 持久化调度 ExecutionHandle 或直接控制外部任务 |
+| Analysis / Data Processing | 可复现的统计、清洗、特征和可视化计算 | Analysis、ML Data Prep | 绕过数据权限或把临时推断发布为契约 |
+
+这些是逻辑 Module，不要求每个 Module 对应独立 crate、进程或网络 Service。v0.2 只实现 Query 垂直切片真正需要的部分，不为未来能力创建空 Trait、空目录或透传 Facade。
+
+### 16.3 Capability-based Ports
+
+不定义巨型 DataConnector。使用 capability-based Ports：
 
 | Port | 责任 |
 |---|---|
@@ -563,7 +725,9 @@ YS Data Agent 必须依赖受治理的语义契约，但不要求客户预先部
 | ArtifactRepository | 读取和提交代码 Artifact |
 | TestRunner | 执行数据或项目测试 |
 
-Adapter 只实现真实支持的能力，并公开 CapabilityDescriptor。Workflow 在规划前即可知道环境支持什么。
+Adapter 只实现真实支持的能力，并公开 CapabilityDescriptor。Workflow 在规划前即可知道环境支持什么。外部 I/O 由 Tool Handler 通过 Port 发起；Domain Module 不依赖具体 Adapter 类型。
+
+### 16.4 原生 Artifact，而非通用 Pipeline DSL
 
 PipelineIntent 可以描述输入、输出、转换、调度、质量和验收目标，但真正产物必须是用户框架的原生代码：
 
@@ -573,6 +737,8 @@ PipelineIntent 可以描述输入、输出、转换、调度、质量和验收�
 - Spark job 与测试。
 
 ## 17. Execution Control Plane
+
+Execution Control Plane 独占长任务的持久化提交、等待、取消、事件唤醒和 Reconcile 责任。Tool Handler 通过 JobController Port 操作外部任务；Operations Diagnostics / Health Domain Module 只处理诊断规则、恢复计划验证和执行后健康判断，不维护另一套执行状态。
 
 长任务返回持久化 ExecutionHandle：
 
@@ -662,7 +828,8 @@ Runtime Store 保存 Artifact Metadata。Artifact Store 保存大型内容。两
 ~~~text
 .ysda/
 ├── runtime.db
-└── artifacts/
+├── artifacts/
+└── context/       # v0.2 FileContextRepository 的可重建投影
 ~~~
 
 共享模式：
@@ -670,11 +837,14 @@ Runtime Store 保存 Artifact Metadata。Artifact Store 保存大型内容。两
 ~~~text
 Postgres Runtime Store
 + Object Storage Artifact Store
++ Agent Context Lakehouse（达到启用条件后使用 Lance/LanceDB）
 ~~~
 
-业务数据源与 Agent Runtime Store 必须分离。
+业务数据源、Agent Runtime Store、Artifact Store 和 Agent Context Lakehouse 必须保持独立职责。Metadata 通过 workspace_id、task_id、artifact_id、evidence_id、source_uri 和 content_hash 关联，不通过复制完整业务数据关联。
 
 ## 20. 可观测性与 Eval
+
+Eval 是独立质量平面，不属于 Domain Module，也不是模型可调用的 Tool。在线 Runtime 负责生成可关联的 Event、Artifact、VerificationReport 和 EvalRecord；离线 Eval Runner 负责数据集执行、版本比较和发布门禁。确定性 Verifier 可以被 Completion Gate 在线调用，但观测平台或 LLM Judge 不能成为 Task 状态和完成判断的权威来源。
 
 ### 20.1 三个数据面
 
@@ -726,7 +896,7 @@ OpenAI-compatible Adapter 支持配置 base_url、api_key 和 model，并要求 
 
 ## 22. AgentService 与产品入口
 
-AgentService 是所有入口共用的应用 API：
+AgentService 是所有入口共用的应用 Interface。TUI/CLI 使用进程内 Adapter，Web、Mobile 和 Event Source 通过 HTTP/Event Adapter 访问同一个 Interface：
 
 - create_session；
 - create_task；
@@ -803,13 +973,13 @@ ys-data-agent/
 ├── Cargo.toml
 ├── crates/
 │   ├── ys-agent-core/
-│   │   └── Task、Run、Event、Tool、Artifact、Policy、Ports
+│   │   └── Task、Run、Event、Tool、Artifact、Policy、Domain Types、Ports
 │   ├── ys-agent-runtime/
-│   │   └── AgentService、Harness、Loop、Workflow、Context、Verifier
+│   │   └── AgentService、Harness、Loop、Workflow、Domain Modules、Context、Verifier
 │   ├── ys-agent-store/
 │   │   └── SQLite/Postgres Runtime Store 与 Artifact Metadata
 │   └── ys-agent-adapters/
-│       └── Model、Data、dbt、Git、Telemetry Adapter
+│       └── Model、Data、dbt、Git、Context Repository、Telemetry Adapter
 ├── apps/
 │   └── ysda/
 │       └── CLI/TUI、配置和依赖装配
@@ -820,7 +990,7 @@ ys-data-agent/
 
 初期仍然可以编译为一个 ysda 可执行文件。Server 和 Worker 在真正需要共享 Runtime 与长任务时再新增。
 
-Crate 拆分依据是稳定依赖边界，不是架构图中出现的名词数量。Memory、Policy、Eval 等在足够复杂前保持为 Runtime 内部模块。
+Crate 拆分依据是稳定依赖边界，不是架构图中出现的名词数量。Domain Module 不等于 crate 或进程。Memory、Policy、Eval 和 Context Resolver 等在足够复杂前保持为 Runtime 内部 Module。File/Lance 等 ContextRepository Adapter 保持在 ys-agent-adapters；只有当某个实现形成独立发布、依赖或测试节奏时，才评估拆出专用 crate。
 
 依赖方向：
 
@@ -842,6 +1012,8 @@ Runtime、Store 和 Adapters 互不直接形成循环依赖，由 apps/ysda 负�
 
 ### 26.2 必须实现
 
+v0.2 只实例化 Semantic & Metric、Metadata/Freshness、Query Planning & Verification 和 Artifact Packaging 中 Query 闭环需要的行为。其他 Domain Module 保持为后续演进方向，不预建空壳。
+
 - Cargo Workspace 与四层依赖边界；
 - 本地 AgentService；
 - Session、Task、Run、Step、Event、Snapshot 和 Artifact；
@@ -854,6 +1026,7 @@ Runtime、Store 和 Adapters 互不直接形成循环依赖，由 apps/ysda 负�
 - Postgres 第一个真实数据源；
 - dbt manifest 第一个工程 Context Adapter；
 - 文件型最小 Metric Registry；
+- ContextRepository Interface、InMemoryContextRepository 和 FileContextRepository Adapter；
 - ContextManifest 与预算内 ContextPack；
 - QueryVerifier 和 Query Completion Gate；
 - 结构化 QueryArtifact；
@@ -877,7 +1050,7 @@ Runtime、Store 和 Adapters 互不直接形成循环依赖，由 apps/ysda 负�
 - Python Worker；
 - 生产写入、Merge 和 Deploy；
 - Langfuse 正式集成；
-- 向量数据库与全量 RAG Pipeline；
+- Lance/LanceDB Adapter、Embedding、向量索引与全量 RAG Pipeline；
 - 完整语义引擎；
 - Dashboard 生成；
 - 多种非 OpenAI 协议 Provider。
@@ -922,6 +1095,18 @@ v0.2 支持在持久化 Step 之间恢复，以及 WaitingForInput 后恢复。�
 14. cargo fmt、cargo clippy --all-targets --all-features -- -D warnings 和 cargo test --workspace 全部通过。
 
 ## 27. 后续演进顺序
+
+### Agent Context Lakehouse：按条件启用的横向里程碑
+
+LanceContextRepository 不与某个业务 Workflow 版本强绑定。v0.2 之后只有同时出现以下信号，才启动独立 Spike 和正式实现：
+
+- FileContextRepository 的 Evidence 规模或检索延迟超出目标；
+- 全文、向量或多模态混合检索在 Eval 中显著优于确定性检索；
+- 已定义 Embedding 版本、增量同步、失效、重建和 Compaction 策略；
+- Workspace、ACL 和 Sensitivity 可以在召回阶段正确隔离；
+- 本地文件系统与对象存储上的版本锁定、崩溃恢复和迁移测试通过。
+
+Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索、重启恢复、索引重建和权限隔离。未达到质量和运维门槛时继续使用 FileContextRepository，不为技术选型本身扩大版本范围。
 
 ### v0.3：Analysis Workflow
 
@@ -974,7 +1159,12 @@ v0.2 支持在持久化 Step 之间恢复，以及 WaitingForInput 后恢复。�
 | 风险 | 应对 |
 |---|---|
 | 五类 Agent 同时开发导致 Runtime 复制 | v0.2 只用 Query 打穿公共主干 |
-| Data Context 变成新 Catalog 项目 | 保持逻辑检索平面，真实系统继续作为权威来源 |
+| Query/Pipeline/Ops Service 与 Workflow 重复 | 按目标组织 Workflow，按跨 Workflow 复用规则组织 Domain Module；Domain Module 不拥有 Loop 和 Task 状态 |
+| 通用 Pipeline 或 Ops Facade 退化成巨型 switch | 统一 Intent、Artifact 和 Verification，平台差异留在 capability-based Adapter |
+| Data Context 变成新 Catalog 或万能数据库 | 保持逻辑检索平面；Lance 只保存可重建 Projection，真实系统继续作为权威来源 |
+| Lance 引入后污染 Core | 只通过 ContextRepository Seam 接入，Core 和 Agent Loop 不暴露 Lance、Arrow 或 Embedding SDK 类型 |
+| 向量检索造成跨租户或敏感信息泄露 | Workspace、ACL 和 Sensitivity 在召回阶段过滤，并加入确定性权限 Eval |
+| Embedding 或 Lance 格式升级破坏历史索引 | 显式记录版本，锁定稳定格式，先重建和兼容性验证再切换 |
 | Metric Registry 演变为完整语义引擎 | 限制在治理与有限查询闭环 |
 | Tool 数量膨胀 | ToolCatalog 与按 Step 生成的 ToolView 分离 |
 | LLM 自己验证自己 | 确定性 Verifier 和 Completion Gate 优先 |
@@ -990,7 +1180,7 @@ v0.2 支持在持久化 Step 之间恢复，以及 WaitingForInput 后恢复。�
 
 1. 普通用户无需选择内部 Agent。
 2. 一个 Workflow 不得拥有独立的 Harness、Policy 或 Event 体系。
-3. 模型不能绕过 Tool Runtime 直接调用 Connector。
+3. 模型不能绕过 Tool Runtime 直接调用 Port 或 Adapter。
 4. 模型不能单方面完成 Task、发布 Metric 或写入长期 Memory。
 5. 生产副作用不能使用模糊 Session 级审批。
 6. Agent Runtime Store 不能与用户业务数据混用。
@@ -998,6 +1188,11 @@ v0.2 支持在持久化 Step 之间恢复，以及 WaitingForInput 后恢复。�
 8. Context Index 不能被当成永远正确的事实源。
 9. 非 Data Engineer 不能获得 change.prepare 能力。
 10. CLI、Web 和 Worker 不得各自复制 Agent 执行逻辑。
+11. Lance/LanceDB 不能存储 Task/Run 权威状态，也不能取代 Warehouse、语义层或 Artifact Store。
+12. Context Repository 的具体存储类型不能泄漏到 Agent Loop、Workflow 或领域类型。
+13. Domain Module 不能拥有独立 Agent Loop、Session、Task 生命周期或 Event 体系。
+14. Workflow 不能绕过 Tool Runtime 或 Execution Control Plane 直接调用外部 Adapter。
+15. Eval Runner、Telemetry 后端和 LLM Judge 不能成为在线 Task 状态或完成判断的权威来源。
 
 ## 30. 参考项目的取舍
 
