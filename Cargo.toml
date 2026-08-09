@@ -1,24 +1,54 @@
-[package]
-name = "ysda"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "apps/ysda",
+    "crates/ys-agent-core",
+    "crates/ys-agent-runtime",
+    "crates/ys-agent-store",
+    "crates/ys-agent-adapters",
+]
+resolver = "3"
 
-[dependencies]
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+async-trait = "0.1"
+bigdecimal = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures = "0.3"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13", features = ["json"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
+sha2 = "0.10"
 sqlparser = "0.62"
+sqlx = { version = "0.9", default-features = false, features = [
+    "bigdecimal",
+    "chrono",
+    "json",
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls",
+    "uuid",
+] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-uuid = { version = "1", features = ["serde", "v4"] }
-
-[dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 wiremock = "0.6"
 
-[[bin]]
-name = "ysda"
-path = "src/main.rs"
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

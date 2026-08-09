@@ -1,0 +1,37 @@
+[package]
+name = "ysda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+comfy-table.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlparser.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+ys-agent-core = { path = "../../crates/ys-agent-core" }
+ys-agent-runtime = { path = "../../crates/ys-agent-runtime" }
+ys-agent-store = { path = "../../crates/ys-agent-store" }
+ys-agent-adapters = { path = "../../crates/ys-agent-adapters" }
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
+
+[[bin]]
+name = "ysda"
+path = "src/main.rs"
+
+[lints]
+workspace = true
