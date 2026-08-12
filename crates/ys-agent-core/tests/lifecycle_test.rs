@@ -5,7 +5,7 @@ use ys_agent_core::{
 
 #[test]
 fn new_session_and_task_have_separate_lifecycles() {
-    let principal = Principal::local_owner("ysc");
+    let principal = Principal::local_operator("ysc");
     let session = Session::new(WorkspaceId::new(), principal.id.clone());
     let task = Task::new(
         session.workspace_id.clone(),
@@ -17,8 +17,9 @@ fn new_session_and_task_have_separate_lifecycles() {
 }
 
 #[test]
-fn local_owner_has_only_v02_query_capability() {
-    let principal = Principal::local_owner("ysc");
+
+fn local_operator_has_only_v02_query_capability() {
+    let principal = Principal::local_operator("ysc");
     assert!(principal.capabilities.contains(&Capability::DataQuery));
     assert_eq!(principal.capabilities.len(), 1);
 }
@@ -62,7 +63,7 @@ fn waiting_does_not_create_a_new_run() {
 
 #[test]
 fn completed_task_cannot_return_to_in_progress() {
-    let principal = Principal::local_owner("ysc");
+    let principal = Principal::local_operator("ysc");
     let mut task = Task::new(WorkspaceId::new(), principal.id, "Query GMV");
     task.start().expect("open to in progress");
     task.complete().expect("in progress to completed");
