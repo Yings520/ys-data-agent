@@ -10,6 +10,10 @@
 
 **Design spec:** docs/superpowers/specs/2026-08-06-ys-data-agent-architecture-design.md
 
+**Product boundary:** v0.2 is the first technical validation slice of the long-term SME AI data team, not the long-term product itself. Requiring a Data Engineer or technical analyst for this Pilot is a temporary entry condition, not a permanent customer requirement.
+
+**Implementation status (2026-08-12):** Task 1 is complete in `b5a45e4`; Task 2 is complete in `5bc527c`. Do not re-run or rewrite completed tasks. Begin new implementation work at Task 2A, then continue from Task 3.
+
 ---
 
 ## 0. Scope guard
@@ -40,6 +44,8 @@
 
 Do not create Rust modules, traits, enum variants, Events or Artifact kinds for Approval, action_hash, ExecutionHandle, ChangeRequest, TaskHandoff, a generic SemanticProvider, or future Workflow states. Add them only with their first executable vertical slice.
 
+Workspace Bootstrap, WorkspaceReadinessReport, customer-maturity modeling, Accountable Data Owner governance flows, Starter Data Stack Profile, ProvisioningPlan and remote control-plane/data-plane protocols also remain product and architecture concepts only. They must not appear as v0.2 Rust types, configuration schemas or empty extension points.
+
 TelemetrySink is not a placeholder: v0.2 implements the minimal interface used to prove Telemetry failure isolation.
 
 ### v0.2 excludes
@@ -52,11 +58,29 @@ TelemetrySink is not a placeholder: v0.2 implements the minimal interface used t
 - Langfuse exporter;
 - vector database and embedding pipeline;
 - complete semantic engine;
-- non-OpenAI protocol provider implementations.
+- non-OpenAI protocol provider implementations;
+- Workspace Bootstrap, automated maturity diagnosis and a non-technical governance wizard;
+- Excel, CSV or SaaS connectors and incremental ingestion;
+- Starter Data Stack provisioning, configuration, upgrades or managed operations;
+- a YS-managed control plane or remote customer data-plane protocol.
 
 ### Recovery promise
 
 v0.2 resumes between persisted Steps and after WaitingForInput. If the process dies while SQL is in flight, the ToolCall becomes Unknown. A low-cost call may create a new ToolCall only after explicit resume; a high-cost, cost-unknown or remotely identifiable call requires reconcile, cancellation or user confirmation. Exact recovery of multi-day jobs begins with Operate.
+
+### Incremental delivery checkpoints
+
+These are integration checkpoints inside v0.2, not additional product versions. Do not begin the next checkpoint until the current checkpoint's tests pass, and do not pull v0.3+ concepts forward to make a checkpoint look more complete.
+
+| Checkpoint | Tasks | Demonstrable outcome | Exit gate |
+|---|---|---|---|
+| Foundation | 1, 2, 2A | Compiling workspace and unambiguous Query-only lifecycle model | Core tests and Clippy pass |
+| Alpha: Durable control spine | 3–5 | An idempotent local command creates and reloads Session, Task, Run, Event, Snapshot and Artifact state without a model or data source | Store reopen, optimistic-writer and duplicate-command tests pass |
+| Beta 1: Governed query capabilities | 6–10 | Fake/Replay and OpenAI-compatible models can see only phase-allowed tools; SQLite and Postgres enforce read-only scope; Active metrics compile deterministically | Provider, Tool Runtime, Connector, Context and Query Tool suites pass |
+| Beta 2: Trustworthy query loop | 11–12 | One GovernedMetric, AdHocRead or Metadata Task reaches a verified QueryArtifact, or waits/resumes safely | Workflow, Completion Gate and restart-recovery suites pass |
+| Release Candidate: Pilot product | 13–15 | Doctor, TUI, export, Telemetry isolation and deterministic Eval make the technical Pilot installable and releasable | Full release gate and recorded Pilot acceptance pass |
+
+At each checkpoint, keep the workspace compiling and commit the tested vertical increment. A checkpoint may be demonstrated internally, but only the Release Candidate satisfies the complete v0.2 product promise.
 
 ---
 
@@ -140,7 +164,8 @@ crates/
 │       ├── service_test.rs
 │       ├── tool_runtime_test.rs
 │       ├── query_workflow_test.rs
-│       └── recovery_test.rs
+│       ├── recovery_test.rs
+│       └── telemetry_test.rs
 ├── ys-agent-store/
 │   ├── Cargo.toml
 │   ├── migrations/0001_runtime.sql
@@ -201,6 +226,8 @@ The file map is intentionally limited to four library crates and one application
 
 ## Task 1: Convert the repository to a compiling Cargo Workspace
 
+**Status:** Completed in `b5a45e4`. Retained as implementation history; do not execute these steps again. The live manifests and repository tree are authoritative.
+
 **Files:**
 
 - Modify: Cargo.toml
@@ -216,7 +243,7 @@ The file map is intentionally limited to four library crates and one application
 - Create: crates/ys-agent-adapters/Cargo.toml
 - Create: crates/ys-agent-adapters/src/lib.rs
 
-- [ ] **Step 1: Record the v0.1 baseline**
+- [x] **Step 1: Record the v0.1 baseline**
 
 Run:
 
@@ -227,7 +254,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: 19 tests pass and Clippy exits successfully.
 
-- [ ] **Step 2: Move the existing application without changing behavior**
+- [x] **Step 2: Move the existing application without changing behavior**
 
 Run:
 
@@ -239,7 +266,7 @@ rtk git mv tests/* apps/ysda/tests/
 
 Expected: the original source and tests now live under apps/ysda.
 
-- [ ] **Step 3: Replace the root manifest**
+- [x] **Step 3: Replace the root manifest**
 
 Write Cargo.toml:
 
@@ -300,7 +327,7 @@ unsafe_code = "forbid"
 all = "warn"
 ~~~
 
-- [ ] **Step 4: Give every crate a minimal compiling manifest**
+- [x] **Step 4: Give every crate a minimal compiling manifest**
 
 Write apps/ysda/Cargo.toml:
 
@@ -452,11 +479,11 @@ workspace = true
 
 Every initial lib.rs contains only a crate-level purpose comment. Runtime may have adapters and store as dev-dependencies because neither production crate depends on Runtime; this does not create a production dependency cycle.
 
-- [ ] **Step 5: Fix the moved integration-test support path**
+- [x] **Step 5: Fix the moved integration-test support path**
 
 Ensure apps/ysda/tests/support/mod.rs remains addressable through mod support and that CARGO_BIN_EXE_ysda resolves from the application package.
 
-- [ ] **Step 6: Verify the workspace preserves v0.1 behavior**
+- [x] **Step 6: Verify the workspace preserves v0.1 behavior**
 
 Run:
 
@@ -468,7 +495,7 @@ rtk cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Expected: the original 19 tests pass from their new location; the four empty library crates compile.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ~~~bash
 rtk git add Cargo.toml Cargo.lock apps crates
@@ -478,6 +505,8 @@ rtk git commit -m "refactor: establish agent workspace boundaries"
 ---
 
 ## Task 2: Define Session, Task and Run lifecycle types
+
+**Status:** Completed in `5bc527c`. Retained as implementation history; do not execute these steps again.
 
 **Files:**
 
@@ -490,7 +519,7 @@ rtk git commit -m "refactor: establish agent workspace boundaries"
 - Modify: crates/ys-agent-core/src/lib.rs
 - Test: crates/ys-agent-core/tests/lifecycle_test.rs
 
-- [ ] **Step 1: Write failing lifecycle tests**
+- [x] **Step 1: Write failing lifecycle tests**
 
 Create lifecycle_test.rs:
 
@@ -534,7 +563,7 @@ fn local_owner_has_only_v02_query_capability() {
 }
 ~~~
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run:
 
@@ -544,7 +573,7 @@ rtk cargo test -p ys-agent-core --test lifecycle_test
 
 Expected: FAIL because the domain types are not defined.
 
-- [ ] **Step 3: Implement strongly typed identifiers**
+- [x] **Step 3: Implement strongly typed identifiers**
 
 In ids.rs define serde-transparent UUID newtypes for WorkspaceId, PrincipalId, SessionId, TaskId, RunId, StepId, ToolCallId, ArtifactId, EventId and CommandId. Every type must provide new(), Display and FromStr. Do not reserve ExecutionId before durable execution exists and do not expose raw UUID fields publicly.
 
@@ -586,11 +615,11 @@ macro_rules! id_type {
 }
 ~~~
 
-- [ ] **Step 4: Implement identity and capability types**
+- [x] **Step 4: Implement identity and capability types**
 
 In identity.rs define Capability as a serializable enum containing only DataQuery for v0.2. Principal contains PrincipalId, display_name and a BTreeSet of Capability. local_owner grants DataQuery for the single-user local profile. No Runtime code may infer capabilities from display_name. Add future capabilities with their first executable Workflow rather than reserving enum variants.
 
-- [ ] **Step 5: Implement Session, Task and Run transitions**
+- [x] **Step 5: Implement Session, Task and Run transitions**
 
 Use UTC DateTime timestamps. Session holds id, workspace_id, principal_id, focused_task_id, created_at and closed_at.
 
@@ -604,7 +633,7 @@ RunSnapshot holds run identity, Task identity, Workflow, RunStatus, version, ser
 
 Transition methods return CoreError::InvalidTransition for illegal edges. A terminal Run never returns to Running.
 
-- [ ] **Step 6: Export the domain API and pass tests**
+- [x] **Step 6: Export the domain API and pass tests**
 
 Run:
 
@@ -616,11 +645,91 @@ rtk cargo clippy -p ys-agent-core --all-targets -- -D warnings
 
 Expected: all lifecycle tests pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ~~~bash
 rtk git add crates/ys-agent-core
 rtk git commit -m "feat(core): add task-centric lifecycle model"
+~~~
+
+---
+
+## Task 2A: Remove the ambiguous local owner name
+
+`Principal::local_owner` currently means the single local technical operator, not the long-term Accountable Data Owner. Rename it now so v0.2 does not encode a misleading governance concept. This task does not add roles, approvals, multi-user identity or Accountable Data Owner behavior.
+
+**Files:**
+
+- Modify: crates/ys-agent-core/src/identity.rs
+- Modify: crates/ys-agent-core/tests/lifecycle_test.rs
+
+- [ ] **Step 1: Rename the lifecycle test and call the intended constructor**
+
+Replace the existing local-owner capability test with:
+
+~~~rust
+#[test]
+fn local_operator_has_only_v02_query_capability() {
+    let principal = Principal::local_operator("ysc");
+    assert!(principal.capabilities.contains(&Capability::DataQuery));
+    assert_eq!(principal.capabilities.len(), 1);
+}
+~~~
+
+Replace the other `Principal::local_owner("ysc")` calls in the same test file with `Principal::local_operator("ysc")`.
+
+- [ ] **Step 2: Run the test to verify the new name fails**
+
+Run:
+
+~~~bash
+rtk cargo test -p ys-agent-core --test lifecycle_test
+~~~
+
+Expected: FAIL because `Principal::local_operator` is not defined.
+
+- [ ] **Step 3: Rename the constructor without adding new authority**
+
+In identity.rs, replace the constructor with:
+
+~~~rust
+impl Principal {
+    pub fn local_operator(display_name: impl Into<String>) -> Self {
+        let mut capabilities = BTreeSet::new();
+        capabilities.insert(Capability::DataQuery);
+        Self {
+            id: PrincipalId::new(),
+            display_name: display_name.into(),
+            capabilities,
+        }
+    }
+
+    pub fn has_capability(&self, capability: Capability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+}
+~~~
+
+Do not keep a `local_owner` alias: a deprecated alias would preserve the domain ambiguity this task removes.
+
+- [ ] **Step 4: Verify the rename and Core tests**
+
+Run:
+
+~~~bash
+rtk cargo fmt --all
+rtk cargo test -p ys-agent-core
+rtk cargo clippy -p ys-agent-core --all-targets -- -D warnings
+rtk rg "local_owner" crates
+~~~
+
+Expected: Core tests and Clippy pass; the final search returns no matches.
+
+- [ ] **Step 5: Commit**
+
+~~~bash
+rtk git add crates/ys-agent-core/src/identity.rs crates/ys-agent-core/tests/lifecycle_test.rs
+rtk git commit -m "refactor(core): name the local query operator explicitly"
 ~~~
 
 ---
@@ -735,6 +844,7 @@ pub enum RunEventKind {
     ToolExecutionStarted { call_id: ToolCallId },
     ToolExecutionSucceeded { call_id: ToolCallId, artifacts: Vec<ArtifactId> },
     ToolExecutionFailed { call_id: ToolCallId, failure: ToolFailure },
+    ToolExecutionIndeterminate { call_id: ToolCallId, failure: ToolFailure },
     ArtifactCreated { artifact: ArtifactMetadata },
     ClarificationRequested { clarification_id: String, question: String },
     ClarificationAnswered { clarification_id: String, answer_artifact_id: ArtifactId },
@@ -764,7 +874,7 @@ AgentAction contains CallTool, ProposeQueryPlan, RequestClarification and Propos
 
 ToolSpec contains input/output JSON Schema, risk, SideEffect::None, idempotency, timeout, required_permissions, input_sensitivity, output_sensitivity and version.
 
-ToolOutcome contains Succeeded, Failed, Rejected and Indeterminate. ToolFailure contains typed category, safe user message, retryability, parameter_revision_allowed, remote_query_id: Option<String> and CostClass::Low/High/Unknown. Categories include Authentication, Authorization, Policy, Budget, InvalidArguments, Dialect, SchemaChanged, Timeout, Cancelled, Transport, ProviderProtocol and Internal. ApprovalRequired and Running are introduced with their first real callers.
+ToolOutcome contains Succeeded, Failed, Rejected and Indeterminate. ToolFailure contains a stable machine-readable code, typed category, safe user message, retryability, parameter_revision_allowed, remote_query_id: Option<String> and CostClass::Low/High/Unknown. Categories include Authentication, Authorization, Policy, Budget, InvalidArguments, NotFound, Governance, Dialect, SchemaChanged, Timeout, Cancelled, Transport, ProviderProtocol and Internal. ApprovalRequired and Running are introduced with their first real callers.
 
 - [ ] **Step 6: Implement Context, Metric, Query and Connector contracts**
 
@@ -1454,7 +1564,7 @@ fn duplicate_tool_names_are_rejected() {
 #[test]
 fn query_view_exposes_only_tools_for_the_current_phase() {
     let catalog = catalog_with_query_tools();
-    let principal = Principal::local_owner("ysc");
+    let principal = Principal::local_operator("ysc");
     let view = ToolViewBuilder::new(&catalog)
         .for_workflow(WorkflowKind::Query)
         .for_query_phase(QueryPhase::ResolveContext)
@@ -2072,7 +2182,7 @@ Input:
 }
 ~~~
 
-Output includes exact id, version, status, description, source_relation, expression, time_column, allowed_dimensions, owner and freshness SLA. A missing or non-Active metric returns a structured non-retryable ToolFailure with category metric_not_found_or_inactive.
+Output includes exact id, version, status, description, source_relation, expression, time_column, allowed_dimensions, owner and freshness SLA. A missing or non-Active metric returns a structured non-retryable ToolFailure with `code = "metric_not_found_or_inactive"` and category Governance.
 
 - [ ] **Step 4: Implement InspectSchemaTool**
 
@@ -2630,6 +2740,8 @@ rtk git commit -m "feat(runtime): resume durable query runs"
 
 ## Task 13: Add Workspace Doctor, safe export and the focused TUI
 
+Workspace Doctor is a read-only readiness check for an already configured technical Pilot. It is not the v0.3 Workspace Bootstrap: it does not discover or ingest business sources, propose governance contracts, generate WorkspaceReadinessReport, provision infrastructure or provide a non-technical onboarding flow.
+
 **Files:**
 
 - Create: apps/ysda/src/bootstrap.rs
@@ -2750,7 +2862,7 @@ fn slash_new_creates_a_session_command_not_a_cancel_command() {
 
 #[test]
 fn v02_tui_does_not_offer_unimplemented_modes() {
-    let app = TuiApp::for_principal(Principal::local_owner("ysc"));
+    let app = TuiApp::for_principal(Principal::local_operator("ysc"));
     let rendered = render_to_string(&app, 100, 28);
     assert!(!rendered.contains("Build mode"));
 }
@@ -3036,6 +3148,7 @@ rtk git commit -m "feat(tui): add doctor export and focused query interface"
 **Files:**
 
 - Create: crates/ys-agent-runtime/src/telemetry.rs
+- Create: crates/ys-agent-runtime/tests/telemetry_test.rs
 - Create: evals/query_cases.jsonl
 - Create: evals/README.md
 - Create: apps/ysda/tests/query_eval_test.rs
@@ -3045,7 +3158,7 @@ rtk git commit -m "feat(tui): add doctor export and focused query interface"
 
 - [ ] **Step 1: Write a failing Telemetry isolation test**
 
-Add to a new runtime telemetry test module:
+Create crates/ys-agent-runtime/tests/telemetry_test.rs:
 
 ~~~rust
 #[tokio::test]
@@ -3236,8 +3349,11 @@ Make it executable. The cleanup target is the explicit fixture Compose project o
 
 README must state:
 
-- the long-term product is a Data-Engineer-owned full-stack AI data team for lean organizations;
+- the long-term product is an Accountable-Data-Owner-governed AI data team for SMEs that cannot staff a complete data team;
+- the long-term product absorbs technical complexity and uses mature databases, compute engines, transformation frameworks and orchestrators rather than reimplementing them;
+- the final product does not permanently require a resident Data Engineer, but it does require a business owner to confirm business meaning, access and high-risk choices;
 - v0.2 is a local Trustworthy Query Pilot for Data Engineers and technical analysts;
+- the v0.2 technical operator is a temporary validation entry point, not the final product persona;
 - a suitable Pilot has a queryable SQLite/Postgres source, a least-privilege identity and an owner for metric, timezone, Freshness and sensitivity policy;
 - the five long-term Workflow outcomes;
 - the Task-centric architecture;
@@ -3245,7 +3361,7 @@ README must state:
 - AST, database read-only, ACL, QueryBudget and ResultPolicy security boundaries;
 - supported GovernedMetric, AdHocRead and Metadata examples;
 - explicit UnsupportedCapability behavior;
-- v0.2 exclusions.
+- v0.2 exclusions, including Workspace Bootstrap, Excel/CSV/SaaS ingestion, Starter Data Stack and a managed control plane.
 
 - [ ] **Step 3: Document local setup**
 
@@ -3375,12 +3491,13 @@ Expected:
 Use one clean local Workspace and record:
 
 1. time from first `ysda doctor` to the first verified QueryArtifact;
-2. one GovernedMetric, one AdHocRead and one Metadata success;
-3. one ambiguity that waits for clarification;
-4. one Analysis request that returns UnsupportedCapability without a Run;
-5. one cost rejection and one sensitive-column rejection;
-6. one allowed export and one denied export;
-7. p50/p95 duration, model tokens, database execution time and estimated cost for the fixture cases.
+2. Data Engineer configuration time and the number of manual setup steps required before that first trusted answer;
+3. one GovernedMetric, one AdHocRead and one Metadata success;
+4. one ambiguity that waits for clarification;
+5. one Analysis request that returns UnsupportedCapability without a Run;
+6. one cost rejection and one sensitive-column rejection;
+7. one allowed export and one denied export;
+8. p50/p95 duration, model tokens, database execution time and estimated cost for the fixture cases.
 
 Save only aggregate Pilot measurements in the release notes. Do not copy raw customer rows or credentials.
 
@@ -3399,6 +3516,8 @@ rtk git commit -m "docs: prepare trustworthy query runtime release"
 Task 1  Workspace
   ↓
 Task 2  Lifecycle domain
+  ↓
+Task 2A Rename local technical operator
   ↓
 Task 3  Events and ports
   ├──────────────┐
@@ -3458,6 +3577,7 @@ v0.2 is complete only when all statements are true:
 - [ ] Fake and Replay providers run core tests without network or token cost.
 - [ ] Query Eval cases enforce outcome, trajectory, security and unsupported-capability behavior.
 - [ ] No production write Tool is registered.
+- [ ] No Workspace Bootstrap, Accountable Data Owner workflow, Starter Data Stack, Provisioning or remote control-plane/data-plane type is present in v0.2 code or configuration.
 - [ ] The release-gate script passes.
 
 ## 4. Intentional follow-up boundaries
@@ -3466,38 +3586,44 @@ Do not broaden a v0.2 implementation task when encountering these needs:
 
 | Need discovered during v0.2 | Record for |
 |---|---|
-| Dashboard or causal analysis | v0.3 Analysis |
-| Git Worktree, dbt edits, ChangeSet | v0.4 Build/Change |
-| Action approval types or execution | v0.4 Build/Change, scoped first to sandbox change.prepare |
-| multi-day external job | v0.5 Durable Execution |
-| Airflow or Dagster control | v0.5 Operate |
-| multi-principal approval, Merge, Deploy or production.execute | v0.6 Shared Runtime and identity |
-| shared Postgres Runtime Store | v0.6 Shared Runtime |
-| Web/API and multi-user identity | v0.6 Shared Runtime |
-| Python/Polars feature work | v0.7 ML Data Prep |
+| Non-technical onboarding, maturity diagnosis or Draft governance suggestions | v0.3 Workspace Bootstrap |
+| Dashboard or causal analysis | v0.4 Analysis |
+| Git Worktree, dbt edits, ChangeSet | v0.5 Build/Change |
+| Action approval types or execution | v0.5 Build/Change, scoped first to sandbox change.prepare |
+| multi-day external job | v0.6 Durable Execution |
+| Airflow or Dagster control | v0.6 Operate |
+| multi-principal approval, Merge, Deploy or production.execute | v0.7 Shared Runtime and identity |
+| shared Postgres Runtime Store | v0.7 Shared Runtime |
+| Web/API, managed control plane and multi-user identity | v0.7 Shared Runtime |
+| Excel/CSV/SaaS ingestion or infrastructure provisioning | v0.8 Starter Data Stack |
+| Python/Polars feature work | v0.9 ML Data Prep |
 | embeddings or vector retrieval | separate Context milestone after deterministic retrieval is measured |
 
 ## 5. Plan self-review checklist
 
 Before implementation begins, verify:
 
-- [ ] Every file in a task appears in the final repository map or is explicitly removed.
-- [ ] Core types used by later tasks are introduced in Tasks 2 and 3.
-- [ ] No executable Rust placeholder for Approval, ExecutionHandle, ChangeRequest, TaskHandoff or future Workflow remains.
-- [ ] Runtime never imports a concrete Adapter.
-- [ ] Store append and Snapshot update are atomic.
-- [ ] AgentService command replay is idempotent and Run progression is optimistic-single-writer.
-- [ ] Query Tool and Completion Gate cannot bypass Policy.
-- [ ] ContextAssembler cannot perform live Connector I/O or treat Evidence as instructions.
-- [ ] Runtime recovery never blindly retries an indeterminate or high-cost query.
-- [ ] TUI quit and Session /new never imply Task cancellation.
-- [ ] Default TUI hides internal Run/Step/Workflow identifiers and Doctor blockers disable submission.
-- [ ] Telemetry and Eval cannot become Runtime state dependencies.
-- [ ] The plan contains no implementation work for excluded Workflows.
+- [x] Every file in a task appears in the final repository map or is explicitly removed.
+- [x] Completed Tasks 1 and 2 are not re-executed; implementation resumes at Task 2A against the live repository state.
+- [x] Core types used by later tasks are introduced in Tasks 2 and 3.
+- [x] No executable Rust placeholder for Approval, ExecutionHandle, ChangeRequest, TaskHandoff or future Workflow remains.
+- [x] No v0.3+ onboarding, governance, ingestion, provisioning or managed-platform type has entered the v0.2 plan.
+- [x] Runtime never imports a concrete Adapter.
+- [x] Store append and Snapshot update are atomic.
+- [x] AgentService command replay is idempotent and Run progression is optimistic-single-writer.
+- [x] Query Tool and Completion Gate cannot bypass Policy.
+- [x] ContextAssembler cannot perform live Connector I/O or treat Evidence as instructions.
+- [x] Runtime recovery never blindly retries an indeterminate or high-cost query.
+- [x] TUI quit and Session /new never imply Task cancellation.
+- [x] Default TUI hides internal Run/Step/Workflow identifiers and Doctor blockers disable submission.
+- [x] Telemetry and Eval cannot become Runtime state dependencies.
+- [x] The plan contains no implementation work for excluded Workflows.
 
 ## 6. Execution handoff
 
 Plan complete and saved to docs/superpowers/plans/2026-08-06-ys-data-agent-v0.2.md.
+
+Tasks 1 and 2 are already complete. Either execution option starts with Task 2A and then proceeds to Task 3.
 
 Two execution options:
 
