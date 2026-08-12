@@ -1524,6 +1524,6 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 
 YS Data Agent 的长期形态不是五个独立聊天机器人，而是：
 
-> 一个受业务数据责任人治理、面向没有完整数据团队的中小型公司的 AI data team。它通过统一、简单的产品入口，使用可信的 Task-centric Runtime、多种领域 Workflow 和成熟数据基础设施，端到端完成并验证数据接入、治理、工程、分析、数据科学准备和运维工作。
+> 一个受业务数据责任人治理、面向没有完整数据团队的中小型公司的 AI data team。它通过统一、简单的产品入口，使用可信的 Task-centric Runtime、多种领域 Workflow 和成熟数据基础设施，在明确支持的数据源、技术栈和风险边界内，逐步覆盖并端到端完成、验证数据接入、治理、工程、分析、数据科学准备和运维工作。
 
 v0.2 不追求功能数量，也不实现终局愿景的全部能力。它面向 Data Engineer 和技术型分析师 Pilot，以 Query 为第一个垂直切片，证明 Doctor、Harness、Tool Runtime、Context、安全执行、验证、Artifact、恢复、Eval 和 TUI 可以形成可信控制内核。后续版本再依次降低治理配置门槛、增加领域 Workflow、提供共享控制平面和有限的 Starter Data Stack。
