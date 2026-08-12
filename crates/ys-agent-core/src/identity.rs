@@ -16,7 +16,7 @@ pub struct Principal {
 }
 
 impl Principal {
-    pub fn local_owner(display_name: impl Into<String>) -> Self {
+    pub fn local_operator(display_name: impl Into<String>) -> Self {
         let mut capabilities = BTreeSet::new();
         capabilities.insert(Capability::DataQuery);
         Self {
