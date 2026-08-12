@@ -1,7 +1,7 @@
 # YS Data Agent 完整架构设计草案
 
 **日期：** 2026-08-06  
-**状态：** 已按 2026-08-07 三角色 Review 修订，作为 v0.2 产品与架构基线  
+**状态：** 已按 2026-08-12 产品愿景讨论修订，作为长期产品与 v0.2 架构基线  
 **替代范围：** 本文扩展并修正 2026-08-02 v0.1 设计中的长期架构；v0.1 文档继续作为已实现 Demo 的历史记录
 
 ---
@@ -14,26 +14,56 @@
 
 ## 2. 产品定位
 
-YS Data Agent 是一个由 Data Engineer 拥有和治理的 full-stack AI data team，面向没有预算组建完整数据团队的中小型公司。
+YS Data Agent 是一个受业务责任人治理的 full-stack AI data team，面向没有能力或预算组建完整数据团队的中小型公司。
 
-它的核心价值不是生成一段 SQL 或代码，而是：
+它的长期愿景是：
 
-> 在用户已有的数据栈上，端到端完成、验证并交付可审计的数据工作结果，放大一名资深 Data Engineer 的能力。
+> 让大多数无力负担完整专业数据团队成本的中小型公司，通过 YS Data Agent 获得接近大厂的数据工程、数据分析和数据科学服务能力，让数据能够被简单地接入、治理、管理、查询和使用，而不要求用户掌握复杂的数据专业知识。
 
-“没有完整数据团队”不等于“没有 Data Engineer”。产品成立的前提是客户至少有一名能够承担数据源接入、指标口径、权限和结果治理责任的 Data Engineer 或技术型 Data Owner。
+它的核心价值不是生成一段 SQL 或代码，而是把数据工作推进到可交付状态：理解业务目标、选择和管理成熟的数据基础设施、执行工作、验证结果、披露限制并交付可审计的 Artifact。复杂性由系统和底层专业工具吸收，用户主要表达业务目标、提供必要授权并确认关键业务判断。
 
-`full-stack AI data team` 是 v1.0 的长期定位。任何 v0.x 版本必须同时声明当前直接用户、前置条件、已启用 Workflow 和明确不支持的任务，不能用长期定位暗示尚未交付的能力。
+`full-stack AI data team` 是长期产品定位，不表示任何单个 v0.x 版本已经交付完整能力。每个版本必须同时声明当前直接用户、数据成熟度前置条件、已启用 Workflow 和明确不支持的任务。
+
+### 2.1 终局客户、用户与责任
+
+终局客户包括两类中小型公司：
+
+- 已经拥有数据库、Warehouse、dbt 或 Orchestrator，但没有完整数据团队；
+- 只有 Excel、CSV、SaaS 或业务数据库，尚未建立 Warehouse、数据模型和治理体系。
+
+终局产品不要求客户常驻 Data Engineer，但要求每个 Workspace 指定至少一名 **业务数据责任人（Accountable Data Owner）**。该角色不需要理解 SQL、数据建模或调度系统，其不可委托的责任是：
+
+- 确认指标含义、关键业务规则和结果用途；
+- 决定谁可以访问哪些数据；
+- 批准生产写入、部署、删除、高成本操作和其他高风险动作；
+- 对 Agent 无法从事实中决定的业务冲突作最终选择。
+
+YS Data Agent 负责把技术问题翻译为该角色可以理解的业务选择，提出推荐方案、影响和风险，并完成获准范围内的专业执行与验证。Agent 不能自行决定企业的业务真相，也不能因为用户不懂技术而扩大权限。
 
 长期用户与能力如下：
 
 | 用户 | 主要能力 | 权限边界 |
 |---|---|---|
+| 业务数据责任人 | 用业务语言确认口径、权限、成本和高风险动作 | 不要求技术能力；保留关键业务与授权决定权 |
 | 产品或业务人员 | 受治理的指标查询与业务分析 | 只读；可以提交 ChangeRequest，不能修改代码或生产系统 |
 | 数据分析师 | 指标拆解、趋势、异常和归因分析 | 只读；可以提交带证据的 ChangeRequest |
 | Data Engineer | ETL/ELT 开发、调试、维护和 DataOps | 可以在隔离环境准备变更；Merge、Deploy 和生产写入继续受策略控制 |
 | Data/ML Engineer | 数据清洗、特征定义、样本构建和质量验证 | 仅在授权数据域内工作；模型训练与 MLOps 不属于早期范围 |
 
-### 2.1 v0.2 首个用户与承诺
+### 2.2 客户数据成熟度与双接入路径
+
+YS Data Agent 使用同一个产品入口和可信控制内核服务不同成熟度的客户，但按条件逐步开放能力：
+
+| 客户状态 | 接入路径 | YS Data Agent 的责任 |
+|---|---|---|
+| 已有数据栈 | Bring Your Own Stack | 连接并管理客户已有的 Database、Warehouse、dbt、Orchestrator 和权限体系 |
+| 没有完整数据栈 | Starter Data Stack | 通过 Workspace Bootstrap 诊断现状，选择、配置和管理一套受支持的标准化成熟工具组合 |
+
+Starter Data Stack 不是 YS 自研数据库或调度器。它是由 PostgreSQL、DuckDB、dbt、Dagster、对象存储等成熟基础设施组成的受支持 Profile。YS Data Agent 拥有统一的控制、治理和用户体验，并通过 Adapter 管理这些工具。
+
+两条路径最终共享相同的 Task、Workflow、Policy、Context、Artifact、Verification、Recovery 和 Eval 体系。它们不是两个产品；用户只看到 YS Data Agent，底层差异由 Workspace Profile 和 Capability Descriptor 隔离。
+
+### 2.3 v0.2 首个用户与承诺
 
 v0.2 的直接用户是 Data Engineer 和能够理解 SQL、数据口径与权限边界的技术型数据分析师。产品或业务人员在 v0.2 主要是 QueryArtifact 的间接消费者，不是本地 TUI 的主要操作者。
 
@@ -50,6 +80,8 @@ v0.2 的产品承诺是：
 > 对受支持的只读问题，完成受治理的上下文解析、安全执行、确定性验证和可审计交付；无法可信回答时明确澄清、警告或拒绝。
 
 v0.2 不承诺归因分析、代码修改、Pipeline 恢复、业务用户自助 Web 入口或完整 AI data team 能力。
+
+v0.2 也不实现 Workspace Bootstrap、Starter Data Stack、SaaS/Excel 接入、基础设施自动部署、托管控制平面或面向非技术责任人的完整治理向导。Data Engineer Pilot 是验证可信控制内核的版本切入点，不是长期产品对客户组织能力的要求。
 
 ## 3. 五类任务产物
 
@@ -79,6 +111,8 @@ YS Data Agent 是现有数据平台之上的控制与智能层，不重新实现
 
 系统可以在本地使用 SQLite、DuckDB、Python、Polars 或沙箱执行轻量任务，但重计算和长任务应委托给现有 Warehouse、dbt、Spark 或 Orchestrator。
 
+“不重新实现基础设施”不等于“只服务已经拥有数据平台的客户”。后续版本可以代表客户选择、Provision、配置、升级和运维受支持的 Starter Data Stack，但数据库、存储、计算、转换和调度仍由成熟产品提供。YS Data Agent 对组合后的用户体验、治理契约、验证结果和运维闭环负责，不把底层工具复杂度直接转嫁给非技术用户。
+
 ### 4.1 v0.2 Query 产品边界
 
 v0.2 只接受三类 QueryIntent：
@@ -105,6 +139,10 @@ v0.2 遇到未实现能力时返回 `UnsupportedCapability`，说明当前边界
 8. **Context 按需获取：** 完整 Data Context 不等于 Prompt；每次模型调用只获得预算内 ContextPack。
 9. **事实、推断、契约分离：** LLM 推断不能伪装成数据库事实或正式业务规则。
 10. **权限不放大：** Agent 的有效权限不能高于当前用户与 Workspace Policy 的交集。
+11. **专业复杂度由系统吸收：** 普通用户用业务语言表达目标和确认关键选择，不需要理解 SQL、数据模型、dbt 或调度器。
+12. **控制平面与数据平面分离：** 托管控制状态、策略和编排不要求复制客户原始业务数据；实际数据处理优先留在客户授权的数据平面。
+13. **按风险分级自治：** 只读和低风险动作可以在明确 Policy 内自动执行；代码变更先在隔离环境验证；生产写入、部署、删除和高成本操作必须获得明确批准。
+14. **按客户成熟度渐进启用：** 先通过受支持的窄场景证明可靠性，再降低对 Data Engineer、Metric Contract 和现有数据平台的前置要求。
 
 ## 6. 总体架构
 
@@ -157,9 +195,31 @@ v0.2 遇到未实现能力时返回 `UnsupportedCapability`，说明当前边界
 - Workflow 表达用户目标、阶段、状态转换、Artifact 和完成条件；
 - Domain Module 提供可被多个 Workflow 复用的确定性数据领域规则。
 
+Workspace Bootstrap 是后续版本的产品 Onboarding 与治理建立流程，不是第六种业务 Workflow，也不拥有独立 Harness。Starter Data Stack 的准备与变更复用 Build/Change 的隔离、验证和审批能力，日常健康与恢复复用 Operate；平台 Provision 的具体差异留在 capability-based Adapter。
+
 不得按照 Query、Pipeline、Ops 等角色再建立一组拥有自己 Loop 和状态的 Service。它们要么是 Workflow，要么拆成跨 Workflow 复用的深 Domain Module。Eval 是独立质量平面，Data Context 是共享知识平面；二者都不是某一种业务 Workflow 的下游 Service。
 
 Context Resolver 是 Control Runtime 消费 Data Context 的统一入口；Eval Runner 通过版本化 Event、Artifact、ContextManifest 和 EvalRecord 评估系统。共享知识与质量平面不位于 Tool Runtime 的线性调用链中。
+
+### 6.1 长期部署拓扑
+
+长期默认采用“YS 托管控制平面 + 客户环境数据平面”的混合部署：
+
+~~~text
+┌──────────────────────── YS Managed Control Plane ──────────────────────────┐
+│ Identity / Workspace / Policy / Task / Workflow / Model / Eval / Telemetry│
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │ scoped commands, metadata and references
+                                   │
+┌──────────────────────── Customer Data Plane ───────────────────────────────┐
+│ Database / Warehouse / Object Storage / dbt / Dagster / Execution Identity│
+│ Raw and restricted business data remains here unless policy allows export  │
+└──────────────────────────────────────────────────────────────────────────────┘
+~~~
+
+原始业务数据默认留在客户数据库、客户云账号或明确授权的 Starter Data Stack 数据平面。控制平面只接收完成任务所需、经过 Policy 允许的 Metadata、脱敏 Preview、Artifact 引用和派生结果。客户可以选择本地控制平面、YS 托管控制平面或满足相同 Interface 的其他部署 Adapter。
+
+微型公司的 Starter Data Stack 可以由 YS 托管，但仍保持 Runtime State、客户业务数据、Artifact 和 Context Projection 的职责分离。部署位置不能改变权限不放大、敏感数据出境和可审计性等架构不变量。
 
 ## 7. 核心领域模型
 
@@ -167,7 +227,8 @@ Context Resolver 是 Control Runtime 消费 Data Context 的统一入口；Eval 
 
 Workspace 是治理和资源隔离边界，包含：
 
-- 成员与角色；
+- 业务数据责任人、成员与角色；
+- 客户数据成熟度、Bring Your Own Stack 或 Starter Data Stack Profile；
 - 数据源和代码仓库连接；
 - Metric Registry 或外部 Semantic Provider；
 - 默认时区、数据新鲜度规则和输出约定；
@@ -523,7 +584,7 @@ Core 使用能力权限而不是硬编码职位名称：
 - change.merge；
 - production.execute。
 
-DataEngineer 是 Workspace 提供的一组默认授权。
+DataEngineer 是 Workspace 提供的一组默认技术授权。业务数据责任人拥有确认业务契约和批准策略允许动作的责任，但不因此自动获得 `change.prepare`、`change.merge` 或 `production.execute`；批准权与实际执行权限保持分离。
 
 ### 13.2 有效权限
 
@@ -565,6 +626,20 @@ Tool Runtime 负责统一脱敏 Tool 参数、Connector 错误和结果 Preview�
 每个 QueryArtifact 和 QueryResult Artifact 必须记录 sensitivity、owner、ACL、retention_policy 和 expires_at。默认本地文件权限仅允许当前用户访问；过期清理由显式命令或受治理的维护流程执行。
 
 Workspace Policy 决定哪些字段可以进入外部 Model Provider。不能发送的字段只允许进入确定性 Tool 与本地 Artifact；模型只获得脱敏摘要。来自 dbt docs、数据库文本和历史 Artifact 的内容一律视为不可信数据，不能覆盖 System 指令或被解释为 Tool 调用。
+
+### 13.5 风险分级自治
+
+系统按动作的副作用、环境、数据敏感性、可逆性、成本和影响范围决定自治级别，而不是要求非技术用户理解底层命令：
+
+| 动作类型 | 默认行为 |
+|---|---|
+| 授权范围内的低成本只读查询、Metadata 读取和确定性验证 | 自动执行并保留审计记录 |
+| 可逆的低风险配置建议和日常维护 | 在 Workspace 预授权范围内自动执行，超出范围时请求确认 |
+| 代码、模型或 Pipeline 变更 | 只在隔离环境准备和测试，交付 Diff、测试与影响报告 |
+| 生产写入、Merge、Deploy、删除、高成本或不可逆动作 | 绑定不可变 action_hash，由业务数据责任人或策略指定的审批人明确批准 |
+| 无法可靠判断影响、权限或执行状态 | Fail closed，进入澄清、Reconcile 或人工接管 |
+
+批准界面必须使用业务影响、成本、数据范围、可逆性和失败处理解释动作，不得只展示 SQL、Git 命令或基础设施术语。低风险预授权必须有明确 Scope、预算、有效期和撤销机制。
 
 ## 14. Data Context
 
@@ -1142,7 +1217,7 @@ Runtime、Store 和 Adapters 互不直接形成循环依赖，由 apps/ysda 负�
 
 ### 26.2 首个用户、前置条件与支持场景
 
-直接用户、Workspace 前置条件和产品承诺遵循 §2.1。Pilot 至少覆盖：
+直接用户、Workspace 前置条件和产品承诺遵循 §2.3。Pilot 至少覆盖：
 
 - Active Metric 的时间范围与维度查询；
 - 受限 AdHocRead；
@@ -1183,6 +1258,8 @@ v0.2 只实例化 Semantic & Metric、Metadata/Freshness、Query Planning & Veri
 
 Approval、action_hash、ExecutionHandle、ChangeRequest、TaskHandoff、通用 SemanticProvider 和生产审批身份仍保留在长期架构中，但 v0.2 不创建对应空 Trait、enum variant、ArtifactKind、Event 或透传 Module。
 
+Workspace Bootstrap、WorkspaceReadinessReport、Starter Data Stack Profile、ProvisioningPlan 和远程控制平面/数据平面协议同样不进入 v0.2 Rust 类型或配置 Schema。
+
 这些类型在首个真实调用者出现时，依据当时的权限、状态与错误语义设计。v0.2 只保留已经被 Query Runtime 使用的 TelemetrySink。
 
 ### 26.5 明确排除
@@ -1196,7 +1273,11 @@ Approval、action_hash、ExecutionHandle、ChangeRequest、TaskHandoff、通用 
 - Lance/LanceDB Adapter、Embedding、向量索引与全量 RAG Pipeline；
 - 完整语义引擎；
 - Dashboard 生成；
-- 多种非 OpenAI 协议 Provider。
+- 多种非 OpenAI 协议 Provider；
+- Workspace Bootstrap、客户成熟度自动诊断和非技术治理向导；
+- Excel、CSV、SaaS Connector 和增量数据接入；
+- Starter Data Stack 的 Provision、配置、升级和托管运维；
+- YS 托管控制平面与客户数据平面的远程协议。
 
 ### 26.6 v0.2 首次使用与可信查询闭环
 
@@ -1276,11 +1357,14 @@ v0.2 技术验收通过后，还必须在 Pilot 记录：
 - 正确澄清、可信拒答和错误放行比例；
 - p50/p95 首答时间、Model token 和数据库执行成本；
 - 用户相对手写 SQL 的时间节省；
-- QueryArtifact 的导出、复用与用户纠错次数。
+- QueryArtifact 的导出、复用与用户纠错次数；
+- 完成首次可信答案所需的 Data Engineer 配置时间和手工步骤数。
 
-这些指标用于决定下一阶段优先 Analysis、Build/Change 还是共享入口，不能只按架构图顺序推进。
+这些指标用于判断可信 Query 内核是否成立，以及后续 Workspace Bootstrap 应优先消除哪些专业配置步骤。后续版本仍由独立 Spec、Eval 和发布门禁控制，不能因为长期愿景扩大 v0.2 范围。
 
 ## 27. 后续演进顺序
+
+以下版本表达产品演进顺序，不表示一次实现长期愿景。每个版本都必须形成可独立使用、可测试和可发布的垂直切片；未列入该版本的长期概念不得提前创建空 Trait、状态或基础设施。
 
 ### Agent Context Lakehouse：按条件启用的横向里程碑
 
@@ -1294,14 +1378,24 @@ LanceContextRepository 不与某个业务 Workflow 版本强绑定。v0.2 之后
 
 Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索、重启恢复、索引重建和权限隔离。未达到质量和运维门槛时继续使用确定性 Provider 或 FileContextRepository，不为技术选型本身扩大版本范围。
 
-### v0.3：Analysis Workflow
+### v0.3：Workspace Bootstrap
+
+- 面向没有常驻 Data Engineer、但已有 SQLite 或 Postgres 的客户；
+- 识别 Workspace 数据成熟度、可用 Source、Schema、权限和能力缺口；
+- 通过业务语言引导业务数据责任人确认时区、新鲜度、敏感数据和 Query Budget；
+- 从 ObservedSchema 和可选 dbt Evidence 提出 Draft Metric、维度和数据质量建议；
+- 生成 WorkspaceReadinessReport，明确当前可可信支持的问题和修复路径；
+- Draft 不能由 Agent 自动提升为 Active；
+- 不实现 SaaS/Excel 数据接入，不 Provision Starter Data Stack，也不要求业务责任人编辑 JSON、SQL 或 dbt 配置。
+
+### v0.4：Analysis Workflow
 
 - QueryArtifact 通过 TaskHandoff 创建 Analysis 子 Task；
 - 可复现 Analysis Artifact；
 - 图表与 Dashboard Artifact；
 - 证据与假设 Eval。
 
-### v0.4：Build/Change Workflow
+### v0.5：Build/Change Workflow
 
 - ChangeRequest；
 - Git Worktree 沙箱；
@@ -1310,7 +1404,7 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 - action_hash 只绑定沙箱内 change.prepare；
 - 单用户本地模式不实现真实多人 Merge、Deploy 或生产审批。
 
-### v0.5：Operate 与 Durable Execution
+### v0.6：Operate 与 Durable Execution
 
 - 只读诊断、恢复计划和健康验证；
 - Worker、ExecutionHandle、Webhook 和 Reconciler；
@@ -1318,7 +1412,7 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 - 长任务恢复；
 - 在共享身份上线前不执行需要多人审批的生产恢复动作。
 
-### v0.6：共享 Runtime
+### v0.7：共享 Runtime 与托管控制平面
 
 - Server AgentService；
 - Postgres Runtime Store；
@@ -1328,7 +1422,16 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 - 在外部审批或共享身份支持下启用受治理的 Merge、Deploy 与 production.execute；
 - Web 客户端基础。
 
-### v0.7：ML Data Prep 与 Python Worker
+### v0.8：Starter Data Stack
+
+- 面向只有 Excel、CSV、受支持 SaaS 或业务数据库的客户；
+- 提供少量经过验证的 Data Stack Profile，而不是任意技术组合；
+- 通过 Adapter Provision 和配置成熟的存储、转换、调度与质量工具；
+- 建立受治理的数据接入、增量同步、基础模型、调度、质量检查和运维闭环；
+- 托管控制平面与客户数据平面保持分离，原始数据默认不进入控制平面；
+- 以端到端可靠性和客户运维成本决定扩展 Connector，不追求 Connector 数量。
+
+### v0.9：ML Data Prep 与 Python Worker
 
 - Rust/Python 协议；
 - Arrow/Parquet Artifact；
@@ -1338,6 +1441,8 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 ### v1.0：受治理的 full-stack AI data team
 
 - 五类 Workflow 统一入口；
+- Bring Your Own Stack 与 Starter Data Stack 使用统一产品体验；
+- 业务数据责任人无需数据工程知识即可完成治理与高风险决策；
 - 共享 Data Context；
 - 团队级 Memory；
 - 完整 LLM-Ops 和持续 Eval；
@@ -1347,6 +1452,10 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 
 | 风险 | 应对 |
 |---|---|
+| 长期愿景被误当成当前版本范围 | 每个版本声明直接用户、数据前置条件、可执行 Workflow 和明确排除项；长期概念不提前进入 Rust 类型 |
+| 只服务已有成熟数据栈，无法触达真正没有数据团队的客户 | v0.3 先降低治理配置门槛，v0.8 再以有限、标准化 Profile 提供 Starter Data Stack |
+| Starter Data Stack 演变为自研数据库和调度平台 | YS 只拥有控制、治理、验证和用户体验；底层始终采用成熟基础设施与 Adapter |
+| 非技术责任人无法理解审批内容 | 用业务影响、数据范围、成本、可逆性和失败处理表达选择，不把 SQL 或基础设施命令当作审批界面 |
 | 五类 Agent 同时开发导致 Runtime 复制 | v0.2 只用 Query 打穿公共主干 |
 | Query/Pipeline/Ops Service 与 Workflow 重复 | 按目标组织 Workflow，按跨 Workflow 复用规则组织 Domain Module；Domain Module 不拥有 Loop 和 Task 状态 |
 | 通用 Pipeline 或 Ops Facade 退化成巨型 switch | 统一 Intent、Artifact 和 Verification，平台差异留在 capability-based Adapter |
@@ -1388,6 +1497,10 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 16. Secret 不能进入 Prompt、Event、Artifact、Telemetry 或可序列化 Core 类型。
 17. 只读 Tool 不能绕过 QueryBudget、数据范围和敏感策略，也不能仅因 SideEffect::None 被无条件重试。
 18. v0.2 不能为未实现 Workflow 创建假的执行结果、审批或 Handoff。
+19. 长期产品不能把拥有 Data Engineer 或现成数据平台作为所有客户的永久前提。
+20. 业务数据责任人负责业务确认和高风险授权，但批准身份不能自动获得实际生产执行权限。
+21. YS Data Agent 可以 Provision 和管理成熟基础设施，但不能重新实现数据库、计算引擎、转换框架或调度器。
+22. 托管控制平面不能默认复制客户原始业务数据；任何数据出境都必须经过 Workspace Policy 和敏感级别检查。
 
 ## 30. 参考项目的取舍
 
@@ -1411,6 +1524,6 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 
 YS Data Agent 的长期形态不是五个独立聊天机器人，而是：
 
-> 一个受治理、可恢复、可评测的 Task-centric Data Agent Runtime，承载多个领域 Workflow，并通过共享 Data Context 和现有数据平台端到端完成数据工作。
+> 一个受业务数据责任人治理、面向没有完整数据团队的中小型公司的 AI data team。它通过统一、简单的产品入口，使用可信的 Task-centric Runtime、多种领域 Workflow 和成熟数据基础设施，端到端完成并验证数据接入、治理、工程、分析、数据科学准备和运维工作。
 
-v0.2 不追求功能数量。它面向 Data Engineer Pilot，以 Query 为第一个垂直切片，证明 Doctor、Harness、Tool Runtime、Context、安全执行、验证、Artifact、恢复、Eval 和 TUI 可以形成一个可信闭环。
+v0.2 不追求功能数量，也不实现终局愿景的全部能力。它面向 Data Engineer 和技术型分析师 Pilot，以 Query 为第一个垂直切片，证明 Doctor、Harness、Tool Runtime、Context、安全执行、验证、Artifact、恢复、Eval 和 TUI 可以形成可信控制内核。后续版本再依次降低治理配置门槛、增加领域 Workflow、提供共享控制平面和有限的 Starter Data Stack。
