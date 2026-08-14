@@ -6,9 +6,9 @@ use ys_agent_core::{
 #[test]
 fn new_session_and_task_have_separate_lifecycles() {
     let principal = Principal::local_operator("ysc");
-    let session = Session::new(WorkspaceId::new(), principal.id.clone());
+    let session = Session::new(WorkspaceId::new(), principal.id);
     let task = Task::new(
-        session.workspace_id.clone(),
+        session.workspace_id,
         principal.id,
         "Query the last seven complete days of GMV",
     );
@@ -45,7 +45,7 @@ fn terminal_run_cannot_resume() {
 fn waiting_does_not_create_a_new_run() {
     let mut run = Run::new(TaskId::new(), WorkflowKind::Query);
 
-    let original_run_id = run.id.clone();
+    let original_run_id = run.id;
 
     run.start().expect("queued to running");
 

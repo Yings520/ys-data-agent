@@ -94,11 +94,11 @@ impl Run {
         let now = Utc::now();
         Ok(Self {
             id: RunId::new(),
-            task_id: previous.task_id.clone(),
+            task_id: previous.task_id,
             workflow: previous.workflow,
             status: RunStatus::Running,
             attempt: previous.attempt + 1,
-            retry_of_run_id: Some(previous.id.clone()),
+            retry_of_run_id: Some(previous.id),
             version: 1,
             created_at: now,
             updated_at: now,
@@ -115,8 +115,8 @@ impl Run {
         last_completed_step_id: Option<StepId>,
     ) -> RunSnapshot {
         RunSnapshot {
-            run_id: self.id.clone(),
-            task_id: self.task_id.clone(),
+            run_id: self.id,
+            task_id: self.task_id,
             workflow: self.workflow,
             status: self.status,
             version: self.version,
