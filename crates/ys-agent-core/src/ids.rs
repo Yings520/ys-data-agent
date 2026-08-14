@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Copy)]
         #[serde(transparent)]
         pub struct $name(Uuid);
 
