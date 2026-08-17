@@ -9,7 +9,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventActor {
-    Sytem,
+    System,
     Principal { id: PrincipalId },
     Model { model: String },
     Tool { name: String },
