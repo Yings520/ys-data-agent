@@ -23,6 +23,11 @@ pub enum CoreError {
 
     #[error("artifact access denied: {reason}")]
     ArtifactAccessDenied { reason: String },
+    #[error("corrupt artifact {artifact_id}: {reason}")]
+    CorruptArtifact { artifact_id: String, reason: String },
+
+    #[error("storage error: {message}")]
+    Storage { message: String },
 
     #[error("optimistic concurrency conflict on run {run_id}")]
     ConcurrencyConflict { run_id: String },
@@ -56,6 +61,8 @@ impl CoreError {
             Self::IdempotencyConflict { .. } => "idempotency_conflict",
             Self::NotFound { .. } => "not_found",
             Self::ArtifactAccessDenied { .. } => "artifact_access_denied",
+            Self::CorruptArtifact { .. } => "corrupt_artifact",
+            Self::Storage { .. } => "storage_error",
             Self::ConcurrencyConflict { .. } => "concurrency_conflict",
         }
     }
