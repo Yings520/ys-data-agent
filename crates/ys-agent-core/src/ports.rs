@@ -18,6 +18,7 @@ pub struct RuntimeCommandBatch {
     pub new_session: Option<Session>,
     pub new_task: Option<Task>,
     pub new_run_snapshot: Option<RunSnapshot>,
+    pub new_artifact: Option<ArtifactMetadata>,
     pub pending_events: Vec<PendingRunEvent>,
     pub snapshot_update: Option<RunSnapshot>,
 }
@@ -33,6 +34,8 @@ pub trait RuntimeStore: Send + Sync {
     async fn load_task(&self, task_id: &TaskId) -> CoreResult<Task>;
 
     async fn load_run(&self, run_id: &RunId) -> CoreResult<RunSnapshot>;
+
+    async fn load_artifact(&self, artifact_id: &crate::ArtifactId) -> CoreResult<ArtifactMetadata>;
 
     async fn list_tasks(&self, workspace_id: &WorkspaceId) -> CoreResult<Vec<Task>>;
 
