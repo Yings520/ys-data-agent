@@ -171,12 +171,12 @@ pub trait AgentServiceApi: Send + Sync {
 
     async fn send_message(&self, request: SendMessageRequest) -> CoreResult<ServiceReply>;
 
-    async fn resume_task(&self, command_id: CommandId, task_id: TaskId) -> CoreResult<RunId>;
+    async fn resume_task(&self, command_id: CommandId, task_id: &TaskId) -> CoreResult<RunId>;
 
     async fn answer_clarification(
         &self,
         command_id: CommandId,
-        run_id: RunId,
+        run_id: &RunId,
         answer: String,
     ) -> CoreResult<()>;
 
@@ -201,7 +201,7 @@ pub trait AgentServiceApi: Send + Sync {
     async fn cancel_run(
         &self,
         command_id: CommandId,
-        run_id: RunId,
+        run_id: &RunId,
         reason: String,
     ) -> CoreResult<()>;
 }
@@ -414,9 +414,13 @@ impl AgentServiceApi for InProcessAgentService {
             "send_message",
             json!({
                 "session_id": request.session_id,
+                "focused_task_id": request.focused_task_id,
                 "text": request.text,
             }),
         )?;
+        let replayed_receipt = self
+            .replayed_receipt(&request.command_id, &fingerprint)
+            .await?;
 
         let session = self.store.load_session(&request.session_id).await?;
         ensure_workspace(self.workspace_id, session.workspace_id)?;
@@ -428,10 +432,7 @@ impl AgentServiceApi for InProcessAgentService {
             .route(&session, focused.as_ref(), &request.text)
             .await?;
 
-        if let Some(receipt) = self
-            .replayed_receipt(&request.command_id, &fingerprint)
-            .await?
-        {
+        if let Some(receipt) = replayed_receipt {
             return reply_from_receipt(decision, &receipt);
         }
 
@@ -553,13 +554,13 @@ impl AgentServiceApi for InProcessAgentService {
         }
     }
 
-    async fn resume_task(&self, command_id: CommandId, task_id: TaskId) -> CoreResult<RunId> {
+    async fn resume_task(&self, command_id: CommandId, task_id: &TaskId) -> CoreResult<RunId> {
         let fingerprint = command_fingerprint("resume_task", json!({ "task_id": task_id }))?;
         if let Some(receipt) = self.replayed_receipt(&command_id, &fingerprint).await? {
             return required_run_id(&receipt);
         }
 
-        let task = self.store.load_task(&task_id).await?;
+        let task = self.store.load_task(task_id).await?;
         ensure_workspace(self.workspace_id, task.workspace_id)?;
         if task.is_terminal() {
             return Err(CoreError::validation(
@@ -589,7 +590,7 @@ impl AgentServiceApi for InProcessAgentService {
     async fn answer_clarification(
         &self,
         command_id: CommandId,
-        run_id: RunId,
+        run_id: &RunId,
         answer: String,
     ) -> CoreResult<()> {
         let fingerprint = command_fingerprint(
@@ -604,7 +605,7 @@ impl AgentServiceApi for InProcessAgentService {
             return Ok(());
         }
 
-        let current = self.store.load_run(&run_id).await?;
+        let current = self.store.load_run(run_id).await?;
         if current.status != RunStatus::WaitingForInput {
             return Err(CoreError::validation(
                 "run_not_waiting",
@@ -625,7 +626,7 @@ impl AgentServiceApi for InProcessAgentService {
             .put(PutArtifact {
                 workspace_id: task.workspace_id,
                 task_id: task.id,
-                run_id,
+                run_id: *run_id,
                 kind: ArtifactKind::ContextEvidence,
                 media_type: "text/plain; charset=utf-8".to_owned(),
                 bytes: answer.into_bytes(),
@@ -646,7 +647,7 @@ impl AgentServiceApi for InProcessAgentService {
             result_kind: CommandResultKind::ClarificationAnswered,
             session_id: None,
             task_id: Some(task.id),
-            run_id: Some(run_id),
+            run_id: Some(*run_id),
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -667,14 +668,14 @@ impl AgentServiceApi for InProcessAgentService {
                 snapshot_update: Some(resumed),
             })
             .await?;
-        self.scheduler.schedule(run_id).await?;
-        self.event_publisher().notify(run_id, u64::MAX);
+        self.scheduler.schedule(*run_id).await?;
+        self.event_publisher().notify(*run_id, u64::MAX);
         Ok(())
     }
     async fn cancel_run(
         &self,
         command_id: CommandId,
-        run_id: RunId,
+        run_id: &RunId,
         reason: String,
     ) -> CoreResult<()> {
         let fingerprint =
@@ -687,7 +688,7 @@ impl AgentServiceApi for InProcessAgentService {
             return Ok(());
         }
 
-        let current = self.store.load_run(&run_id).await?;
+        let current = self.store.load_run(run_id).await?;
         if matches!(
             current.status,
             RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
@@ -708,7 +709,7 @@ impl AgentServiceApi for InProcessAgentService {
             result_kind: CommandResultKind::RunCancelled,
             session_id: None,
             task_id: Some(current.task_id),
-            run_id: Some(run_id),
+            run_id: Some(*run_id),
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -723,7 +724,7 @@ impl AgentServiceApi for InProcessAgentService {
                 snapshot_update: Some(cancelled),
             })
             .await?;
-        self.event_publisher().notify(run_id, u64::MAX);
+        self.event_publisher().notify(*run_id, u64::MAX);
         Ok(())
     }
 

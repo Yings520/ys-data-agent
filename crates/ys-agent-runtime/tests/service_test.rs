@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use ys_agent_core::{
-    CommandId, CoreResult, EventActor, PendingRunEvent, Principal, RunEventKind, RunId,
-    RuntimeStore, StepId, TaskStatus, WorkspaceId,
+    CommandId, CoreError, CoreResult, EventActor, PendingRunEvent, Principal, RunEventKind, RunId,
+    RunStatus, RuntimeStore, StepId, TaskStatus, WorkspaceId,
 };
 use ys_agent_runtime::{
     AgentServiceApi, CoordinationDecision, Coordinator, CreateTaskRequest, InProcessAgentService,
@@ -203,6 +203,153 @@ async fn repeated_send_message_command_creates_only_one_run() {
     assert_eq!(first.run_id(), second.run_id());
     assert_eq!(fixture.created_run_count().await, 1);
     assert_eq!(fixture.scheduler.count().await, 1);
+}
+
+#[tokio::test]
+async fn repeated_send_message_with_a_different_focus_is_an_idempotency_conflict() {
+    let fixture = ServiceFixture::new().await;
+    let first_task = fixture
+        .service
+        .create_task(CreateTaskRequest {
+            command_id: CommandId::new(),
+            session_id: fixture.session_id(),
+            goal: "Query GMV".to_owned(),
+            acceptance_criteria: vec![],
+        })
+        .await
+        .expect("first task");
+    let second_task = fixture
+        .service
+        .create_task(CreateTaskRequest {
+            command_id: CommandId::new(),
+            session_id: fixture.session_id(),
+            goal: "Query DAU".to_owned(),
+            acceptance_criteria: vec![],
+        })
+        .await
+        .expect("second task");
+    let command_id = CommandId::new();
+
+    fixture
+        .service
+        .send_message(SendMessageRequest {
+            command_id,
+            session_id: fixture.session_id(),
+            focused_task_id: Some(first_task.id),
+            text: "same range".to_owned(),
+        })
+        .await
+        .expect("first message");
+    let error = fixture
+        .service
+        .send_message(SendMessageRequest {
+            command_id,
+            session_id: fixture.session_id(),
+            focused_task_id: Some(second_task.id),
+            text: "same range".to_owned(),
+        })
+        .await
+        .expect_err("changing focus must conflict with the original command");
+
+    assert!(matches!(error, CoreError::IdempotencyConflict { .. }));
+}
+
+#[tokio::test]
+async fn replay_conflict_is_detected_before_loading_a_different_focus() {
+    let fixture = ServiceFixture::new().await;
+    let command_id = CommandId::new();
+
+    fixture
+        .service
+        .send_message(SendMessageRequest::new(
+            command_id,
+            fixture.session_id(),
+            "Query GMV",
+        ))
+        .await
+        .expect("first message");
+    let error = fixture
+        .service
+        .send_message(SendMessageRequest {
+            command_id,
+            session_id: fixture.session_id(),
+            focused_task_id: Some(ys_agent_core::TaskId::new()),
+            text: "Query GMV".to_owned(),
+        })
+        .await
+        .expect_err("a conflicting replay must fail before loading its focus");
+
+    assert!(matches!(error, CoreError::IdempotencyConflict { .. }));
+}
+
+#[tokio::test]
+async fn mutating_run_commands_accept_borrowed_ids() {
+    let fixture = ServiceFixture::new().await;
+    let task = fixture
+        .service
+        .create_task(CreateTaskRequest {
+            command_id: CommandId::new(),
+            session_id: fixture.session_id(),
+            goal: "Query GMV".to_owned(),
+            acceptance_criteria: vec![],
+        })
+        .await
+        .expect("task");
+
+    let resumed_run_id = fixture
+        .service
+        .resume_task(CommandId::new(), &task.id)
+        .await
+        .expect("resume task");
+    fixture
+        .service
+        .cancel_run(
+            CommandId::new(),
+            &resumed_run_id,
+            "operator request".to_owned(),
+        )
+        .await
+        .expect("cancel run");
+    assert_eq!(
+        fixture
+            .service
+            .get_run(&resumed_run_id)
+            .await
+            .expect("cancelled run")
+            .status,
+        RunStatus::Cancelled
+    );
+
+    let clarification = fixture
+        .service
+        .send_message(SendMessageRequest {
+            command_id: CommandId::new(),
+            session_id: fixture.session_id(),
+            focused_task_id: Some(task.id),
+            text: "change it".to_owned(),
+        })
+        .await
+        .expect("clarification request");
+    let clarification_run_id = clarification.run_id().expect("clarification run");
+    fixture
+        .service
+        .answer_clarification(
+            CommandId::new(),
+            &clarification_run_id,
+            "Use the previous range".to_owned(),
+        )
+        .await
+        .expect("answer clarification");
+
+    assert_eq!(
+        fixture
+            .service
+            .get_run(&clarification_run_id)
+            .await
+            .expect("resumed run")
+            .status,
+        RunStatus::Running
+    );
 }
 
 #[tokio::test]
