@@ -31,6 +31,12 @@ pub enum CoreError {
 
     #[error("optimistic concurrency conflict on run {run_id}")]
     ConcurrencyConflict { run_id: String },
+
+    #[error("unsupported capability: {0}")]
+    UnsupportedCapability(String),
+
+    #[error("replay provider has no response left")]
+    ReplayExhausted,
 }
 
 impl CoreError {
@@ -64,6 +70,8 @@ impl CoreError {
             Self::CorruptArtifact { .. } => "corrupt_artifact",
             Self::Storage { .. } => "storage_error",
             Self::ConcurrencyConflict { .. } => "concurrency_conflict",
+            Self::UnsupportedCapability(_) => "unsupported_capability",
+            Self::ReplayExhausted => "replay_exhausted",
         }
     }
 }
