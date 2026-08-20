@@ -74,6 +74,8 @@ pub struct ToolSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: ToolCallId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_call_id: Option<String>,
     pub name: String,
     pub arguments: Value,
     pub version: String,
