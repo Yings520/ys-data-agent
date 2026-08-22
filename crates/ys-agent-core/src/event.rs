@@ -71,6 +71,7 @@ pub enum RunEventKind {
     ModelRequested {
         model_call_id: String,
         context_manifest_id: ArtifactId,
+        tool_view_hash: String,
     },
     ModelResponded {
         model_call_id: String,
