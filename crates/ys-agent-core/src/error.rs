@@ -37,6 +37,9 @@ pub enum CoreError {
 
     #[error("replay provider has no response left")]
     ReplayExhausted,
+
+    #[error("duplicate tool registration: {0}")]
+    DuplicateTool(String),
 }
 
 impl CoreError {
@@ -72,6 +75,7 @@ impl CoreError {
             Self::ConcurrencyConflict { .. } => "concurrency_conflict",
             Self::UnsupportedCapability(_) => "unsupported_capability",
             Self::ReplayExhausted => "replay_exhausted",
+            Self::DuplicateTool(_) => "duplicate_tool",
         }
     }
 }

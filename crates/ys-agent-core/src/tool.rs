@@ -86,6 +86,7 @@ pub struct ToolCall {
 pub enum ToolOutcome {
     Succeeded {
         message: String,
+        output: Value,
         artifacts: Vec<ArtifactId>,
     },
     Failed {
@@ -122,6 +123,13 @@ impl ToolOutcome {
                     && !failure.parameter_revision_allowed
             }
             Self::Succeeded { .. } | Self::Indeterminate { .. } => false,
+        }
+    }
+
+    pub fn success_json(&self) -> Option<&Value> {
+        match self {
+            Self::Succeeded { output, .. } => Some(output),
+            Self::Failed { .. } | Self::Rejected { .. } | Self::Indeterminate { .. } => None,
         }
     }
 }

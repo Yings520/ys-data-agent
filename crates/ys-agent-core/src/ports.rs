@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::{
-    ArtifactAccessContext, ArtifactMetadata, ArtifactRef, CommandId, CommandReceipt,
-    ContextEvidence, CoreResult, EventEnvelope, FreshnessObservation, MetricDefinition,
-    ModelCapabilities, ModelRequest, ModelResponse, ObservedSchema, PendingRunEvent, PutArtifact,
-    QueryPreflight, QueryRequest, QueryResult, RunId, RunSnapshot, Session, SessionId, SourceId,
-    Task, TaskId, ToolOutcome, ToolSpec, WorkspaceId,
+    AllowedDataScope, ArtifactAccessContext, ArtifactMetadata, ArtifactRef, CommandId,
+    CommandReceipt, ContextEvidence, CoreResult, EventEnvelope, FreshnessObservation,
+    MetricDefinition, ModelCapabilities, ModelRequest, ModelResponse, ObservedSchema,
+    PendingRunEvent, Principal, PutArtifact, QueryBudget, QueryPreflight, QueryRequest,
+    QueryResult, RunId, RunSnapshot, Session, SessionId, SourceId, Task, TaskId, ToolCallId,
+    ToolOutcome, ToolSpec, WorkspaceId,
 };
 
 /// Atomic control-plane mutation unit for RuntimeStore::commit_command.
@@ -75,9 +76,13 @@ pub trait ModelProvider: Send + Sync {
 /// Execution context handed to tools (principal, run, budget hints, etc.).
 #[derive(Debug, Clone)]
 pub struct ToolExecutionContext {
+    pub call_id: ToolCallId,
     pub workspace_id: WorkspaceId,
     pub task_id: TaskId,
     pub run_id: RunId,
+    pub principal: Principal,
+    pub query_budget: QueryBudget,
+    pub data_scope: AllowedDataScope,
 }
 
 #[async_trait]
