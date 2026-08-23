@@ -34,6 +34,9 @@ pub enum AppError {
     #[error("SQL execution failed: {0}")]
     SqlExecution(#[source] rusqlite::Error),
 
+    #[error("data adapter failed: {0}")]
+    DataAdapter(String),
+
     #[error("trace operation failed: {0}")]
     Trace(String),
 
@@ -52,6 +55,7 @@ impl AppError {
             Self::SqlParse(_) => "SqlParseError",
             Self::UnsafeSql(_) => "UnsafeSqlError",
             Self::SqlExecution(_) => "SqlExecutionError",
+            Self::DataAdapter(_) => "DataAdapterError",
             Self::Trace(_) => "TraceError",
             Self::AgentRunFailed { .. } => "AgentRunError",
         }

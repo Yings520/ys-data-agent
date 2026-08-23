@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "allowed_sources": {
+    "sqlite_demo": {
+      "relations": {
+        "mart_orders": {
+          "columns": {
+            "order_id": "allow",
+            "paid_amount": "allow",
+            "paid_at": "allow",
+            "customer_email": "redact",
+            "country": "allow",
+            "channel": "allow"
+          }
+        }
+      }
+    },
+    "postgres_demo": {
+      "relations": {
+        "public.orders": {
+          "columns": {
+            "order_id": "allow",
+            "paid_amount": "allow",
+            "paid_at": "allow",
+            "customer_email": "redact"
+          }
+        }
+      }
+    }
+  }
+}

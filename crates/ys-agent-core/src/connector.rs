@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::{AllowedDataScope, CoreError, CoreResult, QueryBudget, Sensitivity};
 
@@ -61,15 +60,26 @@ impl CredentialReference {
 pub struct CapabilityDescriptor {
     pub source_id: SourceId,
     pub dialect: String,
+    pub catalog_reader: bool,
+    pub sql_query_executor: bool,
+    pub freshness_reader: bool,
     pub supports_explain: bool,
     pub supports_read_only_tx: bool,
     pub max_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaKnowledgeKind {
+    Observed,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservedColumn {
     pub name: String,
     pub data_type: String,
+    pub nullable: bool,
+    pub primary_key_position: Option<u32>,
     pub sensitivity: Sensitivity,
 }
 
@@ -82,6 +92,7 @@ pub struct ObservedRelation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservedSchema {
     pub source_id: SourceId,
+    pub kind: SchemaKnowledgeKind,
     pub relations: Vec<ObservedRelation>,
     pub observed_at: DateTime<Utc>,
 }
@@ -93,11 +104,32 @@ pub struct QueryCostEstimate {
     pub estimator_version: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryPreflightDecision {
+    Allowed,
+    ConfirmationRequired,
+    Rejected,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryPreflight {
     pub sql: String,
+    pub decision: QueryPreflightDecision,
     pub cost: QueryCostEstimate,
+    pub reason_codes: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum CellValue {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    BlobSummary { bytes: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,15 +139,19 @@ pub struct QueryRequest {
     pub budget: QueryBudget,
     pub query_tag: String,
     pub scope: AllowedDataScope,
+    pub confirmation_granted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
+    pub rows: Vec<Vec<CellValue>>,
     pub truncated: bool,
     pub remote_query_id: Option<String>,
     pub row_count: usize,
+    pub serialized_bytes: usize,
+    pub warning_codes: Vec<String>,
+    pub model_preview: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
