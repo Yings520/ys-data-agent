@@ -5,9 +5,9 @@ use crate::{
     AllowedDataScope, ArtifactAccessContext, ArtifactMetadata, ArtifactRef, CommandId,
     CommandReceipt, ContextEvidence, CoreResult, EventEnvelope, FreshnessObservation,
     MetricDefinition, ModelCapabilities, ModelRequest, ModelResponse, ObservedSchema,
-    PendingRunEvent, Principal, PutArtifact, QueryBudget, QueryPreflight, QueryRequest,
-    QueryResult, RunId, RunSnapshot, Session, SessionId, SourceId, Task, TaskId, ToolCallId,
-    ToolOutcome, ToolSpec, WorkspaceId,
+    PendingRunEvent, PrincipalId, PutArtifact, QueryBudget, QueryPreflight, QueryRequest,
+    QueryResult, RunId, RunSnapshot, Session, SessionId, SourceId, Task, TaskId, ToolOutcome,
+    ToolSpec, WorkspaceId,
 };
 
 /// Atomic control-plane mutation unit for RuntimeStore::commit_command.
@@ -73,16 +73,15 @@ pub trait ModelProvider: Send + Sync {
     async fn complete(&self, request: ModelRequest) -> CoreResult<ModelResponse>;
 }
 
-/// Execution context handed to tools (principal, run, budget hints, etc.).
+/// Runtime-owned governance passed to every v0.2 query Tool.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionContext {
-    pub call_id: ToolCallId,
     pub workspace_id: WorkspaceId,
     pub task_id: TaskId,
     pub run_id: RunId,
-    pub principal: Principal,
+    pub principal_id: PrincipalId,
     pub query_budget: QueryBudget,
-    pub data_scope: AllowedDataScope,
+    pub allowed_data_scope: AllowedDataScope,
 }
 
 #[async_trait]
