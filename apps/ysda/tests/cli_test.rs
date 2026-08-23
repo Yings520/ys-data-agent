@@ -7,7 +7,7 @@ fn parse_schema_command() {
         .expect("schema command should parse");
     assert!(matches!(
         cli.command,
-        AgentCommand::Schema {database} if database == *"examples/demo.db"
+        AgentCommand::Schema { database, .. } if database == *"examples/demo.db"
     ));
 }
 

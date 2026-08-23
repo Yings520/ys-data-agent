@@ -23,9 +23,9 @@ pub use artifact::{
 pub use command::{CommandReceipt, CommandResultKind};
 
 pub use connector::{
-    CapabilityDescriptor, CredentialReference, FreshnessObservation, ObservedColumn,
-    ObservedRelation, ObservedSchema, QueryCostEstimate, QueryPreflight, QueryRequest, QueryResult,
-    SourceId,
+    CapabilityDescriptor, CellValue, CredentialReference, FreshnessObservation, ObservedColumn,
+    ObservedRelation, ObservedSchema, QueryCostEstimate, QueryPreflight, QueryPreflightDecision,
+    QueryRequest, QueryResult, SchemaKnowledgeKind, SourceId,
 };
 
 pub use context::{ContextEvidence, ContextManifest, ContextOmission, InstructionTrust};

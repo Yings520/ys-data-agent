@@ -3,6 +3,7 @@ mod support;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use ys_agent_core::SourceId;
 use ysda::agent::QueryAgent;
 use ysda::domain::UserQuestion;
 use ysda::llm::{LlmClient, LlmConfig};
@@ -18,7 +19,7 @@ async fn completes_question_to_safe_query_result_and_trace() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices":[{
                 "message":{
-                    "content": "{\"sql\":\"SELECT name FROM customers ORDER BY id\",\"explanation\":\"List customers\"}"
+                    "content": "{\"sql\":\"SELECT order_id FROM mart_orders ORDER BY order_id\",\"explanation\":\"List orders\"}"
                 }
             }]
         })))
@@ -33,10 +34,12 @@ async fn completes_question_to_safe_query_result_and_trace() {
         }),
         TraceRecorder::new(&trace_directory),
         100,
+        SourceId::new("sqlite_demo"),
+        support::test_policy(),
     );
 
     let run = agent
-        .run(&database.path, UserQuestion::new("list customers"))
+        .run(&database.path, UserQuestion::new("list orders"))
         .await
         .expect("trace persistence should succeed");
 
@@ -60,7 +63,7 @@ async fn records_policy_rejection_without_executing_sql() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{
                 "message": {
-                    "content": "{\"sql\":\"DELETE FROM customers\",\"explanation\":\"unsafe test\"}"
+                    "content": "{\"sql\":\"DELETE FROM mart_orders\",\"explanation\":\"unsafe test\"}"
                 }
             }]
         })))
@@ -74,10 +77,12 @@ async fn records_policy_rejection_without_executing_sql() {
         }),
         TraceRecorder::new(&trace_directory),
         100,
+        SourceId::new("sqlite_demo"),
+        support::test_policy(),
     );
 
     let run = agent
-        .run(&database.path, UserQuestion::new("delete customers"))
+        .run(&database.path, UserQuestion::new("delete orders"))
         .await
         .expect("failure trace should still save");
 
