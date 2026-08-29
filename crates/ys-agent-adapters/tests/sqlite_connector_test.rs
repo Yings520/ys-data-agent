@@ -69,6 +69,7 @@ impl SqliteFixture {
         QueryRequest {
             source_id: self.source_id.clone(),
             sql: sql.to_owned(),
+            parameters: Vec::new(),
             budget: QueryBudget {
                 max_rows: 2,
                 max_result_bytes: 16 * 1024,
@@ -168,7 +169,7 @@ async fn sqlite_reads_freshness_from_the_configured_column() {
     let fixture = SqliteFixture::from_seed().await;
     let observation = fixture
         .connector
-        .read_freshness(&fixture.source_id, "mart_orders")
+        .read_freshness(&fixture.source_id, "mart_orders", "paid_at")
         .await
         .expect("read freshness");
 

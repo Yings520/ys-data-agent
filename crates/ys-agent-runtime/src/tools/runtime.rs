@@ -120,7 +120,7 @@ fn preflight(
     }
 
     if let Some(source_id) = arguments.get("source_id").and_then(Value::as_str)
-        && source_id != context.execution.allowed_data_scope.source_id
+        && source_id != context.execution.data_scope.source_id
     {
         return Err(failure(
             "source_acl_denied",
@@ -281,7 +281,7 @@ impl ToolRuntime {
         let kind = match outcome {
             ToolOutcome::Succeeded { artifacts, .. } => RunEventKind::ToolExecutionSucceeded {
                 call_id: context.call_id,
-                artifacts: artifacts.clone(),
+                artifacts: artifacts.iter().map(|artifact| artifact.id).collect(),
             },
             ToolOutcome::Failed { failure } | ToolOutcome::Rejected { failure } => {
                 RunEventKind::ToolExecutionFailed {
@@ -426,7 +426,10 @@ impl ToolRuntime {
                 };
             }
         };
-        if output_bytes > context.execution.query_budget.max_result_bytes {
+        let effective_output_limit = spec
+            .max_output_bytes
+            .min(context.execution.query_budget.max_result_bytes);
+        if output_bytes > effective_output_limit {
             return ToolOutcome::Failed {
                 failure: failure(
                     "tool_output_budget_exceeded",

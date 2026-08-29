@@ -37,6 +37,7 @@ fn schema_tool() -> ToolSpec {
         side_effect: SideEffect::None,
         idempotent: true,
         timeout_ms: 5_000,
+        max_output_bytes: 4_096,
         required_permissions: vec!["data_query".to_owned()],
         input_sensitivity: Sensitivity::Internal,
         output_sensitivity: Sensitivity::Internal,

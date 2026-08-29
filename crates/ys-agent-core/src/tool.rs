@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{ArtifactId, Sensitivity, ToolCallId};
+use crate::{ArtifactMetadata, Sensitivity, ToolCallId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +65,7 @@ pub struct ToolSpec {
     pub side_effect: SideEffect,
     pub idempotent: bool,
     pub timeout_ms: u64,
+    pub max_output_bytes: usize,
     pub required_permissions: Vec<String>,
     pub input_sensitivity: Sensitivity,
     pub output_sensitivity: Sensitivity,
@@ -87,7 +88,7 @@ pub enum ToolOutcome {
     Succeeded {
         message: String,
         output: Value,
-        artifacts: Vec<ArtifactId>,
+        artifacts: Vec<ArtifactMetadata>,
     },
     Failed {
         failure: ToolFailure,
@@ -130,6 +131,13 @@ impl ToolOutcome {
         match self {
             Self::Succeeded { output, .. } => Some(output),
             Self::Failed { .. } | Self::Rejected { .. } | Self::Indeterminate { .. } => None,
+        }
+    }
+
+    pub fn artifact_metadata(&self) -> &[ArtifactMetadata] {
+        match self {
+            Self::Succeeded { artifacts, .. } => artifacts,
+            Self::Failed { .. } | Self::Rejected { .. } | Self::Indeterminate { .. } => &[],
         }
     }
 }

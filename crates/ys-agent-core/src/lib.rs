@@ -54,7 +54,10 @@ pub use ports::{
     SqlQueryExecutor, Tool, ToolExecutionContext,
 };
 
-pub use query::{AllowedDataScope, ColumnPolicy, QueryBudget, QueryIntent};
+pub use query::{
+    AllowedDataScope, ColumnPolicy, QueryBudget, QueryExecutionPlan, QueryIntent, QueryParameter,
+    QueryPlan, SemanticStatus, TimeRange,
+};
 pub use run::{Run, RunSnapshot, RunStatus, WorkflowKind};
 pub use session::Session;
 pub use task::{Task, TaskStatus};
