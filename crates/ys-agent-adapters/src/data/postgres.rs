@@ -12,8 +12,8 @@ use sqlx::{AssertSqlSafe, Column, PgPool, Postgres, Row, Transaction, TypeInfo, 
 use ys_agent_core::{
     CapabilityDescriptor, CatalogReader, CellValue, CoreError, CoreResult, FreshnessObservation,
     FreshnessReader, ObservedColumn, ObservedRelation, ObservedSchema, QueryCostEstimate,
-    QueryPreflight, QueryPreflightDecision, QueryPreflightReader, QueryRequest, QueryResult,
-    SchemaKnowledgeKind, SourceId, SqlQueryExecutor,
+    QueryParameter, QueryPreflight, QueryPreflightDecision, QueryPreflightReader, QueryRequest,
+    QueryResult, SchemaKnowledgeKind, SourceId, SqlQueryExecutor,
 };
 
 use super::result_policy::{
@@ -216,13 +216,23 @@ impl PostgresConnector {
 
     async fn execute_postgres_rows(
         transaction: &mut Transaction<'_, Postgres>,
-        sql: &str,
+        request: &QueryRequest,
         max_rows: usize,
         max_result_bytes: usize,
         backend_pid: i32,
     ) -> CoreResult<DecodedQueryResult> {
         let mut columns = Vec::new();
-        let mut stream = sqlx::query(AssertSqlSafe(sql)).fetch(&mut **transaction);
+        let mut query = sqlx::query(AssertSqlSafe(request.sql.as_str()));
+        for parameter in &request.parameters {
+            query = match parameter {
+                QueryParameter::Timestamp(value) => query.bind(*value),
+                QueryParameter::Text(value) => query.bind(value.clone()),
+                QueryParameter::Integer(value) => query.bind(*value),
+                QueryParameter::Real(value) => query.bind(*value),
+                QueryParameter::Boolean(value) => query.bind(*value),
+            };
+        }
+        let mut stream = query.fetch(&mut **transaction);
         let mut rows = Vec::new();
         let mut serialized_bytes = 0usize;
         let mut truncated = false;
@@ -297,7 +307,7 @@ impl PostgresConnector {
             .map_err(|_| safe_database_error("read PostgreSQL backend id"))?;
         let decoded = Self::execute_postgres_rows(
             &mut transaction,
-            &request.sql,
+            &request,
             request.budget.max_rows,
             request.budget.max_result_bytes,
             backend_pid,
@@ -525,19 +535,14 @@ impl FreshnessReader for PostgresConnector {
         &self,
         source_id: &SourceId,
         relation: &str,
+        time_column: &str,
     ) -> CoreResult<FreshnessObservation> {
         ensure_source(&self.config.source_id, source_id)?;
-        let column = self.config.freshness_columns.get(relation).ok_or_else(|| {
-            CoreError::validation(
-                "freshness_column_not_configured",
-                format!("no freshness column configured for {relation}"),
-            )
-        })?;
         let scope = self
             .result_policy
             .allowed_scope(ys_agent_core::WorkspaceId::new(), source_id)?;
-        ensure_freshness_scope(&scope, relation, column)?;
-        read_postgres_freshness(&self.pool, source_id, relation, column).await
+        ensure_freshness_scope(&scope, relation, time_column)?;
+        read_postgres_freshness(&self.pool, source_id, relation, time_column).await
     }
 }
 

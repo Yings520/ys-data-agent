@@ -24,7 +24,9 @@ ys-agent-core = { path = "../ys-agent-core" }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true
 wiremock.workspace = true
+ys-agent-store = { path = "../ys-agent-store" }
 
 [lints]
 workspace = true

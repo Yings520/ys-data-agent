@@ -1,25 +1,61 @@
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::WorkspaceId;
+use crate::{ArtifactId, SourceId, WorkspaceId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryIntent {
+    GovernedMetric,
+    AdHocRead,
+    Metadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticStatus {
+    Confirmed,
+    Inferred,
+    Observed,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum QueryIntent {
-    GovernedMetric {
+pub struct TimeRange {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QueryExecutionPlan {
+    Metric {
         metric_id: String,
-        metric_version: String,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         dimensions: Vec<String>,
-        time_range: String,
     },
-    AdHocRead {
-        question: String,
-        assumed_relations: Vec<String>,
+    AdHoc {
+        sql: String,
+        assumption_refs: Vec<ArtifactId>,
     },
-    Metadata {
-        subject: String,
-    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlan {
+    pub source_id: SourceId,
+    pub execution: QueryExecutionPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum QueryParameter {
+    Timestamp(DateTime<Utc>),
+    Text(String),
+    Integer(i64),
+    Real(f64),
+    Boolean(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +85,6 @@ impl Default for QueryBudget {
     }
 }
 
-/// v0.2: exact relation → allowed columns. No wildcards.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllowedDataScope {
     pub workspace_id: WorkspaceId,

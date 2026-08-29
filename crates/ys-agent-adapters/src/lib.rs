@@ -3,6 +3,7 @@
 pub mod context;
 pub mod data;
 pub mod model;
+pub mod tools;
 
 pub use context::{DbtManifestAdapter, FileMetricRegistry};
 pub use data::{
@@ -10,4 +11,9 @@ pub use data::{
     RestrictedResultContext, RestrictedResultPayload, ResultPolicy, SqlPolicyDecision,
     SqlPolicyDisposition, SqlPolicyReason, SqlReadOnlyPolicy, SqliteConnector,
     SqliteConnectorConfig, SupportedDialect,
+};
+pub use tools::{
+    ArtifactLookup, ArtifactRecord, CompiledQuery, ConnectorHandle, ConnectorRegistry,
+    InspectSchemaTool, MetricSqlCompiler, MetricSqlDialect, QueryDataInput, QueryDataTool,
+    ReadFreshnessTool, ResolveMetricTool, RuntimeArtifactLookup,
 };

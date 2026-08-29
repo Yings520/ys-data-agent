@@ -41,6 +41,7 @@ fn tool(name: &str) -> ToolSpec {
         side_effect: ys_agent_core::SideEffect::None,
         idempotent: true,
         timeout_ms: 1_000,
+        max_output_bytes: 4_096,
         required_permissions: vec!["data_query".to_owned()],
         input_sensitivity: Sensitivity::Internal,
         output_sensitivity: Sensitivity::Internal,

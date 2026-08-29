@@ -24,6 +24,7 @@ fn request(
     QueryRequest {
         source_id: source_id.clone(),
         sql: sql.to_owned(),
+        parameters: Vec::new(),
         budget: QueryBudget {
             max_rows: 2,
             max_result_bytes: 16 * 1024,
@@ -104,7 +105,7 @@ async fn postgres_exposes_bounded_read_only_query_capabilities() {
     assert!(result.remote_query_id.is_some());
 
     let freshness = connector
-        .read_freshness(&source_id, "public.orders")
+        .read_freshness(&source_id, "public.orders", "paid_at")
         .await
         .expect("read PostgreSQL freshness");
     assert!(freshness.data_as_of.is_some());
