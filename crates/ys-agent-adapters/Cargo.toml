@@ -14,9 +14,10 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
+sha2.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
 sqlx.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 uuid.workspace = true
 ys-agent-core = { path = "../ys-agent-core" }
