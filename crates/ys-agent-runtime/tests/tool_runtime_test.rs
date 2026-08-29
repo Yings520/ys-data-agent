@@ -504,7 +504,7 @@ fn preview_is_redacted_above_workspace_preview_sensitivity() {
 }
 
 #[test]
-fn tool_view_hash_is_shared_by_manifest_and_model_event() {
+fn tool_view_version_is_shared_by_manifest_and_model_event() {
     let catalog = catalog_with_query_tools();
     let principal = Principal::local_operator("ysc");
     let view = ToolViewBuilder::new(&catalog)
@@ -521,11 +521,15 @@ fn tool_view_hash_is_shared_by_manifest_and_model_event() {
     let event = RunEventKind::ModelRequested {
         model_call_id: "model-call-1".to_owned(),
         context_manifest_id: ArtifactId::new(),
-        tool_view_hash: view.content_hash().to_owned(),
+        tool_view_version: view.content_hash().to_owned(),
+        prompt_version: "v1".to_owned(),
     };
 
-    let RunEventKind::ModelRequested { tool_view_hash, .. } = event else {
+    let RunEventKind::ModelRequested {
+        tool_view_version, ..
+    } = event
+    else {
         unreachable!("constructed ModelRequested")
     };
-    assert_eq!(manifest.tool_view_version, tool_view_hash);
+    assert_eq!(manifest.tool_view_version, tool_view_version);
 }

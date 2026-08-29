@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::PrincipalId;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricStatus {
@@ -20,6 +18,6 @@ pub struct MetricDefinition {
     pub expression: String,
     pub time_column: String,
     pub allowed_dimensions: Vec<String>,
-    pub owner: Option<PrincipalId>,
+    pub owner: String,
     pub freshness_sla_seconds: Option<u64>,
 }

@@ -11,10 +11,21 @@ pub enum InstructionTrust {
     UntrustedData,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSourceType {
+    MetricRegistry,
+    DbtManifest,
+    ObservedSchema,
+    Freshness,
+    TaskSummary,
+    Fixture,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextEvidence {
     pub source: String,
-    pub source_type: String,
+    pub source_type: ContextSourceType,
     pub version: String,
     pub observed_at: DateTime<Utc>,
     pub freshness: Option<DateTime<Utc>>,
@@ -31,7 +42,7 @@ impl ContextEvidence {
     pub fn fixture(text: impl Into<String>) -> Self {
         Self {
             source: "fixture://content".to_owned(),
-            source_type: "fixture".to_owned(),
+            source_type: ContextSourceType::Fixture,
             version: "v0".to_owned(),
             observed_at: Utc::now(),
             freshness: None,

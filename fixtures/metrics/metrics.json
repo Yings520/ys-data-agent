@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "metrics": [
+    {
+      "id": "commerce.gmv",
+      "version": 1,
+      "status": "active",
+      "description": "Paid order amount excluding cancelled orders",
+      "source_relation": "mart_orders",
+      "expression": "SUM(paid_amount)",
+      "time_column": "paid_at",
+      "allowed_dimensions": ["country", "channel"],
+      "owner": "data-team",
+      "freshness_sla_seconds": 86400
+    },
+    {
+      "id": "commerce.gmv_draft",
+      "version": 1,
+      "status": "draft",
+      "description": "Unapproved candidate",
+      "source_relation": "mart_orders",
+      "expression": "SUM(gross_amount)",
+      "time_column": "paid_at",
+      "allowed_dimensions": [],
+      "owner": "data-team",
+      "freshness_sla_seconds": 86400
+    }
+  ]
+}
