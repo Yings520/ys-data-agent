@@ -191,18 +191,18 @@ fn governed_context_for(
 
     GovernedToolContext {
         execution: ToolExecutionContext {
-            call_id: ToolCallId::new(),
             workspace_id,
             task_id: TaskId::new(),
             run_id: RunId::new(),
-            principal,
+            principal_id: principal.id,
             query_budget: QueryBudget::default(),
-            data_scope: AllowedDataScope {
+            allowed_data_scope: AllowedDataScope {
                 workspace_id,
                 source_id: "warehouse".to_owned(),
                 relations: BTreeMap::new(),
             },
         },
+        call_id: ToolCallId::new(),
         view,
         policy: WorkspaceToolPolicy::default(),
         run_status: RunStatus::Running,
