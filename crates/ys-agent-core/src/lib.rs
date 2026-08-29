@@ -28,7 +28,9 @@ pub use connector::{
     QueryRequest, QueryResult, SchemaKnowledgeKind, SourceId,
 };
 
-pub use context::{ContextEvidence, ContextManifest, ContextOmission, InstructionTrust};
+pub use context::{
+    ContextEvidence, ContextManifest, ContextOmission, ContextSourceType, InstructionTrust,
+};
 pub use error::{CoreError, CoreResult};
 pub use event::{
     EventActor, EventEnvelope, PendingRunEvent, PolicyDecision, RunEventKind, VersionedRunEvent,
