@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
 use ys_agent_core::{
-    Capability, CoreResult, CostClass, EventActor, PendingRunEvent, PolicyDecision, RunEventKind,
-    RunId, RunStatus, SideEffect, Tool, ToolFailure, ToolFailureCategory, ToolOutcome, ToolSpec,
+    CoreResult, CostClass, EventActor, PendingRunEvent, PolicyDecision, RunEventKind, RunId,
+    RunStatus, SideEffect, Tool, ToolCallId, ToolFailure, ToolFailureCategory, ToolOutcome,
+    ToolSpec,
 };
 
 use super::{ToolView, WorkspaceToolPolicy, catalog::validate_instance};
@@ -13,6 +14,7 @@ use super::{ToolView, WorkspaceToolPolicy, catalog::validate_instance};
 #[derive(Clone)]
 pub struct GovernedToolContext {
     pub execution: ys_agent_core::ToolExecutionContext,
+    pub call_id: ToolCallId,
     pub view: ToolView,
     pub policy: WorkspaceToolPolicy,
     pub run_status: RunStatus,
@@ -84,11 +86,7 @@ fn preflight(
     }
 
     let has_effective_permission = visible_spec.required_permissions.len() == 1
-        && visible_spec.required_permissions[0] == "data_query"
-        && context
-            .execution
-            .principal
-            .has_capability(Capability::DataQuery);
+        && visible_spec.required_permissions[0] == "data_query";
     if !has_effective_permission {
         return Err(failure(
             "missing_data_query_permission",
@@ -122,7 +120,7 @@ fn preflight(
     }
 
     if let Some(source_id) = arguments.get("source_id").and_then(Value::as_str)
-        && source_id != context.execution.data_scope.source_id
+        && source_id != context.execution.allowed_data_scope.source_id
     {
         return Err(failure(
             "source_acl_denied",
@@ -235,7 +233,7 @@ impl ToolRuntime {
             .emit(PendingRunEvent {
                 actor: EventActor::System,
                 kind: RunEventKind::PolicyEvaluated {
-                    call_id: context.execution.call_id,
+                    call_id: context.call_id,
                     decision: PolicyDecision::Allow,
                 },
             })
@@ -251,7 +249,7 @@ impl ToolRuntime {
             .emit(PendingRunEvent {
                 actor: EventActor::System,
                 kind: RunEventKind::PolicyEvaluated {
-                    call_id: context.execution.call_id,
+                    call_id: context.call_id,
                     decision: PolicyDecision::Deny {
                         code: denied.code.clone(),
                         message: denied.user_message.clone(),
@@ -268,7 +266,7 @@ impl ToolRuntime {
                     name: tool_name.to_owned(),
                 },
                 kind: RunEventKind::ToolExecutionStarted {
-                    call_id: context.execution.call_id,
+                    call_id: context.call_id,
                 },
             })
             .await
@@ -282,17 +280,17 @@ impl ToolRuntime {
     ) -> CoreResult<()> {
         let kind = match outcome {
             ToolOutcome::Succeeded { artifacts, .. } => RunEventKind::ToolExecutionSucceeded {
-                call_id: context.execution.call_id,
+                call_id: context.call_id,
                 artifacts: artifacts.clone(),
             },
             ToolOutcome::Failed { failure } | ToolOutcome::Rejected { failure } => {
                 RunEventKind::ToolExecutionFailed {
-                    call_id: context.execution.call_id,
+                    call_id: context.call_id,
                     failure: failure.clone(),
                 }
             }
             ToolOutcome::Indeterminate { failure } => RunEventKind::ToolExecutionIndeterminate {
-                call_id: context.execution.call_id,
+                call_id: context.call_id,
                 failure: failure.clone(),
             },
         };
