@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params_from_iter, types::Value as SqliteValue};
 use ys_agent_core::{
     CapabilityDescriptor, CatalogReader, CellValue, CoreError, CoreResult, FreshnessObservation,
-    FreshnessReader, ObservedColumn, ObservedRelation, ObservedSchema, QueryRequest, QueryResult,
-    SchemaKnowledgeKind, SourceId, SqlQueryExecutor,
+    FreshnessReader, ObservedColumn, ObservedRelation, ObservedSchema, QueryParameter,
+    QueryRequest, QueryResult, SchemaKnowledgeKind, SourceId, SqlQueryExecutor,
 };
 
 use super::result_policy::{
@@ -68,10 +68,18 @@ impl SqliteConnector {
 
         let path = self.config.database_path.clone();
         let sql = request.sql.clone();
+        let parameters = request.parameters.clone();
         let budget = request.budget.clone();
-        let decoded =
-            blocking(move || execute_read(&path, &sql, budget.max_rows, budget.max_result_bytes))
-                .await?;
+        let decoded = blocking(move || {
+            execute_read(
+                &path,
+                &sql,
+                parameters,
+                budget.max_rows,
+                budget.max_result_bytes,
+            )
+        })
+        .await?;
 
         self.result_policy.apply(
             &request.source_id,
@@ -99,6 +107,7 @@ fn open_read_only(path: &Path) -> CoreResult<Connection> {
 fn execute_read(
     path: &Path,
     sql: &str,
+    parameters: Vec<QueryParameter>,
     max_rows: usize,
     max_result_bytes: usize,
 ) -> CoreResult<DecodedQueryResult> {
@@ -112,8 +121,12 @@ fn execute_read(
         .map(|name| (*name).to_owned())
         .collect::<Vec<_>>();
     let column_count = columns.len();
+    let bound = parameters
+        .into_iter()
+        .map(sqlite_parameter)
+        .collect::<CoreResult<Vec<_>>>()?;
     let mut cursor = statement
-        .query([])
+        .query(params_from_iter(bound.iter()))
         .map_err(|error| storage_error("execute SQLite query", error))?;
     let mut rows = Vec::new();
     let mut serialized_bytes = 0usize;
@@ -155,6 +168,16 @@ fn execute_read(
         remote_query_id: None,
         warning_codes: Vec::new(),
     })
+}
+
+fn sqlite_parameter(parameter: QueryParameter) -> CoreResult<SqliteValue> {
+    match parameter {
+        QueryParameter::Timestamp(value) => Ok(SqliteValue::Text(value.to_rfc3339())),
+        QueryParameter::Text(value) => Ok(SqliteValue::Text(value)),
+        QueryParameter::Integer(value) => Ok(SqliteValue::Integer(value)),
+        QueryParameter::Real(value) => Ok(SqliteValue::Real(value)),
+        QueryParameter::Boolean(value) => Ok(SqliteValue::Integer(if value { 1 } else { 0 })),
+    }
 }
 
 fn decode_sqlite_value(value: ValueRef<'_>) -> CellValue {
@@ -298,27 +321,18 @@ impl FreshnessReader for SqliteConnector {
         &self,
         source_id: &SourceId,
         relation: &str,
+        time_column: &str,
     ) -> CoreResult<FreshnessObservation> {
         ensure_source(&self.config.source_id, source_id)?;
-        let column = self
-            .config
-            .freshness_columns
-            .get(relation)
-            .cloned()
-            .ok_or_else(|| {
-                CoreError::validation(
-                    "freshness_column_not_configured",
-                    format!("no freshness column configured for {relation}"),
-                )
-            })?;
         let scope = self
             .result_policy
             .allowed_scope(ys_agent_core::WorkspaceId::new(), source_id)?;
-        ensure_freshness_scope(&scope, relation, &column)?;
+        ensure_freshness_scope(&scope, relation, time_column)?;
         let path = self.config.database_path.clone();
         let source_id = source_id.clone();
         let relation = relation.to_owned();
-        blocking(move || read_sqlite_freshness(&path, &source_id, &relation, &column)).await
+        let time_column = time_column.to_owned();
+        blocking(move || read_sqlite_freshness(&path, &source_id, &relation, &time_column)).await
     }
 }
 

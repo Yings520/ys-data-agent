@@ -5,9 +5,9 @@ use crate::{
     AllowedDataScope, ArtifactAccessContext, ArtifactMetadata, ArtifactRef, CommandId,
     CommandReceipt, ContextEvidence, CoreResult, EventEnvelope, FreshnessObservation,
     MetricDefinition, ModelCapabilities, ModelRequest, ModelResponse, ObservedSchema,
-    PendingRunEvent, PrincipalId, PutArtifact, QueryBudget, QueryPreflight, QueryRequest,
-    QueryResult, RunId, RunSnapshot, Session, SessionId, SourceId, Task, TaskId, ToolOutcome,
-    ToolSpec, WorkspaceId,
+    PendingRunEvent, Principal, PutArtifact, QueryBudget, QueryPreflight, QueryRequest,
+    QueryResult, RunId, RunSnapshot, Session, SessionId, SourceId, Task, TaskId, ToolCallId,
+    ToolOutcome, ToolSpec, WorkspaceId,
 };
 
 /// Atomic control-plane mutation unit for RuntimeStore::commit_command.
@@ -76,12 +76,14 @@ pub trait ModelProvider: Send + Sync {
 /// Runtime-owned governance passed to every v0.2 query Tool.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionContext {
+    pub call_id: ToolCallId,
     pub workspace_id: WorkspaceId,
     pub task_id: TaskId,
     pub run_id: RunId,
-    pub principal_id: PrincipalId,
+    pub principal: Principal,
     pub query_budget: QueryBudget,
-    pub allowed_data_scope: AllowedDataScope,
+    pub data_scope: AllowedDataScope,
+    pub confirmation_granted: bool,
 }
 
 #[async_trait]
@@ -116,6 +118,7 @@ pub trait FreshnessReader: Send + Sync {
         &self,
         source_id: &SourceId,
         relation: &str,
+        time_column: &str,
     ) -> CoreResult<FreshnessObservation>;
 }
 

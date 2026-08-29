@@ -62,6 +62,7 @@ impl TestTool {
                 side_effect: SideEffect::None,
                 idempotent: true,
                 timeout_ms: 1_000,
+                max_output_bytes: 4_096,
                 required_permissions: vec!["data_query".to_owned()],
                 input_sensitivity: Sensitivity::Internal,
                 output_sensitivity: Sensitivity::Internal,
@@ -191,16 +192,18 @@ fn governed_context_for(
 
     GovernedToolContext {
         execution: ToolExecutionContext {
+            call_id: ToolCallId::new(),
             workspace_id,
             task_id: TaskId::new(),
             run_id: RunId::new(),
-            principal_id: principal.id,
+            principal,
             query_budget: QueryBudget::default(),
-            allowed_data_scope: AllowedDataScope {
+            data_scope: AllowedDataScope {
                 workspace_id,
                 source_id: "warehouse".to_owned(),
                 relations: BTreeMap::new(),
             },
+            confirmation_granted: false,
         },
         call_id: ToolCallId::new(),
         view,

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{AllowedDataScope, CoreError, CoreResult, QueryBudget, Sensitivity};
+use crate::{AllowedDataScope, CoreError, CoreResult, QueryBudget, QueryParameter, Sensitivity};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceId(String);
@@ -136,6 +136,7 @@ pub enum CellValue {
 pub struct QueryRequest {
     pub source_id: SourceId,
     pub sql: String,
+    pub parameters: Vec<QueryParameter>,
     pub budget: QueryBudget,
     pub query_tag: String,
     pub scope: AllowedDataScope,
