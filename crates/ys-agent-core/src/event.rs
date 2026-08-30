@@ -2,8 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentAction, ArtifactId, ArtifactMetadata, CoreError, CoreResult, EventId, PrincipalId, RunId,
-    StepId, TaskId, ToolCall, ToolCallId, ToolFailure, WorkspaceId,
+    AgentAction, ArtifactId, ArtifactMetadata, CoreError, CoreResult, CostClass, EventId,
+    PrincipalId, RunId, RunSnapshot, StepId, TaskId, ToolCall, ToolCallId, ToolFailure,
+    WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +88,7 @@ pub enum RunEventKind {
     },
     ToolExecutionStarted {
         call_id: ToolCallId,
+        cost_class: CostClass,
     },
     ToolExecutionSucceeded {
         call_id: ToolCallId,
@@ -124,6 +126,9 @@ pub enum RunEventKind {
     },
     RunCancelled {
         reason: String,
+    },
+    RunStateProjected {
+        snapshot: Box<RunSnapshot>,
     },
 }
 

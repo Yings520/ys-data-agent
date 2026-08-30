@@ -16,6 +16,7 @@ tracing.workspace = true
 ys-agent-core = { path = "../ys-agent-core" }
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile.workspace = true
 ys-agent-adapters = { path = "../ys-agent-adapters" }
 ys-agent-store = { path = "../ys-agent-store" }

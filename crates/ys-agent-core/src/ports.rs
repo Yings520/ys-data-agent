@@ -36,6 +36,8 @@ pub trait RuntimeStore: Send + Sync {
 
     async fn load_run(&self, run_id: &RunId) -> CoreResult<RunSnapshot>;
 
+    async fn list_runs_for_task(&self, task_id: &TaskId) -> CoreResult<Vec<RunSnapshot>>;
+
     async fn load_artifact(&self, artifact_id: &crate::ArtifactId) -> CoreResult<ArtifactMetadata>;
 
     async fn list_tasks(&self, workspace_id: &WorkspaceId) -> CoreResult<Vec<Task>>;
@@ -45,6 +47,8 @@ pub trait RuntimeStore: Send + Sync {
         run_id: &RunId,
         after_sequence: u64,
     ) -> CoreResult<Vec<EventEnvelope>>;
+
+    async fn replace_snapshot_cache(&self, snapshot: &RunSnapshot) -> CoreResult<()>;
 
     async fn append(
         &self,

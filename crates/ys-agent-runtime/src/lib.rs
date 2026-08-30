@@ -2,6 +2,7 @@ mod context_assembler;
 mod coordinator;
 mod harness;
 mod loop_driver;
+mod recovery;
 mod service;
 
 pub mod workflow;
@@ -17,6 +18,7 @@ pub use harness::{Harness, HarnessConfig, HarnessDependencies};
 pub use loop_driver::{
     HarnessStep, LoopBudget, LoopDriver, LoopResult, LoopUsage, StepAccounting, StepOutcome,
 };
+pub use recovery::{RecoveryDecision, RecoveryManager, RecoveryRequest};
 pub use service::{
     AgentServiceApi, ArtifactView, CreateTaskRequest, EventSubscription, InProcessAgentService,
     NoopRunScheduler, RunScheduler, SendMessageRequest, ServiceEvent, ServiceEventPublisher,

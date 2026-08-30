@@ -216,6 +216,8 @@ mod tests {
             task_id: TaskId::new(),
             workflow: WorkflowKind::Query,
             status,
+            attempt: 1,
+            retry_of_run_id: None,
             version: 1,
             workflow_state: serde_json::json!({}),
             pending_wait_metadata: None,

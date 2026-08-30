@@ -778,6 +778,8 @@ impl QueryWorkflowFixture {
 }
 
 pub struct TestRunResult {
+    #[allow(dead_code)]
+    pub run_id: ys_agent_core::RunId,
     pub status: ys_agent_core::RunStatus,
     snapshot: ys_agent_core::RunSnapshot,
     failure_code: Option<String>,
@@ -804,6 +806,7 @@ impl TestRunResult {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
         Ok(Self {
+            run_id: snapshot.run_id,
             status: snapshot.status,
             snapshot,
             failure_code,
@@ -818,4 +821,491 @@ impl TestRunResult {
     pub fn pending_reason(&self) -> &str {
         self.pending_reason.as_deref().unwrap_or("")
     }
+}
+
+#[allow(dead_code)]
+struct RuntimeComponents {
+    runtime: Arc<ys_agent_store::SqliteRuntimeStore>,
+    service: Arc<ys_agent_runtime::InProcessAgentService>,
+    recovery: Arc<ys_agent_runtime::RecoveryManager>,
+    driver: ys_agent_runtime::LoopDriver,
+    tool_counts: Arc<StdMutex<BTreeMap<String, usize>>>,
+}
+
+#[allow(dead_code)]
+pub struct PersistentRuntimeFixture {
+    _root: tempfile::TempDir,
+    database_path: std::path::PathBuf,
+    artifact_root: std::path::PathBuf,
+    workspace_id: ys_agent_core::WorkspaceId,
+    principal: ys_agent_core::Principal,
+    actions: Arc<Mutex<VecDeque<ScriptedAction>>>,
+    current_run_id: Arc<Mutex<Option<ys_agent_core::RunId>>>,
+    live: Option<RuntimeComponents>,
+    pub run_id: ys_agent_core::RunId,
+    pub task_id: ys_agent_core::TaskId,
+    pub failed_run_id: ys_agent_core::RunId,
+    original_call_id: Option<ys_agent_core::ToolCallId>,
+}
+
+#[allow(dead_code)]
+impl PersistentRuntimeFixture {
+    fn live(&self) -> &RuntimeComponents {
+        self.live.as_ref().expect("Runtime fixture is open")
+    }
+
+    pub fn runtime(&self) -> &ys_agent_store::SqliteRuntimeStore {
+        self.live().runtime.as_ref()
+    }
+
+    pub fn service(&self) -> &ys_agent_runtime::InProcessAgentService {
+        self.live().service.as_ref()
+    }
+
+    pub fn recovery(&self) -> &ys_agent_runtime::RecoveryManager {
+        self.live().recovery.as_ref()
+    }
+
+    pub fn original_tool_call_id(&self) -> ys_agent_core::ToolCallId {
+        self.original_call_id
+            .expect("fixture has an interrupted Tool call")
+    }
+
+    pub fn close_runtime(&mut self) {
+        let old = self.live.take().expect("Runtime fixture is open");
+        drop(old);
+    }
+
+    pub async fn reopen(&self) -> ys_agent_core::CoreResult<ReopenedRuntime> {
+        if self.live.is_some() {
+            return Err(ys_agent_core::CoreError::validation(
+                "fixture_not_closed",
+                "close_runtime must drop old handles before reopen",
+            ));
+        }
+        let components = open_runtime_components(
+            &self.database_path,
+            &self.artifact_root,
+            self.workspace_id,
+            self.principal.clone(),
+            self.actions.clone(),
+            self.current_run_id.clone(),
+        )
+        .await?;
+        Ok(ReopenedRuntime {
+            runtime: components.runtime,
+            service: components.service,
+            recovery: components.recovery,
+            driver: components.driver,
+            tool_counts: components.tool_counts,
+            current_run_id: self.current_run_id.clone(),
+            run_id: self.run_id,
+            task_id: self.task_id,
+        })
+    }
+
+    async fn with_actions(actions: Vec<ScriptedAction>) -> Self {
+        let root = tempfile::tempdir().expect("persistent fixture root");
+        let database_path = root.path().join("runtime.db");
+        let artifact_root = root.path().join("artifacts");
+        let workspace_id = ys_agent_core::WorkspaceId::new();
+        let principal = ys_agent_core::Principal::local_operator("recovery-tutorial");
+        let actions = Arc::new(Mutex::new(VecDeque::from(actions)));
+        let current_run_id = Arc::new(Mutex::new(None));
+        let live = open_runtime_components(
+            &database_path,
+            &artifact_root,
+            workspace_id,
+            principal.clone(),
+            actions.clone(),
+            current_run_id.clone(),
+        )
+        .await
+        .expect("open persistent Runtime");
+        Self {
+            _root: root,
+            database_path,
+            artifact_root,
+            workspace_id,
+            principal,
+            actions,
+            current_run_id,
+            live: Some(live),
+            run_id: ys_agent_core::RunId::new(),
+            task_id: ys_agent_core::TaskId::new(),
+            failed_run_id: ys_agent_core::RunId::new(),
+            original_call_id: None,
+        }
+    }
+
+    pub async fn new() -> Self {
+        Self::with_actions(metric_success_script()).await
+    }
+
+    async fn create_run(&mut self, question: &str) -> ys_agent_core::RunSnapshot {
+        let session = ys_agent_runtime::AgentServiceApi::create_session(
+            self.service(),
+            ys_agent_core::CommandId::new(),
+            self.principal.clone(),
+        )
+        .await
+        .expect("create recovery Session");
+        let reply = ys_agent_runtime::AgentServiceApi::send_message(
+            self.service(),
+            ys_agent_runtime::SendMessageRequest::new(
+                ys_agent_core::CommandId::new(),
+                session.id,
+                question,
+            ),
+        )
+        .await
+        .expect("schedule recovery Run");
+        let run_id = reply.run_id().expect("Query Run ID");
+        let snapshot = self
+            .runtime()
+            .load_run(&run_id)
+            .await
+            .expect("load created Run");
+        self.run_id = run_id;
+        self.task_id = snapshot.task_id;
+        *self.current_run_id.lock().await = Some(run_id);
+        snapshot
+    }
+
+    pub async fn run_until_clarification(&mut self, question: &str) -> TestRunResult {
+        let snapshot = self.create_run(question).await;
+        let loop_result = self
+            .live()
+            .driver
+            .run(&snapshot.run_id)
+            .await
+            .expect("run to clarification");
+        TestRunResult::load(self.runtime(), loop_result.snapshot)
+            .await
+            .expect("load waiting Run")
+    }
+
+    async fn seed_started_tool(
+        &mut self,
+        call: ys_agent_core::ToolCall,
+        phase: ys_agent_runtime::tools::QueryPhase,
+        cost_class: ys_agent_core::CostClass,
+    ) {
+        let current = self
+            .runtime()
+            .load_run(&self.run_id)
+            .await
+            .expect("load crash Run");
+        let mut state =
+            ys_agent_runtime::QueryWorkflowState::from_snapshot(current.workflow_state.clone())
+                .expect("decode Query state");
+        state.phase = phase;
+        state.intent = Some(ys_agent_core::QueryIntent::GovernedMetric);
+        let next = ys_agent_core::RunSnapshot {
+            version: current.version + 1,
+            workflow_state: state.to_snapshot().expect("serialize crash state"),
+            ..current.clone()
+        };
+        let events = vec![
+            recovery_test_event(ys_agent_core::RunEventKind::ToolCallProposed {
+                call: call.clone(),
+            }),
+            recovery_test_event(ys_agent_core::RunEventKind::PolicyEvaluated {
+                call_id: call.id,
+                decision: ys_agent_core::PolicyDecision::Allow,
+            }),
+            ys_agent_core::PendingRunEvent {
+                actor: ys_agent_core::EventActor::Tool {
+                    name: call.name.clone(),
+                },
+                kind: ys_agent_core::RunEventKind::ToolExecutionStarted {
+                    call_id: call.id,
+                    cost_class,
+                },
+            },
+        ];
+        self.runtime()
+            .append(&self.run_id, current.version, vec![], events, &next)
+            .await
+            .expect("persist interrupted Tool boundary");
+        self.original_call_id = Some(call.id);
+    }
+
+    pub async fn crash_after_low_cost_tool_started() -> Self {
+        let mut fixture = Self::with_actions(metric_after_context_script()).await;
+        fixture.create_run("GMV for seven complete days").await;
+        let call = ys_agent_core::ToolCall {
+            id: ys_agent_core::ToolCallId::new(),
+            provider_call_id: None,
+            name: "resolve_metric".to_owned(),
+            arguments: json!({ "metric": "commerce.gmv" }),
+            version: "1.0.0".to_owned(),
+        };
+        fixture
+            .seed_started_tool(
+                call,
+                ys_agent_runtime::tools::QueryPhase::ResolveContext,
+                ys_agent_core::CostClass::Low,
+            )
+            .await;
+        fixture
+    }
+
+    pub async fn crash_after_high_cost_tool_started() -> Self {
+        let mut fixture = Self::with_actions(Vec::new()).await;
+        fixture.create_run("GMV for seven complete days").await;
+        let call = ys_agent_core::ToolCall {
+            id: ys_agent_core::ToolCallId::new(),
+            provider_call_id: None,
+            name: "query_data".to_owned(),
+            arguments: json!({
+                "action": "execute",
+                "plan_artifact_id": ys_agent_core::ArtifactId::new(),
+                "plan_hash": "sha256:interrupted-plan",
+                "preflight_artifact_id": ys_agent_core::ArtifactId::new(),
+                "preflight_hash": "sha256:interrupted-preflight",
+            }),
+            version: "1.0.0".to_owned(),
+        };
+        fixture
+            .seed_started_tool(
+                call,
+                ys_agent_runtime::tools::QueryPhase::Execute,
+                ys_agent_core::CostClass::High,
+            )
+            .await;
+        fixture
+    }
+
+    pub async fn failed_run() -> Self {
+        let mut fixture = Self::with_actions(Vec::new()).await;
+        let current = fixture.create_run("GMV").await;
+        let failed = ys_agent_core::RunSnapshot {
+            status: ys_agent_core::RunStatus::Failed,
+            version: current.version + 1,
+            ..current.clone()
+        };
+        fixture
+            .runtime()
+            .append(
+                &current.run_id,
+                current.version,
+                vec![],
+                vec![recovery_test_event(
+                    ys_agent_core::RunEventKind::RunFailed {
+                        code: "fixture_failure".to_owned(),
+                        message: "seeded failure".to_owned(),
+                    },
+                )],
+                &failed,
+            )
+            .await
+            .expect("persist failed Run");
+        fixture.failed_run_id = current.run_id;
+        fixture
+    }
+
+    pub async fn with_event_sequence_gap() -> Self {
+        let mut fixture = Self::with_actions(Vec::new()).await;
+        fixture.create_run("GMV").await;
+        let connection = rusqlite::Connection::open(&fixture.database_path)
+            .expect("open copied recovery database");
+        let changed = connection
+            .execute(
+                "UPDATE run_events
+                 SET sequence = sequence + 1
+                 WHERE run_id = ?1
+                   AND sequence = (
+                       SELECT MAX(sequence) FROM run_events WHERE run_id = ?1
+                   )",
+                [fixture.run_id.to_string()],
+            )
+            .expect("create Event sequence gap");
+        assert_eq!(changed, 1);
+        fixture
+    }
+}
+
+#[allow(dead_code)]
+pub struct ReopenedRuntime {
+    pub runtime: Arc<ys_agent_store::SqliteRuntimeStore>,
+    pub service: Arc<ys_agent_runtime::InProcessAgentService>,
+    pub recovery: Arc<ys_agent_runtime::RecoveryManager>,
+    driver: ys_agent_runtime::LoopDriver,
+    tool_counts: Arc<StdMutex<BTreeMap<String, usize>>>,
+    current_run_id: Arc<Mutex<Option<ys_agent_core::RunId>>>,
+    run_id: ys_agent_core::RunId,
+    task_id: ys_agent_core::TaskId,
+}
+
+#[allow(dead_code)]
+impl ReopenedRuntime {
+    pub async fn run_to_terminal(&self, run_id: &ys_agent_core::RunId) -> TestRunResult {
+        *self.current_run_id.lock().await = Some(*run_id);
+        let result = self.driver.run(run_id).await.expect("run after reopen");
+        TestRunResult::load(&self.runtime, result.snapshot)
+            .await
+            .expect("load terminal Run")
+    }
+
+    pub async fn resume(
+        &self,
+        command_id: ys_agent_core::CommandId,
+    ) -> ys_agent_core::CoreResult<TestRunResult> {
+        let run_id = ys_agent_runtime::AgentServiceApi::resume_task(
+            self.service.as_ref(),
+            command_id,
+            &self.task_id,
+        )
+        .await?;
+        *self.current_run_id.lock().await = Some(run_id);
+        let snapshot = self.runtime.load_run(&run_id).await?;
+        TestRunResult::load(&self.runtime, snapshot).await
+    }
+
+    pub async fn resume_to_terminal(&self, command_id: ys_agent_core::CommandId) -> TestRunResult {
+        let resumed = self.resume(command_id).await.expect("resume Run");
+        if resumed.status == ys_agent_core::RunStatus::Running {
+            self.run_to_terminal(&resumed.run_id).await
+        } else {
+            resumed
+        }
+    }
+
+    pub async fn has_indeterminate_event(&self, call_id: &ys_agent_core::ToolCallId) -> bool {
+        self.runtime
+            .load_events(&self.run_id, 0)
+            .await
+            .expect("load recovery Events")
+            .iter()
+            .any(|event| {
+                matches!(
+                    &event.event.kind,
+                    ys_agent_core::RunEventKind::ToolExecutionIndeterminate {
+                        call_id: observed,
+                        ..
+                    } if observed == call_id
+                )
+            })
+    }
+
+    pub async fn successful_tool_call_id(&self) -> ys_agent_core::ToolCallId {
+        self.runtime
+            .load_events(&self.run_id, 0)
+            .await
+            .expect("load recovery Events")
+            .iter()
+            .rev()
+            .find_map(|event| {
+                if let ys_agent_core::RunEventKind::ToolExecutionSucceeded { call_id, .. } =
+                    &event.event.kind
+                {
+                    Some(*call_id)
+                } else {
+                    None
+                }
+            })
+            .expect("a recovered Tool call succeeded")
+    }
+
+    pub fn tool_execution_count(&self) -> usize {
+        self.tool_counts.lock().unwrap().values().copied().sum()
+    }
+}
+
+#[allow(dead_code)]
+fn recovery_test_event(kind: ys_agent_core::RunEventKind) -> ys_agent_core::PendingRunEvent {
+    ys_agent_core::PendingRunEvent {
+        actor: ys_agent_core::EventActor::System,
+        kind,
+    }
+}
+
+#[allow(dead_code)]
+fn metric_after_context_script() -> Vec<ScriptedAction> {
+    vec![
+        metric_plan_response(
+            Utc.with_ymd_and_hms(2026, 8, 7, 0, 0, 0)
+                .single()
+                .expect("valid start"),
+            Utc.with_ymd_and_hms(2026, 8, 14, 0, 0, 0)
+                .single()
+                .expect("valid end"),
+        ),
+        call_query_data_preflight(),
+        call_query_data_execute(),
+        call_read_freshness(),
+        completion_response("GMV is 10 for the requested complete period."),
+    ]
+}
+
+#[allow(dead_code)]
+async fn open_runtime_components(
+    database_path: &std::path::Path,
+    artifact_root: &std::path::Path,
+    workspace_id: ys_agent_core::WorkspaceId,
+    principal: ys_agent_core::Principal,
+    actions: Arc<Mutex<VecDeque<ScriptedAction>>>,
+    current_run_id: Arc<Mutex<Option<ys_agent_core::RunId>>>,
+) -> ys_agent_core::CoreResult<RuntimeComponents> {
+    let runtime =
+        Arc::new(ys_agent_store::SqliteRuntimeStore::open(database_path.to_path_buf()).await?);
+    let artifacts = Arc::new(ys_agent_store::LocalArtifactStore::new(artifact_root)?);
+    let model: Arc<dyn ys_agent_core::ModelProvider> =
+        Arc::new(ys_agent_adapters::model::FakeModelProvider::new({
+            let actions = actions.clone();
+            let current_run_id = current_run_id.clone();
+            let runtime = runtime.clone();
+            move |_request| {
+                let actions = actions.clone();
+                let current_run_id = current_run_id.clone();
+                let runtime = runtime.clone();
+                async move {
+                    let scripted = actions.lock().await.pop_front().ok_or_else(|| {
+                        ys_agent_core::CoreError::validation(
+                            "model_script_exhausted",
+                            "recovery fixture has no next model action",
+                        )
+                    })?;
+                    let run_id =
+                        current_run_id
+                            .lock()
+                            .await
+                            .as_ref()
+                            .copied()
+                            .ok_or_else(|| {
+                                ys_agent_core::CoreError::validation(
+                                    "fixture_run_missing",
+                                    "recovery model needs a current Run ID",
+                                )
+                            })?;
+                    let snapshot = runtime.load_run(&run_id).await?;
+                    let state = ys_agent_runtime::QueryWorkflowState::from_snapshot(
+                        snapshot.workflow_state,
+                    )?;
+                    scripted.materialize(&state)
+                }
+            }
+        }));
+    let assembled = build_query_dependencies(
+        workspace_id,
+        principal.clone(),
+        runtime.clone(),
+        artifacts.clone(),
+        model,
+    )?;
+    let service = Arc::new(ys_agent_runtime::InProcessAgentService::new(
+        workspace_id,
+        runtime.clone(),
+        artifacts,
+        Arc::new(ys_agent_runtime::NoopRunScheduler),
+    ));
+    let recovery = Arc::new(ys_agent_runtime::RecoveryManager::new(runtime.clone()));
+    Ok(RuntimeComponents {
+        runtime,
+        service,
+        recovery,
+        driver: assembled.driver,
+        tool_counts: assembled.tool_counts,
+    })
 }

@@ -63,7 +63,9 @@ impl QueryWorkflow {
     pub fn next(&self, state: &QueryWorkflowState) -> CoreResult<WorkflowDirective> {
         match state.phase {
             QueryPhase::Clarify => {
-                if let Some(need) = material_ambiguity(&state.question) {
+                if let Some(need) = material_ambiguity(&state.question)
+                    && !state.answered_clarification_ids.contains(&need.id)
+                {
                     Ok(WorkflowDirective::Wait {
                         clarification_id: need.id,
                         question: need.question,

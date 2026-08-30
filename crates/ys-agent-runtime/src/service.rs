@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use async_trait::async_trait;
+use chrono::{TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -8,9 +9,9 @@ use tokio::sync::broadcast;
 use ys_agent_core::{
     ArtifactAccessContext, ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore,
     CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult, EventActor, EventEnvelope,
-    PendingRunEvent, Principal, PutArtifact, Run, RunEventKind, RunId, RunSnapshot, RunStatus,
-    RuntimeCommandBatch, RuntimeStore, Sensitivity, Session, SessionId, Task, TaskId, WorkflowKind,
-    WorkspaceId,
+    PendingRunEvent, Principal, PutArtifact, RetentionPolicy, Run, RunEventKind, RunId,
+    RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, Sensitivity, Session, SessionId,
+    Task, TaskId, WorkflowKind, WorkspaceId,
 };
 
 use crate::coordinator::{CoordinationDecision, Coordinator, FutureWorkflow, RuleBasedCoordinator};
@@ -568,10 +569,11 @@ impl AgentServiceApi for InProcessAgentService {
                 "a completed or cancelled task cannot be resumed",
             ));
         }
-        let snapshot = running_snapshot(task.id, &task.goal)?;
-        let proposed_run_id = snapshot.run_id;
-        let stored = self
-            .commit_run(
+        let runs = self.store.list_runs_for_task(task_id).await?;
+        let Some(previous) = runs.last() else {
+            let snapshot = running_snapshot(task.id, &task.goal)?;
+            let run_id = snapshot.run_id;
+            self.commit_run(
                 command_id,
                 fingerprint,
                 None,
@@ -579,12 +581,88 @@ impl AgentServiceApi for InProcessAgentService {
                 vec![system_event(RunEventKind::RunStarted)],
             )
             .await?;
-        let run_id = required_run_id(&stored)?;
-        if run_id == proposed_run_id {
             self.scheduler.schedule(run_id).await?;
-            self.event_publisher().notify(run_id, 1);
+            self.event_publisher().notify(run_id, u64::MAX);
+            return Ok(run_id);
+        };
+
+        if previous.status == RunStatus::Failed {
+            let retry = RunSnapshot {
+                run_id: RunId::new(),
+                task_id: previous.task_id,
+                workflow: previous.workflow,
+                status: RunStatus::Running,
+                attempt: previous.attempt + 1,
+                retry_of_run_id: Some(previous.run_id),
+                version: 1,
+                workflow_state: previous.workflow_state.clone(),
+                pending_wait_metadata: None,
+                primary_artifact_id: None,
+                last_completed_step_id: None,
+            };
+            let receipt = CommandReceipt {
+                command_id,
+                command_fingerprint: fingerprint.clone(),
+                result_kind: CommandResultKind::RunStarted,
+                session_id: None,
+                task_id: Some(*task_id),
+                run_id: Some(retry.run_id),
+            };
+            self.store
+                .commit_command(RuntimeCommandBatch {
+                    command_id,
+                    command_fingerprint: fingerprint,
+                    receipt,
+                    new_session: None,
+                    new_task: None,
+                    new_run_snapshot: Some(retry.clone()),
+                    new_artifact: None,
+                    pending_events: vec![system_event(RunEventKind::RunStarted)],
+                    snapshot_update: None,
+                })
+                .await?;
+            self.scheduler.schedule(retry.run_id).await?;
+            self.event_publisher().notify(retry.run_id, u64::MAX);
+            return Ok(retry.run_id);
         }
-        Ok(run_id)
+
+        let recovery = crate::RecoveryManager::new(self.store.clone());
+        let applied = recovery
+            .apply(
+                &previous.run_id,
+                crate::RecoveryRequest {
+                    explicit_resume: true,
+                    high_cost_retry_confirmed: false,
+                },
+            )
+            .await?;
+        let receipt = CommandReceipt {
+            command_id,
+            command_fingerprint: fingerprint.clone(),
+            result_kind: CommandResultKind::RunResumed,
+            session_id: None,
+            task_id: Some(*task_id),
+            run_id: Some(applied.snapshot.run_id),
+        };
+        self.store
+            .commit_command(RuntimeCommandBatch {
+                command_id,
+                command_fingerprint: fingerprint,
+                receipt,
+                new_session: None,
+                new_task: None,
+                new_run_snapshot: None,
+                new_artifact: None,
+                pending_events: Vec::new(),
+                snapshot_update: None,
+            })
+            .await?;
+        if applied.schedule {
+            self.scheduler.schedule(applied.snapshot.run_id).await?;
+        }
+        self.event_publisher()
+            .notify(applied.snapshot.run_id, u64::MAX);
+        Ok(applied.snapshot.run_id)
     }
 
     async fn answer_clarification(
@@ -593,9 +671,16 @@ impl AgentServiceApi for InProcessAgentService {
         run_id: &RunId,
         answer: String,
     ) -> CoreResult<()> {
+        if answer.trim().is_empty() {
+            return Err(CoreError::validation(
+                "empty_clarification_answer",
+                "Clarification answer cannot be empty",
+            ));
+        }
+        let normalized_answer = answer.trim().to_ascii_lowercase();
         let fingerprint = command_fingerprint(
             "answer_clarification",
-            json!({ "run_id": run_id, "answer": answer }),
+            json!({ "run_id": run_id, "answer": &answer }),
         )?;
         if self
             .replayed_receipt(&command_id, &fingerprint)
@@ -608,19 +693,65 @@ impl AgentServiceApi for InProcessAgentService {
         let current = self.store.load_run(run_id).await?;
         if current.status != RunStatus::WaitingForInput {
             return Err(CoreError::validation(
-                "run_not_waiting",
-                "only a waiting Run accepts a clarification answer",
+                "run_not_waiting_for_input",
+                "Clarification can answer only a WaitingForInput Run",
             ));
         }
+        let pending = current.pending_wait_metadata.as_ref().ok_or_else(|| {
+            CoreError::validation(
+                "missing_wait_metadata",
+                "Waiting Run has no pending clarification metadata",
+            )
+        })?;
+        let clarification_id = pending
+            .get("clarification_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CoreError::validation(
+                    "missing_clarification_id",
+                    "Wait metadata has no clarification ID",
+                )
+            })?
+            .to_owned();
+        let mut state = crate::workflow::query::QueryWorkflowState::from_snapshot(
+            current.workflow_state.clone(),
+        )?;
+        let state_id = state
+            .pending_clarification
+            .as_ref()
+            .map(|need| need.id.as_str());
+        if state_id != Some(clarification_id.as_str()) {
+            return Err(CoreError::validation(
+                "clarification_id_mismatch",
+                "Snapshot clarification ID does not match wait metadata",
+            ));
+        }
+
+        if clarification_id.starts_with("confirm-high-cost-retry-") {
+            if !matches!(normalized_answer.as_str(), "yes" | "confirm" | "retry") {
+                return Err(CoreError::validation(
+                    "high_cost_retry_not_confirmed",
+                    "Answer must explicitly confirm the retry",
+                ));
+            }
+            let next_call = {
+                let previous = state.pending_recovery_call.as_ref().ok_or_else(|| {
+                    CoreError::validation(
+                        "pending_recovery_call_missing",
+                        "High-cost confirmation has no pending Tool call",
+                    )
+                })?;
+                crate::recovery::new_call_from(previous)
+            };
+            state.pending_recovery_call = Some(next_call);
+            state.recovery_confirmation_granted = true;
+        }
+
         let task = self.store.load_task(&current.task_id).await?;
         ensure_workspace(self.workspace_id, task.workspace_id)?;
-        let clarification_id = current
-            .pending_wait_metadata
-            .as_ref()
-            .and_then(|value| value.get("clarification_id"))
-            .and_then(Value::as_str)
-            .unwrap_or("clarification")
-            .to_owned();
+        let restricted =
+            pending.get("answer_sensitivity").and_then(Value::as_str) == Some("restricted");
+        let expires_at = restricted.then(|| Utc::now() + TimeDelta::days(7));
         let metadata = self
             .artifacts
             .put(PutArtifact {
@@ -630,17 +761,43 @@ impl AgentServiceApi for InProcessAgentService {
                 kind: ArtifactKind::ContextEvidence,
                 media_type: "text/plain; charset=utf-8".to_owned(),
                 bytes: answer.into_bytes(),
-                sensitivity: Sensitivity::Internal,
-                owner: Some(task.created_by),
-                retention_policy: None,
-                expires_at: None,
+                sensitivity: if restricted {
+                    Sensitivity::Restricted
+                } else {
+                    Sensitivity::Internal
+                },
+                owner: restricted.then_some(task.created_by),
+                retention_policy: Some(if restricted {
+                    RetentionPolicy::Days { days: 7 }
+                } else {
+                    RetentionPolicy::Session
+                }),
+                expires_at,
                 producer_step_id: None,
             })
             .await?;
-        let mut resumed = current.clone();
-        resumed.status = RunStatus::Running;
-        resumed.version += 1;
-        resumed.pending_wait_metadata = None;
+        state
+            .clarification_evidence
+            .push(ArtifactRef::new(metadata.clone()));
+        if !state.answered_clarification_ids.contains(&clarification_id) {
+            state
+                .answered_clarification_ids
+                .push(clarification_id.clone());
+        }
+        state.pending_clarification = None;
+        let resumed = RunSnapshot {
+            run_id: current.run_id,
+            task_id: current.task_id,
+            workflow: current.workflow,
+            status: RunStatus::Running,
+            attempt: current.attempt,
+            retry_of_run_id: current.retry_of_run_id,
+            version: current.version + 1,
+            workflow_state: state.to_snapshot()?,
+            pending_wait_metadata: None,
+            primary_artifact_id: current.primary_artifact_id,
+            last_completed_step_id: current.last_completed_step_id,
+        };
         let receipt = CommandReceipt {
             command_id,
             command_fingerprint: fingerprint.clone(),
@@ -800,15 +957,26 @@ fn waiting_snapshot(
     let mut run = Run::new(task_id, WorkflowKind::Query);
     run.start()?;
     run.wait_for_input(clarification_id)?;
-    Ok(run.snapshot(
-        json!({ "user_message": message }),
+    let mut state = crate::workflow::query::QueryWorkflowState::new(message)?;
+    state.pending_clarification = Some(crate::workflow::query::ClarificationNeed {
+        id: clarification_id.to_owned(),
+        question: question.to_owned(),
+        reason: "clarification".to_owned(),
+    });
+    let mut snapshot = run.snapshot(
+        state.to_snapshot()?,
         Some(json!({
             "clarification_id": clarification_id,
             "question": question,
+            "reason": "clarification",
+            "answer_sensitivity": "internal",
         })),
         None,
         None,
-    ))
+    );
+    // The initial Running and Waiting Events commit atomically with this first Snapshot.
+    snapshot.version = 1;
+    Ok(snapshot)
 }
 
 fn system_event(kind: RunEventKind) -> PendingRunEvent {

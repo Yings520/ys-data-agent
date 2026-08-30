@@ -6,8 +6,8 @@ use serde::Serialize;
 use serde_json::json;
 use ys_agent_core::{
     AllowedDataScope, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore, CoreError,
-    CoreResult, EventActor, ModelProvider, PendingRunEvent, Principal, PutArtifact, QueryBudget,
-    RetentionPolicy, RunEventKind, RunId, RunSnapshot, RunStatus, Sensitivity, StepId,
+    CoreResult, CostClass, EventActor, ModelProvider, PendingRunEvent, Principal, PutArtifact,
+    QueryBudget, RetentionPolicy, RunEventKind, RunId, RunSnapshot, RunStatus, Sensitivity, StepId,
     ToolExecutionContext, WorkspaceId,
 };
 
@@ -100,6 +100,8 @@ impl Harness {
             task_id: current.task_id,
             workflow: current.workflow,
             status,
+            attempt: current.attempt,
+            retry_of_run_id: current.retry_of_run_id,
             version: current.version + 1,
             workflow_state: state.to_snapshot()?,
             pending_wait_metadata,
@@ -219,6 +221,52 @@ fn artifact_events(artifacts: &[ArtifactMetadata]) -> Vec<PendingRunEvent> {
 }
 
 impl Harness {
+    async fn clarification_messages(
+        &self,
+        state: &QueryWorkflowState,
+    ) -> CoreResult<Vec<ys_agent_core::ModelMessage>> {
+        let mut messages = Vec::new();
+        for artifact in &state.clarification_evidence {
+            if artifact.metadata.sensitivity == Sensitivity::Restricted {
+                continue;
+            }
+            let bytes = self
+                .artifacts
+                .get(
+                    artifact,
+                    &ys_agent_core::ArtifactAccessContext {
+                        workspace_id: self.config.workspace_id,
+                        principal_id: self.config.principal.id,
+                        purpose: ys_agent_core::ArtifactAccessPurpose::RuntimeVerification,
+                        max_sensitivity: Sensitivity::Internal,
+                    },
+                )
+                .await?;
+            let answer = String::from_utf8(bytes).map_err(|error| {
+                CoreError::validation("clarification_utf8_invalid", error.to_string())
+            })?;
+            messages.push(ys_agent_core::ModelMessage {
+                role: ys_agent_core::ModelRole::User,
+                content: format!(
+                    "UNTRUSTED_CLARIFICATION_EVIDENCE_JSON:\n{}",
+                    serde_json::to_string(&json!({
+                        "artifact_id": artifact.id(),
+                        "answer": answer,
+                    }))
+                    .map_err(|error| CoreError::validation(
+                        "clarification_serialization_failed",
+                        error.to_string(),
+                    ))?
+                ),
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        Ok(messages)
+    }
+}
+
+impl Harness {
     async fn model_step(
         &self,
         current: RunSnapshot,
@@ -266,12 +314,15 @@ impl Harness {
                 PromptBuilder::VERSION,
             )
             .await?;
-        let request = self.prompt_builder.build(
+        let mut request = self.prompt_builder.build(
             &state.question,
             state.phase,
             &assembled.manifest,
             &view_snapshot,
         )?;
+        request
+            .messages
+            .extend(self.clarification_messages(&state).await?);
 
         let started = self.next_snapshot(
             &current,
@@ -345,7 +396,17 @@ impl Harness {
                     view,
                     policy: self.config.tool_policy.clone(),
                     run_status: current.status,
-                    expected_cost_class: ys_agent_core::CostClass::Low,
+                    expected_cost_class: match state.phase {
+                        QueryPhase::Execute => ys_agent_core::CostClass::High,
+                        QueryPhase::ValidateAndPreflight
+                        | QueryPhase::ResolveContext
+                        | QueryPhase::Verify => ys_agent_core::CostClass::Low,
+                        QueryPhase::Clarify
+                        | QueryPhase::ClassifyIntent
+                        | QueryPhase::Plan
+                        | QueryPhase::Package
+                        | QueryPhase::ReadyToComplete => ys_agent_core::CostClass::Unknown,
+                    },
                     connector_cost_unknown: false,
                 };
                 self.run_tool(ToolStepInput {
@@ -509,6 +570,139 @@ impl Harness {
         }
     }
 
+    async fn recovered_tool_step(
+        &self,
+        current: RunSnapshot,
+        mut state: QueryWorkflowState,
+        call: ys_agent_core::ToolCall,
+    ) -> CoreResult<StepOutcome> {
+        state.pending_recovery_call = None;
+        let recovered_cost = state
+            .pending_recovery_cost_class
+            .take()
+            .unwrap_or(CostClass::Unknown);
+        let view = ToolViewBuilder::new(self.catalog.as_ref())
+            .for_workflow(current.workflow)
+            .for_query_phase(state.phase)
+            .for_principal(&self.config.principal)
+            .with_connector_tools(self.config.connector_tools.clone())
+            .for_run_status(RunStatus::Running)
+            .build()?;
+        let tool = self
+            .catalog
+            .get(&call.name)
+            .ok_or_else(|| CoreError::NotFound {
+                entity: "tool",
+                id: call.name.clone(),
+            })?;
+        let governed = GovernedToolContext {
+            execution: ToolExecutionContext {
+                call_id: call.id,
+                workspace_id: self.config.workspace_id,
+                task_id: current.task_id,
+                run_id: current.run_id,
+                principal: self.config.principal.clone(),
+                query_budget: self.config.query_budget.clone(),
+                data_scope: self.config.data_scope.clone(),
+                confirmation_granted: state.recovery_confirmation_granted,
+            },
+            call_id: call.id,
+            view,
+            policy: self.config.tool_policy.clone(),
+            run_status: RunStatus::Running,
+            expected_cost_class: recovered_cost,
+            connector_cost_unknown: recovered_cost == CostClass::Unknown,
+        };
+        state.recovery_confirmation_granted = false;
+        self.run_recovered_tool(current, state, call, tool, governed)
+            .await
+    }
+
+    async fn run_recovered_tool(
+        &self,
+        current: RunSnapshot,
+        mut state: QueryWorkflowState,
+        call: ys_agent_core::ToolCall,
+        tool: Arc<dyn ys_agent_core::Tool>,
+        governed: GovernedToolContext,
+    ) -> CoreResult<StepOutcome> {
+        match self
+            .tool_runtime
+            .prepare(tool, governed, call.arguments.clone())
+        {
+            ToolPreparation::Rejected { outcome, events } => {
+                let mut all_events = vec![system_event(RunEventKind::ToolCallProposed { call })];
+                all_events.extend(events);
+                self.workflow
+                    .apply_tool_outcome(&mut state, &outcome, &[])?;
+                let next = self.next_snapshot(
+                    &current,
+                    &state,
+                    RunStatus::Running,
+                    None,
+                    current.primary_artifact_id,
+                    StepId::new(),
+                )?;
+                self.append(&current, vec![], all_events, &next).await?;
+                Ok(StepOutcome::Continue {
+                    snapshot: next,
+                    accounting: StepAccounting::default(),
+                })
+            }
+            ToolPreparation::Ready {
+                prepared,
+                before_io,
+            } => {
+                let mut started_events = vec![system_event(RunEventKind::ToolCallProposed {
+                    call: call.clone(),
+                })];
+                started_events.extend(before_io);
+                let started = self.next_snapshot(
+                    &current,
+                    &state,
+                    RunStatus::Running,
+                    None,
+                    current.primary_artifact_id,
+                    StepId::new(),
+                )?;
+                self.append(&current, vec![], started_events, &started)
+                    .await?;
+
+                let outcome = self.tool_runtime.execute_prepared(&prepared).await;
+                let mut metadata = outcome.artifact_metadata().to_vec();
+                if let Some(evidence) = self
+                    .prepare_context_evidence(&started, &state, &outcome)
+                    .await?
+                {
+                    metadata.push(evidence);
+                }
+                let terminal = self.tool_runtime.terminal_event(&prepared, &outcome);
+                self.workflow
+                    .apply_tool_outcome(&mut state, &outcome, &metadata)?;
+                let mut terminal_events = artifact_events(&metadata);
+                terminal_events.push(terminal);
+                let next = self.next_snapshot(
+                    &started,
+                    &state,
+                    RunStatus::Running,
+                    None,
+                    started.primary_artifact_id,
+                    StepId::new(),
+                )?;
+                self.append(&started, metadata, terminal_events, &next)
+                    .await?;
+                Ok(StepOutcome::Continue {
+                    snapshot: next,
+                    accounting: StepAccounting {
+                        model_calls: 0,
+                        tool_calls: 1,
+                        tokens: 0,
+                    },
+                })
+            }
+        }
+    }
+
     async fn prepare_context_evidence(
         &self,
         current: &RunSnapshot,
@@ -644,6 +838,9 @@ impl HarnessStep for Harness {
             });
         }
         let state = QueryWorkflowState::from_snapshot(current.workflow_state.clone())?;
+        if let Some(call) = state.pending_recovery_call.clone() {
+            return self.recovered_tool_step(current, state, call).await;
+        }
         match self.workflow.next(&state)? {
             WorkflowDirective::Advance(phase) => self.advance(current, state, phase).await,
             WorkflowDirective::Classify(intent) => self.classify(current, state, intent).await,

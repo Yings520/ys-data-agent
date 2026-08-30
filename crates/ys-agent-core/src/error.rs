@@ -26,6 +26,9 @@ pub enum CoreError {
     #[error("corrupt artifact {artifact_id}: {reason}")]
     CorruptArtifact { artifact_id: String, reason: String },
 
+    #[error("corrupt Run history for {run_id}: {reason}")]
+    CorruptRunHistory { run_id: String, reason: String },
+
     #[error("storage error: {message}")]
     Storage { message: String },
 
@@ -71,6 +74,7 @@ impl CoreError {
             Self::NotFound { .. } => "not_found",
             Self::ArtifactAccessDenied { .. } => "artifact_access_denied",
             Self::CorruptArtifact { .. } => "corrupt_artifact",
+            Self::CorruptRunHistory { .. } => "corrupt_run_history",
             Self::Storage { .. } => "storage_error",
             Self::ConcurrencyConflict { .. } => "concurrency_conflict",
             Self::UnsupportedCapability(_) => "unsupported_capability",
