@@ -189,23 +189,29 @@ impl QueryWorkflow {
                                     "Context Tool success needs a ContextEvidence Artifact",
                                 )
                             })?;
-                        match state.intent {
-                            Some(QueryIntent::GovernedMetric) => {
-                                state.metric_evidence = Some(ArtifactRef::new(evidence));
-                                state.transition(QueryPhase::Plan)
+                        if output.get("status").and_then(|value| value.as_str()) == Some("active") {
+                            state.intent = Some(QueryIntent::GovernedMetric);
+                            state.metric_evidence = Some(ArtifactRef::new(evidence));
+                            state.transition(QueryPhase::Plan)
+                        } else {
+                            match state.intent {
+                                Some(QueryIntent::AdHocRead) => {
+                                    state.schema_evidence.push(ArtifactRef::new(evidence));
+                                    state.transition(QueryPhase::Plan)
+                                }
+                                Some(QueryIntent::Metadata) => {
+                                    state.schema_evidence.push(ArtifactRef::new(evidence));
+                                    state.transition(QueryPhase::Verify)
+                                }
+                                Some(QueryIntent::GovernedMetric) => Err(CoreError::validation(
+                                    "metric_contract_not_active",
+                                    "GovernedMetric needs an Active Registry contract",
+                                )),
+                                None => Err(CoreError::validation(
+                                    "query_intent_missing",
+                                    "ResolveContext needs a generic request route",
+                                )),
                             }
-                            Some(QueryIntent::AdHocRead) => {
-                                state.schema_evidence.push(ArtifactRef::new(evidence));
-                                state.transition(QueryPhase::Plan)
-                            }
-                            Some(QueryIntent::Metadata) => {
-                                state.schema_evidence.push(ArtifactRef::new(evidence));
-                                state.transition(QueryPhase::Verify)
-                            }
-                            None => Err(CoreError::validation(
-                                "query_intent_missing",
-                                "ResolveContext needs QueryIntent",
-                            )),
                         }
                     }
                     QueryPhase::ValidateAndPreflight => {

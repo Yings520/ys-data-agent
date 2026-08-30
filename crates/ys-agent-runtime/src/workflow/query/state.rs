@@ -184,13 +184,6 @@ pub fn material_ambiguity(question: &str) -> Option<ClarificationNeed> {
             reason: "material_query_ambiguity".to_owned(),
         });
     }
-    if lower.contains("gmv") && lower.contains("by region") && lower.contains("or market") {
-        return Some(ClarificationNeed {
-            id: "query-dimension-v1".to_owned(),
-            question: "Should the governed dimension be region or market?".to_owned(),
-            reason: "material_query_ambiguity".to_owned(),
-        });
-    }
     None
 }
 
@@ -201,11 +194,6 @@ pub fn classify_intent(question: &str) -> QueryIntent {
         .any(|phrase| lower.contains(phrase))
     {
         QueryIntent::Metadata
-    } else if ["gmv", "revenue", "orders", "conversion rate"]
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-    {
-        QueryIntent::GovernedMetric
     } else {
         QueryIntent::AdHocRead
     }
@@ -216,4 +204,22 @@ pub fn requires_current_freshness(question: &str) -> bool {
     ["current", "latest", "right now", "sla"]
         .iter()
         .any(|phrase| lower.contains(phrase))
+}
+
+#[cfg(test)]
+mod tests {
+    use ys_agent_core::QueryIntent;
+
+    use super::classify_intent;
+
+    #[test]
+    fn data_requests_remain_provisional_until_the_registry_resolves_them() {
+        for question in [
+            "GMV by channel for last month",
+            "Show revenue for the current quarter",
+            "How many orders were placed yesterday?",
+        ] {
+            assert_eq!(classify_intent(question), QueryIntent::AdHocRead);
+        }
+    }
 }
