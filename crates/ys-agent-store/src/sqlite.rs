@@ -352,6 +352,7 @@ fn append_in_transaction(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     expected_version: u64,
+    artifacts: Vec<ArtifactMetadata>,
     events: Vec<PendingRunEvent>,
     snapshot: &RunSnapshot,
 ) -> CoreResult<()> {
@@ -368,6 +369,15 @@ fn append_in_transaction(
         });
     }
 
+    for artifact in &artifacts {
+        if artifact.run_id != *run_id || artifact.task_id != snapshot.task_id {
+            return Err(CoreError::validation(
+                "artifact_run_mismatch",
+                "atomic append Artifact belongs to another Run or Task",
+            ));
+        }
+        insert_artifact(transaction, artifact)?;
+    }
     insert_events(transaction, run_id, events)?;
     update_snapshot(transaction, expected_version, snapshot)
 }
@@ -453,6 +463,7 @@ fn commit_command_on_connection(
                 &transaction,
                 &snapshot.run_id,
                 expected_version,
+                vec![],
                 batch.pending_events,
                 snapshot,
             )?;
@@ -609,6 +620,7 @@ impl RuntimeStore for SqliteRuntimeStore {
         &self,
         run_id: &RunId,
         expected_version: u64,
+        artifacts: Vec<ArtifactMetadata>,
         events: Vec<PendingRunEvent>,
         snapshot: &RunSnapshot,
     ) -> CoreResult<()> {
@@ -618,7 +630,14 @@ impl RuntimeStore for SqliteRuntimeStore {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(storage_error)?;
-            append_in_transaction(&transaction, &run_id, expected_version, events, &snapshot)?;
+            append_in_transaction(
+                &transaction,
+                &run_id,
+                expected_version,
+                artifacts,
+                events,
+                &snapshot,
+            )?;
             transaction.commit().map_err(storage_error)
         })
         .await
