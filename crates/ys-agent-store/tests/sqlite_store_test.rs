@@ -84,6 +84,7 @@ async fn append_is_atomic_and_optimistically_versioned() {
         .append(
             &original.run_id,
             original.version,
+            vec![],
             vec![pending(RunEventKind::RunStarted)],
             &running,
         )
@@ -95,6 +96,7 @@ async fn append_is_atomic_and_optimistically_versioned() {
         .append(
             &original.run_id,
             original.version,
+            vec![],
             vec![pending(RunEventKind::RunResumed)],
             &running,
         )
@@ -149,6 +151,7 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
         .append(
             &initial.run_id,
             initial.version,
+            vec![],
             vec![
                 pending(RunEventKind::RunStarted),
                 pending(RunEventKind::RunWaiting {
