@@ -22,6 +22,24 @@ pub struct GovernedToolContext {
     pub connector_cost_unknown: bool,
 }
 
+pub struct PreparedToolCall {
+    tool: Arc<dyn Tool>,
+    visible_spec: ToolSpec,
+    context: GovernedToolContext,
+    arguments: Value,
+}
+
+pub enum ToolPreparation {
+    Ready {
+        prepared: Box<PreparedToolCall>,
+        before_io: Vec<PendingRunEvent>,
+    },
+    Rejected {
+        outcome: ToolOutcome,
+        events: Vec<PendingRunEvent>,
+    },
+}
+
 fn preflight(
     implementation_spec: &ToolSpec,
     context: &GovernedToolContext,
@@ -214,6 +232,103 @@ impl ToolRuntime {
             run_semaphores: Mutex::new(HashMap::new()),
             events,
         }
+    }
+
+    pub fn prepare(
+        &self,
+        tool: Arc<dyn Tool>,
+        context: GovernedToolContext,
+        arguments: Value,
+    ) -> ToolPreparation {
+        let implementation_spec = tool.spec();
+        match preflight(&implementation_spec, &context, &arguments) {
+            Ok(visible_spec) => ToolPreparation::Ready {
+                before_io: vec![
+                    PendingRunEvent {
+                        actor: EventActor::System,
+                        kind: RunEventKind::PolicyEvaluated {
+                            call_id: context.execution.call_id,
+                            decision: PolicyDecision::Allow,
+                        },
+                    },
+                    PendingRunEvent {
+                        actor: EventActor::Tool {
+                            name: implementation_spec.name,
+                        },
+                        kind: RunEventKind::ToolExecutionStarted {
+                            call_id: context.execution.call_id,
+                        },
+                    },
+                ],
+                prepared: Box::new(PreparedToolCall {
+                    tool,
+                    visible_spec,
+                    context,
+                    arguments,
+                }),
+            },
+            Err(failure) => {
+                let outcome = ToolOutcome::Rejected {
+                    failure: failure.clone(),
+                };
+                ToolPreparation::Rejected {
+                    events: vec![
+                        PendingRunEvent {
+                            actor: EventActor::System,
+                            kind: RunEventKind::PolicyEvaluated {
+                                call_id: context.execution.call_id,
+                                decision: PolicyDecision::Deny {
+                                    code: failure.code.clone(),
+                                    message: failure.user_message.clone(),
+                                },
+                            },
+                        },
+                        terminal_event(
+                            &implementation_spec.name,
+                            context.execution.call_id,
+                            &outcome,
+                        ),
+                    ],
+                    outcome,
+                }
+            }
+        }
+    }
+
+    pub async fn execute_prepared(&self, prepared: &PreparedToolCall) -> ToolOutcome {
+        let mut retries_used = 0;
+        loop {
+            let outcome = self
+                .execute_once(
+                    &prepared.tool,
+                    &prepared.visible_spec,
+                    &prepared.context,
+                    &prepared.arguments,
+                )
+                .await;
+            let outcome =
+                self.normalize_outcome(&prepared.visible_spec, &prepared.context, outcome);
+            if retries_used < self.max_same_call_retries
+                && retry_same_call_allowed(&prepared.visible_spec, &prepared.context, &outcome)
+            {
+                retries_used += 1;
+                tokio::task::yield_now().await;
+                continue;
+            }
+            return outcome;
+        }
+    }
+
+    pub fn terminal_event(
+        &self,
+        prepared: &PreparedToolCall,
+        outcome: &ToolOutcome,
+    ) -> PendingRunEvent {
+        terminal_event(
+            &prepared.visible_spec.name,
+            prepared.context.execution.call_id,
+            outcome,
+        )
     }
 
     async fn semaphore_for(&self, context: &GovernedToolContext) -> Arc<Semaphore> {
@@ -536,6 +651,35 @@ impl ToolRuntime {
         }
 
         outcome
+    }
+}
+
+fn terminal_event(
+    tool_name: &str,
+    call_id: ys_agent_core::ToolCallId,
+    outcome: &ToolOutcome,
+) -> PendingRunEvent {
+    let kind = match outcome {
+        ToolOutcome::Succeeded { artifacts, .. } => RunEventKind::ToolExecutionSucceeded {
+            call_id,
+            artifacts: artifacts.iter().map(|artifact| artifact.id).collect(),
+        },
+        ToolOutcome::Failed { failure } | ToolOutcome::Rejected { failure } => {
+            RunEventKind::ToolExecutionFailed {
+                call_id,
+                failure: failure.clone(),
+            }
+        }
+        ToolOutcome::Indeterminate { failure } => RunEventKind::ToolExecutionIndeterminate {
+            call_id,
+            failure: failure.clone(),
+        },
+    };
+    PendingRunEvent {
+        actor: EventActor::Tool {
+            name: tool_name.to_owned(),
+        },
+        kind,
     }
 }
 

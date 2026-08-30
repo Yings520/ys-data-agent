@@ -787,7 +787,8 @@ impl AgentServiceApi for InProcessAgentService {
 fn running_snapshot(task_id: TaskId, message: &str) -> CoreResult<RunSnapshot> {
     let mut run = Run::new(task_id, WorkflowKind::Query);
     run.start()?;
-    Ok(run.snapshot(json!({ "user_message": message }), None, None, None))
+    let state = crate::workflow::query::QueryWorkflowState::new(message)?;
+    Ok(run.snapshot(state.to_snapshot()?, None, None, None))
 }
 
 fn waiting_snapshot(

@@ -404,6 +404,7 @@ async fn lagged_subscription_reloads_from_the_durable_sequence() {
         .append(
             &run_id,
             current.version,
+            vec![],
             vec![
                 PendingRunEvent {
                     actor: EventActor::System,

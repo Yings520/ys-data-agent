@@ -50,6 +50,7 @@ pub trait RuntimeStore: Send + Sync {
         &self,
         run_id: &RunId,
         expected_version: u64,
+        artifacts: Vec<ArtifactMetadata>,
         events: Vec<PendingRunEvent>,
         snapshot: &RunSnapshot,
     ) -> CoreResult<()>;
