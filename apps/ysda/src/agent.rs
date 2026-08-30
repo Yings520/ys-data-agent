@@ -126,6 +126,7 @@ impl QueryAgent {
         let request = QueryRequest {
             source_id: self.source_id.clone(),
             sql: generated.sql,
+            parameters: Vec::new(),
             budget: QueryBudget {
                 max_rows: self.max_rows,
                 ..QueryBudget::default()
