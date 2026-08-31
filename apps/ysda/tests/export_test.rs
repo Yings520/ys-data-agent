@@ -73,7 +73,6 @@ async fn export_command_replay_returns_the_same_persisted_export_artifact() {
             new_artifact: Some(source.clone()),
             pending_events: Vec::new(),
             snapshot_update: None,
-            capability: None,
         })
         .await
         .expect("index source artifact");

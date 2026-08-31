@@ -155,7 +155,6 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
             new_artifact: None,
             pending_events: vec![],
             snapshot_update: None,
-            capability: None,
         })
         .await
         .expect("seed run");
