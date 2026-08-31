@@ -1,7 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, ObjectName, Select, SelectItem, Statement, Visit, Visitor};
+use sqlparser::ast::{
+    Expr, ObjectName, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Visit,
+    VisitMut, Visitor, VisitorMut,
+};
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use ys_agent_core::{AllowedDataScope, ColumnPolicy, CoreError, CoreResult};
@@ -147,7 +150,7 @@ impl SqlReadOnlyPolicy {
             SupportedDialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
         };
 
-        let statements = match parsed {
+        let mut statements = match parsed {
             Ok(statements) => statements,
             Err(error) => {
                 return SqlPolicyDecision::rejected(
@@ -179,8 +182,9 @@ impl SqlReadOnlyPolicy {
             );
         }
 
+        let _ = VisitMut::visit(&mut statements, &mut OrderByAliasNormalizer { scope });
         let mut facts = AstFacts::default();
-        let _ = statements.visit(&mut facts);
+        let _ = Visit::visit(&statements, &mut facts);
 
         if facts.contains_non_query_statement {
             return SqlPolicyDecision::rejected(
@@ -212,6 +216,70 @@ impl SqlReadOnlyPolicy {
         }
         SqlPolicyDecision::allowed(facts)
     }
+}
+
+struct OrderByAliasNormalizer<'a> {
+    scope: &'a AllowedDataScope,
+}
+
+impl VisitorMut for OrderByAliasNormalizer<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        let aliases = unique_projection_aliases(query);
+        let Some(OrderBy {
+            kind: OrderByKind::Expressions(items),
+            ..
+        }) = &mut query.order_by
+        else {
+            return ControlFlow::Continue(());
+        };
+
+        for item in items {
+            let Expr::Identifier(identifier) = &item.expr else {
+                continue;
+            };
+            let name = identifier.value.to_ascii_lowercase();
+            if source_column_is_configured(self.scope, &name) {
+                continue;
+            }
+            if let Some(expression) = aliases.get(&name) {
+                item.expr = expression.clone();
+            }
+        }
+
+        ControlFlow::Continue(())
+    }
+}
+
+fn unique_projection_aliases(query: &Query) -> BTreeMap<String, Expr> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return BTreeMap::new();
+    };
+    let mut aliases = BTreeMap::new();
+    let mut duplicates = BTreeSet::new();
+
+    for item in &select.projection {
+        let SelectItem::ExprWithAlias { expr, alias } = item else {
+            continue;
+        };
+        let name = alias.value.to_ascii_lowercase();
+        if aliases.insert(name.clone(), expr.clone()).is_some() {
+            duplicates.insert(name);
+        }
+    }
+    for duplicate in duplicates {
+        aliases.remove(&duplicate);
+    }
+
+    aliases
+}
+
+fn source_column_is_configured(scope: &AllowedDataScope, column: &str) -> bool {
+    scope
+        .relations
+        .values()
+        .any(|columns| columns.contains_key(column))
 }
 
 #[derive(Debug, Default)]
@@ -387,7 +455,10 @@ mod tests {
                 "mart_orders".to_owned(),
                 [
                     ("order_id".to_owned(), ColumnPolicy::Allow),
+                    ("paid_amount".to_owned(), ColumnPolicy::Allow),
+                    ("paid_at".to_owned(), ColumnPolicy::Allow),
                     ("customer_email".to_owned(), ColumnPolicy::Redact),
+                    ("internal_note".to_owned(), ColumnPolicy::Deny),
                 ]
                 .into_iter()
                 .collect::<BTreeMap<_, _>>(),
@@ -425,5 +496,42 @@ mod tests {
             &scope(),
         );
         assert_eq!(decision.reasons[0].code, "function_not_allowed");
+    }
+
+    #[test]
+    fn allows_ordering_by_a_declared_output_alias() {
+        let policy = SqlReadOnlyPolicy::new(SupportedDialect::SQLite, 1_024);
+        let decision = policy.evaluate(
+            "SELECT date(paid_at) AS sale_date, SUM(paid_amount) AS daily_sales \
+             FROM mart_orders WHERE paid_at >= '2026-07-01' AND paid_at < '2026-08-01' \
+             GROUP BY date(paid_at) ORDER BY sale_date",
+            &scope(),
+        );
+
+        assert_eq!(decision.disposition, SqlPolicyDisposition::Allowed);
+        assert_eq!(decision.referenced_columns, vec!["paid_amount", "paid_at"]);
+    }
+
+    #[test]
+    fn output_alias_cannot_mask_a_denied_source_column() {
+        let policy = SqlReadOnlyPolicy::new(SupportedDialect::SQLite, 1_024);
+        let decision = policy.evaluate(
+            "SELECT order_id AS internal_note FROM mart_orders ORDER BY internal_note",
+            &scope(),
+        );
+
+        assert_eq!(decision.reasons[0].code, "column_denied");
+    }
+
+    #[test]
+    fn nested_alias_does_not_authorize_an_outer_identifier() {
+        let policy = SqlReadOnlyPolicy::new(SupportedDialect::SQLite, 1_024);
+        let decision = policy.evaluate(
+            "SELECT secret FROM mart_orders WHERE EXISTS \
+             (SELECT order_id AS secret FROM mart_orders ORDER BY secret)",
+            &scope(),
+        );
+
+        assert_eq!(decision.reasons[0].code, "column_not_allowed");
     }
 }
