@@ -250,6 +250,15 @@ impl QueryWorkflow {
             }
             ToolOutcome::Rejected { failure } | ToolOutcome::Failed { failure }
                 if failure.parameter_revision_allowed
+                    && state.phase == QueryPhase::ResolveContext =>
+            {
+                state
+                    .warnings
+                    .push(format!("{}:{}", failure.code, failure.user_message));
+                Ok(())
+            }
+            ToolOutcome::Rejected { failure } | ToolOutcome::Failed { failure }
+                if failure.parameter_revision_allowed
                     && matches!(
                         state.phase,
                         QueryPhase::ValidateAndPreflight | QueryPhase::Execute
