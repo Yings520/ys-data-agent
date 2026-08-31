@@ -7,6 +7,8 @@ mod loop_driver;
 mod recovery;
 mod service;
 
+pub mod telemetry;
+
 pub mod workflow;
 
 pub use context_assembler::{
