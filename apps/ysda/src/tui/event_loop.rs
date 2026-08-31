@@ -387,7 +387,6 @@ async fn submit_composer(app: &mut TuiApp, controller: &mut TuiController) -> Co
             }
         }
         Err(error) => {
-            app.composer.submit();
             app.push_transcript(TranscriptItem::Warning(error.to_string()));
         }
     }
@@ -439,6 +438,45 @@ mod tests {
         })
         .await
         .expect("submission completion")
+    }
+
+    #[tokio::test]
+    async fn invalid_slash_command_keeps_draft_for_correction() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let workspace_id = WorkspaceId::new();
+        let service = Arc::new(InProcessAgentService::new(
+            workspace_id,
+            store,
+            artifacts,
+            Arc::new(NoopRunScheduler),
+        ));
+        let principal = Principal::local_operator("test-operator");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.composer.set_text("/你好");
+
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("invalid command handling");
+
+        assert_eq!(app.composer.text(), "/你好");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(super::TranscriptItem::Warning(text))
+                if text.contains("delete the leading /") && text.contains("/help")
+        ));
     }
 
     #[tokio::test]
