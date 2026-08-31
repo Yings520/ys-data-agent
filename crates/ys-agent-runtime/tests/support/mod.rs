@@ -271,10 +271,19 @@ pub struct QueryWorkflowFixture {
     tool_counts: Arc<std::sync::Mutex<std::collections::BTreeMap<String, usize>>>,
     transport_retries: std::sync::atomic::AtomicUsize,
     cached_primary: std::sync::Mutex<Option<ys_agent_runtime::QueryArtifact>>,
+    telemetry: Arc<TelemetryDispatcher>,
 }
 
 impl QueryWorkflowFixture {
     pub async fn with_model_actions(actions: Vec<ScriptedAction>) -> Self {
+        Self::with_model_actions_and_telemetry(actions, Arc::new(TelemetryDispatcher::default()))
+            .await
+    }
+
+    pub async fn with_model_actions_and_telemetry(
+        actions: Vec<ScriptedAction>,
+        telemetry: Arc<TelemetryDispatcher>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("temporary runtime");
         let runtime = Arc::new(
             ys_agent_store::SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -343,6 +352,7 @@ impl QueryWorkflowFixture {
             runtime.clone(),
             artifacts.clone(),
             model,
+            telemetry.clone(),
         )
         .expect("assemble Query test dependencies");
         Self {
@@ -356,6 +366,7 @@ impl QueryWorkflowFixture {
             tool_counts: assembled.tool_counts,
             transport_retries: std::sync::atomic::AtomicUsize::new(0),
             cached_primary: std::sync::Mutex::new(None),
+            telemetry,
         }
     }
 }
@@ -375,6 +386,7 @@ use ys_agent_core::{
 use ys_agent_runtime::{
     ContextAssembler, Harness, HarnessConfig, HarnessDependencies, InMemoryQueryContextProvider,
     LoopDriver, PromptBuilder,
+    telemetry::TelemetryDispatcher,
     tools::{ConnectorToolAvailability, ToolCatalog, ToolRuntime, WorkspaceToolPolicy},
 };
 
@@ -558,6 +570,7 @@ fn build_query_dependencies(
     runtime: Arc<ys_agent_store::SqliteRuntimeStore>,
     artifacts: Arc<ys_agent_store::LocalArtifactStore>,
     model: Arc<dyn ModelProvider>,
+    telemetry: Arc<TelemetryDispatcher>,
 ) -> CoreResult<AssembledQueryDependencies> {
     let source_id = SourceId::new("sqlite-demo");
     let metric = MetricDefinition {
@@ -631,6 +644,7 @@ fn build_query_dependencies(
             catalog,
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler,
+            telemetry,
         },
         PromptBuilder::new("fake-query-model"),
         HarnessConfig {
@@ -658,6 +672,12 @@ fn build_query_dependencies(
 impl QueryWorkflowFixture {
     pub async fn successful_metric_query() -> Self {
         Self::with_model_actions(metric_success_script()).await
+    }
+
+    pub async fn successful_metric_query_with_telemetry(
+        telemetry: Arc<TelemetryDispatcher>,
+    ) -> Self {
+        Self::with_model_actions_and_telemetry(metric_success_script(), telemetry).await
     }
 
     pub async fn with_ambiguous_metrics() -> Self {
@@ -774,6 +794,24 @@ impl QueryWorkflowFixture {
     pub fn transport_retry_count(&self) -> usize {
         self.transport_retries
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn telemetry_failure_count(&self) -> u64 {
+        self.telemetry.failure_count()
+    }
+
+    pub async fn has_run_completed_event(&self, run_id: &ys_agent_core::RunId) -> bool {
+        self.runtime
+            .load_events(run_id, 0)
+            .await
+            .expect("load workflow events")
+            .iter()
+            .any(|event| {
+                matches!(
+                    event.event.kind,
+                    ys_agent_core::RunEventKind::RunCompleted { .. }
+                )
+            })
     }
 }
 
@@ -1293,6 +1331,7 @@ async fn open_runtime_components(
         runtime.clone(),
         artifacts.clone(),
         model,
+        Arc::new(TelemetryDispatcher::default()),
     )?;
     let service = Arc::new(ys_agent_runtime::InProcessAgentService::new(
         workspace_id,
