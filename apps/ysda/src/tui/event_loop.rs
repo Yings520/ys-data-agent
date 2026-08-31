@@ -386,3 +386,93 @@ fn user_readable_error(error: &CoreError) -> String {
         error.code()
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use tempfile::tempdir;
+    use tokio::sync::Semaphore;
+    use ys_agent_adapters::model::FakeModelProvider;
+    use ys_agent_core::{AgentAction, ModelResponse, Principal, WorkspaceId};
+    use ys_agent_runtime::{
+        InProcessAgentService, NoopRunScheduler,
+        doctor::{DoctorReport, QueryCapability},
+    };
+    use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
+
+    use super::{TuiApp, TuiController, handle_terminal_event};
+
+    #[tokio::test]
+    async fn tui_submission_acknowledges_before_model_returns() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts"))
+                .expect("artifact store"),
+        );
+        let release_model = Arc::new(Semaphore::new(0));
+        let model = Arc::new(FakeModelProvider::new({
+            let release_model = release_model.clone();
+            move |_| {
+                let release_model = release_model.clone();
+                async move {
+                    let _permit = release_model.acquire().await.expect("model release");
+                    Ok(ModelResponse {
+                        action: AgentAction::Respond {
+                            message: "你好！".to_owned(),
+                        },
+                        raw_content: None,
+                        usage: None,
+                    })
+                }
+            }
+        }));
+        let workspace_id = WorkspaceId::new();
+        let service = Arc::new(
+            InProcessAgentService::new(
+                workspace_id,
+                store,
+                artifacts,
+                Arc::new(NoopRunScheduler),
+            )
+            .with_conversation_model(model, "delayed-test-model"),
+        );
+        let principal = Principal::local_operator("test-operator");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.doctor_report = Some(DoctorReport {
+            blocker_codes: Vec::new(),
+            warning_codes: Vec::new(),
+            ready_capabilities: vec![QueryCapability::AdHocRead],
+            repairs: Vec::new(),
+        });
+        app.composer.set_text("你好");
+
+        let handled = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ),
+        )
+        .await
+        .expect("Enter must not wait for the model")
+        .expect("Enter handling");
+
+        assert!(!handled);
+        assert!(matches!(
+            app.transcript.last(),
+            Some(super::TranscriptItem::UserMessage(text)) if text == "你好"
+        ));
+        assert_eq!(app.runtime_status.as_deref(), Some("Thinking…"));
+
+        release_model.add_permits(1);
+    }
+}
