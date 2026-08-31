@@ -416,24 +416,103 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> CoreResult<()> {
     fs::write(path, bytes).map_err(storage_error("write export file"))
 }
 
+#[cfg(unix)]
+fn write_new_private_file(path: &Path, bytes: &[u8]) -> CoreResult<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(storage_error("create workspace ID temporary file"))?;
+    file.write_all(bytes)
+        .map_err(storage_error("write workspace ID temporary file"))?;
+    file.sync_all()
+        .map_err(storage_error("sync workspace ID temporary file"))?;
+    enforce_private_file_permissions(path)?;
+    file.sync_all()
+        .map_err(storage_error("sync workspace ID temporary file"))
+}
+
+#[cfg(not(unix))]
+fn write_new_private_file(path: &Path, bytes: &[u8]) -> CoreResult<()> {
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(storage_error("create workspace ID temporary file"))?;
+    use std::io::Write;
+    file.write_all(bytes)
+        .map_err(storage_error("write workspace ID temporary file"))?;
+    file.sync_all()
+        .map_err(storage_error("sync workspace ID temporary file"))
+}
+
+#[cfg(unix)]
+fn enforce_private_file_permissions(path: &Path) -> CoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(storage_error("secure workspace ID file"))
+}
+
+#[cfg(not(unix))]
+fn enforce_private_file_permissions(_: &Path) -> CoreResult<()> {
+    Ok(())
+}
+
+fn load_workspace_id(path: &Path) -> CoreResult<Option<WorkspaceId>> {
+    match fs::read_to_string(path) {
+        Ok(value) => {
+            let workspace_id = value.trim().parse::<WorkspaceId>().map_err(|error| {
+                CoreError::validation(
+                    "workspace_id_invalid",
+                    format!(
+                        "persisted workspace ID at {} is malformed: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            enforce_private_file_permissions(path)?;
+            Ok(Some(workspace_id))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(storage_error("read workspace ID")(error)),
+    }
+}
+
+fn remove_workspace_id_temporary_file(path: &Path) -> CoreResult<()> {
+    fs::remove_file(path).map_err(storage_error("remove workspace ID temporary file"))
+}
+
 fn resolve_workspace_id(workspace_root: &Path) -> CoreResult<WorkspaceId> {
     let path = workspace_root.join("workspace-id");
-    match fs::read_to_string(&path) {
-        Ok(value) => value.trim().parse::<WorkspaceId>().map_err(|error| {
-            CoreError::validation(
-                "workspace_id_invalid",
-                format!(
-                    "persisted workspace ID at {} is malformed: {error}",
-                    path.display()
-                ),
-            )
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let workspace_id = WorkspaceId::new();
-            write_private_file(&path, format!("{workspace_id}\n").as_bytes())?;
+    if let Some(workspace_id) = load_workspace_id(&path)? {
+        return Ok(workspace_id);
+    }
+
+    let workspace_id = WorkspaceId::new();
+    let temporary_path = workspace_root.join(format!("workspace-id.{workspace_id}.tmp"));
+    write_new_private_file(&temporary_path, format!("{workspace_id}\n").as_bytes())?;
+
+    match fs::hard_link(&temporary_path, &path) {
+        Ok(()) => {
+            remove_workspace_id_temporary_file(&temporary_path)?;
+            enforce_private_file_permissions(&path)?;
             Ok(workspace_id)
         }
-        Err(error) => Err(storage_error("read workspace ID")(error)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            remove_workspace_id_temporary_file(&temporary_path)?;
+            load_workspace_id(&path)?.ok_or_else(|| CoreError::Storage {
+                message: format!(
+                    "workspace ID at {} disappeared after concurrent publication",
+                    path.display()
+                ),
+            })
+        }
+        Err(error) => {
+            remove_workspace_id_temporary_file(&temporary_path)?;
+            Err(storage_error("publish workspace ID")(error))
+        }
     }
 }
 
@@ -1044,7 +1123,11 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use super::{create_private_directory, resolve_workspace_id};
     use ys_agent_core::{CoreError, WorkspaceId};
@@ -1081,6 +1164,72 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn concurrent_first_workspace_initializers_publish_one_id_without_temporary_files() {
+        for _ in 0..64 {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let workspace_root = directory.path().join(".ysda");
+            create_private_directory(&workspace_root).expect("create workspace directory");
+            let barrier = Arc::new(Barrier::new(2));
+
+            let resolvers = (0..2)
+                .map(|_| {
+                    let workspace_root = workspace_root.clone();
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        resolve_workspace_id(&workspace_root)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let ids = resolvers
+                .into_iter()
+                .map(|resolver| resolver.join().expect("resolver thread"))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("resolve workspace IDs");
+
+            assert_eq!(ids[0], ids[1]);
+            let temporary_files = fs::read_dir(&workspace_root)
+                .expect("read workspace directory")
+                .map(|entry| entry.expect("workspace directory entry"))
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("workspace-id.") && name.ends_with(".tmp")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                temporary_files.is_empty(),
+                "temporary identity files remain"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolving_existing_workspace_id_enforces_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_root = directory.path().join(".ysda");
+        create_private_directory(&workspace_root).expect("create workspace directory");
+        let workspace_id = WorkspaceId::new();
+        let path = workspace_root.join("workspace-id");
+        fs::write(&path, format!("{workspace_id}\n")).expect("write workspace ID");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("make workspace ID permissive");
+
+        let resolved = resolve_workspace_id(&workspace_root).expect("resolve workspace ID");
+        let mode = fs::metadata(&path)
+            .expect("read workspace ID metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(resolved, workspace_id);
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
