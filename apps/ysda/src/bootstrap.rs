@@ -522,23 +522,34 @@ fn sync_workspace_id_directory(_: &Path) -> CoreResult<()> {
 }
 
 #[cfg(unix)]
-fn same_workspace_id_file(left: &Path, right: &Path) -> CoreResult<bool> {
-    use std::os::unix::fs::MetadataExt;
+fn acquire_workspace_id_lock(path: &Path) -> CoreResult<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let left = fs::metadata(left).map_err(storage_error("read workspace ID metadata"))?;
-    let right = fs::metadata(right).map_err(storage_error("read workspace ID metadata"))?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(storage_error("open workspace ID lock"))?;
+    enforce_private_file_permissions(path)?;
+    file.lock().map_err(storage_error("lock workspace ID"))?;
+    Ok(file)
 }
 
 #[cfg(not(unix))]
-fn same_workspace_id_file(_: &Path, _: &Path) -> CoreResult<bool> {
-    Ok(false)
+fn acquire_workspace_id_lock(path: &Path) -> CoreResult<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(storage_error("open workspace ID lock"))?;
+    file.lock().map_err(storage_error("lock workspace ID"))?;
+    Ok(file)
 }
 
-fn recover_published_workspace_id_temporary_links(
-    workspace_root: &Path,
-    workspace_id_path: &Path,
-) -> CoreResult<()> {
+fn recover_workspace_id_temporary_files(workspace_root: &Path) -> CoreResult<()> {
     for entry in
         fs::read_dir(workspace_root).map_err(storage_error("read workspace ID directory"))?
     {
@@ -549,50 +560,57 @@ fn recover_published_workspace_id_temporary_links(
             continue;
         }
         let temporary_path = entry.path();
-        if same_workspace_id_file(workspace_id_path, &temporary_path)? {
-            remove_workspace_id_temporary_file(&temporary_path)?;
-        }
+        remove_workspace_id_temporary_file(&temporary_path)?;
     }
     Ok(())
 }
 
 fn resolve_workspace_id(workspace_root: &Path) -> CoreResult<WorkspaceId> {
-    let path = workspace_root.join("workspace-id");
-    if let Some(workspace_id) = load_workspace_id(&path)? {
-        recover_published_workspace_id_temporary_links(workspace_root, &path)?;
-        return Ok(workspace_id);
-    }
+    let lock_path = workspace_root.join("workspace-id.lock");
+    let workspace_id_lock = acquire_workspace_id_lock(&lock_path)?;
+    let result = (|| {
+        let path = workspace_root.join("workspace-id");
+        if let Some(workspace_id) = load_workspace_id(&path)? {
+            recover_workspace_id_temporary_files(workspace_root)?;
+            return Ok(workspace_id);
+        }
 
-    let workspace_id = WorkspaceId::new();
-    let temporary_path = workspace_root.join(format!("workspace-id.{workspace_id}.tmp"));
-    write_new_private_file(&temporary_path, format!("{workspace_id}\n").as_bytes())?;
+        recover_workspace_id_temporary_files(workspace_root)?;
+        if let Some(workspace_id) = load_workspace_id(&path)? {
+            return Ok(workspace_id);
+        }
 
-    match fs::hard_link(&temporary_path, &path) {
-        Ok(()) => {
-            if let Err(error) = sync_workspace_id_directory(&temporary_path) {
-                let _ = remove_workspace_id_temporary_file(&temporary_path);
-                return Err(error);
+        let workspace_id = WorkspaceId::new();
+        let temporary_path = workspace_root.join(format!("workspace-id.{workspace_id}.tmp"));
+        write_new_private_file(&temporary_path, format!("{workspace_id}\n").as_bytes())?;
+
+        match fs::hard_link(&temporary_path, &path) {
+            Ok(()) => {
+                if let Err(error) = sync_workspace_id_directory(&temporary_path) {
+                    let _ = remove_workspace_id_temporary_file(&temporary_path);
+                    return Err(error);
+                }
+                remove_workspace_id_temporary_file(&temporary_path)?;
+                enforce_private_file_permissions(&path)?;
+                Ok(workspace_id)
             }
-            remove_workspace_id_temporary_file(&temporary_path)?;
-            enforce_private_file_permissions(&path)?;
-            Ok(workspace_id)
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                remove_workspace_id_temporary_file(&temporary_path)?;
+                load_workspace_id(&path)?.ok_or_else(|| CoreError::Storage {
+                    message: format!(
+                        "workspace ID at {} disappeared after concurrent publication",
+                        path.display()
+                    ),
+                })
+            }
+            Err(error) => {
+                remove_workspace_id_temporary_file(&temporary_path)?;
+                Err(storage_error("publish workspace ID")(error))
+            }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            remove_workspace_id_temporary_file(&temporary_path)?;
-            let workspace_id = load_workspace_id(&path)?.ok_or_else(|| CoreError::Storage {
-                message: format!(
-                    "workspace ID at {} disappeared after concurrent publication",
-                    path.display()
-                ),
-            })?;
-            recover_published_workspace_id_temporary_links(workspace_root, &path)?;
-            Ok(workspace_id)
-        }
-        Err(error) => {
-            remove_workspace_id_temporary_file(&temporary_path)?;
-            Err(storage_error("publish workspace ID")(error))
-        }
-    }
+    })();
+    drop(workspace_id_lock);
+    result
 }
 
 fn storage_error(context: &'static str) -> impl FnOnce(std::io::Error) -> CoreError {
@@ -1204,11 +1222,12 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
 mod tests {
     use std::{
         fs,
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, mpsc},
         thread,
+        time::Duration,
     };
 
-    use super::{create_private_directory, resolve_workspace_id};
+    use super::{acquire_workspace_id_lock, create_private_directory, resolve_workspace_id};
     use ys_agent_core::{CoreError, WorkspaceId};
 
     #[test]
@@ -1287,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn resolving_existing_workspace_id_removes_only_stale_published_temporary_links() {
+    fn resolving_existing_workspace_id_recovers_all_temporary_files_after_locking_workspace() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let workspace_root = directory.path().join(".ysda");
         create_private_directory(&workspace_root).expect("create workspace directory");
@@ -1301,7 +1320,7 @@ mod tests {
         let active_temporary_path = workspace_root.join("workspace-id.active.tmp");
         fs::write(
             &active_temporary_path,
-            "another initializer is still writing\n",
+            "crashed initializer before publication\n",
         )
         .expect("create active temporary file");
 
@@ -1314,8 +1333,70 @@ mod tests {
             "published temporary hard link should be recovered"
         );
         assert!(
-            active_temporary_path.exists(),
-            "a different initializer's temporary file must remain untouched"
+            !active_temporary_path.exists(),
+            "a crashed pre-publication temporary file should be recovered"
+        );
+    }
+
+    #[test]
+    fn resolving_new_workspace_id_recovers_crashed_temporary_files_after_locking_workspace() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_root = directory.path().join(".ysda");
+        create_private_directory(&workspace_root).expect("create workspace directory");
+
+        let crashed_temporary_path = workspace_root.join("workspace-id.crashed.tmp");
+        fs::write(&crashed_temporary_path, "crashed initializer\n")
+            .expect("create crashed temporary file");
+
+        let active_temporary_path = workspace_root.join("workspace-id.active.tmp");
+        fs::write(&active_temporary_path, "another crashed initializer\n")
+            .expect("create active temporary file");
+
+        resolve_workspace_id(&workspace_root).expect("resolve a new workspace ID");
+
+        assert!(
+            !crashed_temporary_path.exists(),
+            "a crashed initializer's temporary file should be recovered"
+        );
+        assert!(
+            !active_temporary_path.exists(),
+            "every crashed temporary file should be recovered"
+        );
+    }
+
+    #[test]
+    fn workspace_identity_lock_serializes_concurrent_resolvers() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_root = directory.path().join(".ysda");
+        create_private_directory(&workspace_root).expect("create workspace directory");
+        let lock = acquire_workspace_id_lock(&workspace_root.join("workspace-id.lock"))
+            .expect("acquire workspace identity lock");
+        let (sender, receiver) = mpsc::channel();
+        let resolver_workspace_root = workspace_root.clone();
+        let resolver =
+            thread::spawn(move || sender.send(resolve_workspace_id(&resolver_workspace_root)));
+
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a resolver must wait until the active resolver releases the workspace identity lock"
+        );
+
+        drop(lock);
+        let workspace_id = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resolver completes after lock release")
+            .expect("resolve workspace ID");
+        resolver
+            .join()
+            .expect("resolver thread")
+            .expect("send resolver result");
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("workspace-id"))
+                .expect("read workspace ID")
+                .trim()
+                .parse::<WorkspaceId>()
+                .expect("parse workspace ID"),
+            workspace_id
         );
     }
 
