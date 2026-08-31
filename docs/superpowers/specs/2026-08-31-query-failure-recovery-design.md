@@ -12,7 +12,7 @@ The fixes must preserve fail-closed SQL authorization, bounded model interaction
 
 ## Required Behavior
 
-- SQL expressions may be referenced by a declared result alias in clauses supported by the SQL dialect without treating the alias as a source column.
+- A bare result alias declared in the same query block may be referenced by `ORDER BY` without treating the alias as a source column.
 - Every real source column remains subject to the configured `AllowedDataScope`; alias handling must not make a denied or unknown source column readable.
 - Query prompts state the exact typed `request_clarification` action contract wherever clarification is permitted.
 - One malformed free-form model action receives at most one protocol-correction request. A second malformed response remains a terminal failure.
