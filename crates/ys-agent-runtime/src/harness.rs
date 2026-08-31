@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -15,6 +18,7 @@ use crate::{
     ContextAssembler, ContextAssemblyRequest, ContextManifestArtifactWriter,
     PersistContextIdentity, PromptBuilder, ToolViewSnapshot,
     loop_driver::{HarnessStep, StepAccounting, StepOutcome},
+    telemetry::{TelemetryDispatcher, TelemetryEvent},
     tools::{
         ConnectorToolAvailability, GovernedToolContext, QueryPhase, ToolCatalog, ToolPreparation,
         ToolRuntime, ToolViewBuilder, WorkspaceToolPolicy,
@@ -44,6 +48,7 @@ pub struct Harness {
     manifest_writer: ContextManifestArtifactWriter,
     workflow: QueryWorkflow,
     config: HarnessConfig,
+    telemetry: Arc<TelemetryDispatcher>,
 }
 
 pub struct HarnessDependencies {
@@ -53,6 +58,7 @@ pub struct HarnessDependencies {
     pub catalog: Arc<ToolCatalog>,
     pub tool_runtime: Arc<ToolRuntime>,
     pub context_assembler: Arc<ContextAssembler>,
+    pub telemetry: Arc<TelemetryDispatcher>,
 }
 
 struct ToolStepInput {
@@ -63,6 +69,17 @@ struct ToolStepInput {
     tool: Arc<dyn ys_agent_core::Tool>,
     governed: GovernedToolContext,
     tokens: u32,
+    model_telemetry: TelemetryEvent,
+}
+
+struct ModelStepInput {
+    current: RunSnapshot,
+    state: QueryWorkflowState,
+    view: crate::tools::ToolView,
+    model_call_id: String,
+    response: ys_agent_core::ModelResponse,
+    tokens: u32,
+    telemetry: TelemetryEvent,
 }
 
 impl Harness {
@@ -83,6 +100,7 @@ impl Harness {
             manifest_writer,
             workflow: QueryWorkflow::new(),
             config,
+            telemetry: dependencies.telemetry,
         }
     }
 
@@ -347,25 +365,48 @@ impl Harness {
         )
         .await?;
 
+        let model_started_at = Instant::now();
         let response = self.model.complete(request).await?;
         let tokens = response
             .usage
             .as_ref()
             .map(|usage| usage.total_tokens)
             .unwrap_or(0);
-        self.apply_model_response(started, state, view, model_call_id, response, tokens)
-            .await
+        let model_telemetry = TelemetryEvent::ModelUsage {
+            run_id: started.run_id,
+            model_call_id: model_call_id.clone(),
+            prompt_tokens: response
+                .usage
+                .as_ref()
+                .map(|usage| u64::from(usage.prompt_tokens)),
+            completion_tokens: response
+                .usage
+                .as_ref()
+                .map(|usage| u64::from(usage.completion_tokens)),
+            milliseconds: elapsed_milliseconds(model_started_at),
+        };
+        self.apply_model_response(ModelStepInput {
+            current: started,
+            state,
+            view,
+            model_call_id,
+            response,
+            tokens,
+            telemetry: model_telemetry,
+        })
+        .await
     }
 
-    async fn apply_model_response(
-        &self,
-        current: RunSnapshot,
-        mut state: QueryWorkflowState,
-        view: crate::tools::ToolView,
-        model_call_id: String,
-        response: ys_agent_core::ModelResponse,
-        tokens: u32,
-    ) -> CoreResult<StepOutcome> {
+    async fn apply_model_response(&self, input: ModelStepInput) -> CoreResult<StepOutcome> {
+        let ModelStepInput {
+            current,
+            mut state,
+            view,
+            model_call_id,
+            response,
+            tokens,
+            telemetry: model_telemetry,
+        } = input;
         let effect = self.workflow.validate_action(&state, &response.action)?;
         let responded = system_event(RunEventKind::ModelResponded {
             model_call_id,
@@ -417,11 +458,12 @@ impl Harness {
                     tool,
                     governed,
                     tokens,
+                    model_telemetry,
                 })
                 .await
             }
             WorkflowEffect::PersistPlan(plan) => {
-                self.persist_plan(current, state, responded, plan, tokens)
+                self.persist_plan(current, state, responded, plan, tokens, model_telemetry)
                     .await
             }
             WorkflowEffect::Wait {
@@ -439,11 +481,12 @@ impl Harness {
                 )?;
                 self.append(&current, vec![], vec![responded], &acknowledged)
                     .await?;
+                self.telemetry.emit_after_commit(model_telemetry).await;
                 self.wait(acknowledged, state, clarification_id, question, reason)
                     .await
             }
             WorkflowEffect::ProposeCompletion(summary) => {
-                self.complete(current, state, responded, summary, tokens)
+                self.complete(current, state, responded, summary, tokens, model_telemetry)
                     .await
             }
             WorkflowEffect::Repair { code, message } => {
@@ -464,6 +507,7 @@ impl Harness {
                 )?;
                 self.append(&current, vec![], vec![responded], &next)
                     .await?;
+                self.telemetry.emit_after_commit(model_telemetry).await;
                 Ok(StepOutcome::Continue {
                     snapshot: next,
                     accounting: StepAccounting {
@@ -485,6 +529,7 @@ impl Harness {
             tool,
             governed,
             tokens,
+            model_telemetry,
         } = input;
         match self
             .tool_runtime
@@ -507,6 +552,7 @@ impl Harness {
                     StepId::new(),
                 )?;
                 self.append(&current, vec![], all_events, &next).await?;
+                self.telemetry.emit_after_commit(model_telemetry).await;
                 Ok(StepOutcome::Continue {
                     snapshot: next,
                     accounting: StepAccounting {
@@ -520,6 +566,8 @@ impl Harness {
                 prepared,
                 before_io,
             } => {
+                let tool_call_id = call.id;
+                let tool_name = call.name.clone();
                 let mut started_events = vec![
                     responded,
                     system_event(RunEventKind::ToolCallProposed { call }),
@@ -535,7 +583,9 @@ impl Harness {
                 )?;
                 self.append(&current, vec![], started_events, &started)
                     .await?;
+                self.telemetry.emit_after_commit(model_telemetry).await;
 
+                let tool_started_at = Instant::now();
                 let outcome = self.tool_runtime.execute_prepared(&prepared).await;
                 let mut metadata = outcome.artifact_metadata().to_vec();
                 if let Some(evidence) = self
@@ -558,6 +608,15 @@ impl Harness {
                     StepId::new(),
                 )?;
                 self.append(&started, metadata, events, &next).await?;
+                self.telemetry
+                    .emit_after_commit(TelemetryEvent::ToolLatency {
+                        run_id: started.run_id,
+                        tool_call_id,
+                        tool_name,
+                        milliseconds: elapsed_milliseconds(tool_started_at),
+                        outcome: tool_outcome_code(&outcome).to_owned(),
+                    })
+                    .await;
                 Ok(StepOutcome::Continue {
                     snapshot: next,
                     accounting: StepAccounting {
@@ -653,6 +712,8 @@ impl Harness {
                 prepared,
                 before_io,
             } => {
+                let tool_call_id = call.id;
+                let tool_name = call.name.clone();
                 let mut started_events = vec![system_event(RunEventKind::ToolCallProposed {
                     call: call.clone(),
                 })];
@@ -668,6 +729,7 @@ impl Harness {
                 self.append(&current, vec![], started_events, &started)
                     .await?;
 
+                let tool_started_at = Instant::now();
                 let outcome = self.tool_runtime.execute_prepared(&prepared).await;
                 let mut metadata = outcome.artifact_metadata().to_vec();
                 if let Some(evidence) = self
@@ -691,6 +753,15 @@ impl Harness {
                 )?;
                 self.append(&started, metadata, terminal_events, &next)
                     .await?;
+                self.telemetry
+                    .emit_after_commit(TelemetryEvent::ToolLatency {
+                        run_id: started.run_id,
+                        tool_call_id,
+                        tool_name,
+                        milliseconds: elapsed_milliseconds(tool_started_at),
+                        outcome: tool_outcome_code(&outcome).to_owned(),
+                    })
+                    .await;
                 Ok(StepOutcome::Continue {
                     snapshot: next,
                     accounting: StepAccounting {
@@ -776,6 +847,7 @@ impl Harness {
         responded: PendingRunEvent,
         plan: ys_agent_core::QueryPlan,
         tokens: u32,
+        model_telemetry: TelemetryEvent,
     ) -> CoreResult<StepOutcome> {
         let bytes = serde_json::to_vec(&plan).map_err(|error| {
             CoreError::validation("query_plan_serialization_failed", error.to_string())
@@ -816,6 +888,7 @@ impl Harness {
             &next,
         )
         .await?;
+        self.telemetry.emit_after_commit(model_telemetry).await;
         Ok(StepOutcome::Continue {
             snapshot: next,
             accounting: StepAccounting {
@@ -855,6 +928,15 @@ impl HarnessStep for Harness {
                     .await
             }
         }
+    }
+
+    async fn emit_terminal_run_latency(&self, run_id: &RunId, elapsed: Duration) {
+        self.telemetry
+            .emit_after_commit(TelemetryEvent::RunLatency {
+                run_id: *run_id,
+                milliseconds: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            })
+            .await;
     }
 
     async fn fail_terminal(
@@ -959,6 +1041,19 @@ fn verification_hash<T: Serialize>(value: &T) -> CoreResult<String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| CoreError::validation("verification_hash_failed", error.to_string()))?;
     Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
+}
+
+fn elapsed_milliseconds(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn tool_outcome_code(outcome: &ys_agent_core::ToolOutcome) -> &'static str {
+    match outcome {
+        ys_agent_core::ToolOutcome::Succeeded { .. } => "succeeded",
+        ys_agent_core::ToolOutcome::Rejected { .. } => "rejected",
+        ys_agent_core::ToolOutcome::Failed { .. } => "failed",
+        ys_agent_core::ToolOutcome::Indeterminate { .. } => "indeterminate",
+    }
 }
 
 impl Harness {
@@ -1221,6 +1316,7 @@ impl Harness {
         responded: PendingRunEvent,
         summary: String,
         tokens: u32,
+        model_telemetry: TelemetryEvent,
     ) -> CoreResult<StepOutcome> {
         if state.phase != QueryPhase::ReadyToComplete || state.verification_report.is_none() {
             let failed = self.next_snapshot(
@@ -1244,6 +1340,7 @@ impl Harness {
                 &failed,
             )
             .await?;
+            self.telemetry.emit_after_commit(model_telemetry).await;
             return Ok(StepOutcome::Terminal {
                 snapshot: failed,
                 accounting: StepAccounting {
@@ -1404,6 +1501,7 @@ impl Harness {
             &completed,
         )
         .await?;
+        self.telemetry.emit_after_commit(model_telemetry).await;
         Ok(StepOutcome::Terminal {
             snapshot: completed,
             accounting: StepAccounting {

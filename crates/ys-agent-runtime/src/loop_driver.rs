@@ -76,6 +76,8 @@ pub struct LoopResult {
 pub trait HarnessStep: Send + Sync {
     async fn step(&self, run_id: &RunId) -> CoreResult<StepOutcome>;
 
+    async fn emit_terminal_run_latency(&self, _run_id: &RunId, _elapsed: Duration) {}
+
     async fn fail_terminal(
         &self,
         run_id: &RunId,
@@ -99,6 +101,7 @@ impl LoopDriver {
     }
 
     pub async fn run(&self, run_id: &RunId) -> CoreResult<LoopResult> {
+        let run_started_at = Instant::now();
         let deadline = Instant::now() + self.budget.deadline;
         let mut usage = LoopUsage::default();
 
@@ -108,6 +111,7 @@ impl LoopDriver {
                     .fail(
                         run_id,
                         usage,
+                        run_started_at,
                         "loop_step_budget_exceeded",
                         "Loop step budget exceeded",
                     )
@@ -119,6 +123,7 @@ impl LoopDriver {
                     .fail(
                         run_id,
                         usage,
+                        run_started_at,
                         "loop_deadline_exceeded",
                         "Loop deadline exceeded",
                     )
@@ -132,6 +137,7 @@ impl LoopDriver {
                         .fail(
                             run_id,
                             usage,
+                            run_started_at,
                             "loop_deadline_exceeded",
                             "Loop deadline exceeded during a step",
                         )
@@ -149,6 +155,7 @@ impl LoopDriver {
                     .fail(
                         run_id,
                         usage,
+                        run_started_at,
                         "loop_model_call_budget_exceeded",
                         "Model call budget exceeded",
                     )
@@ -159,6 +166,7 @@ impl LoopDriver {
                     .fail(
                         run_id,
                         usage,
+                        run_started_at,
                         "loop_tool_call_budget_exceeded",
                         "Tool call budget exceeded",
                     )
@@ -169,6 +177,7 @@ impl LoopDriver {
                     .fail(
                         run_id,
                         usage,
+                        run_started_at,
                         "loop_token_budget_exceeded",
                         "Model token budget exceeded",
                     )
@@ -177,7 +186,13 @@ impl LoopDriver {
 
             match outcome {
                 StepOutcome::Continue { .. } => {}
-                StepOutcome::Wait { snapshot, .. } | StepOutcome::Terminal { snapshot, .. } => {
+                StepOutcome::Wait { snapshot, .. } => {
+                    return Ok(LoopResult { snapshot, usage });
+                }
+                StepOutcome::Terminal { snapshot, .. } => {
+                    self.harness
+                        .emit_terminal_run_latency(&snapshot.run_id, run_started_at.elapsed())
+                        .await;
                     return Ok(LoopResult { snapshot, usage });
                 }
             }
@@ -188,10 +203,14 @@ impl LoopDriver {
         &self,
         run_id: &RunId,
         usage: LoopUsage,
+        run_started_at: Instant,
         code: &'static str,
         message: &'static str,
     ) -> CoreResult<LoopResult> {
         let snapshot = self.harness.fail_terminal(run_id, code, message).await?;
+        self.harness
+            .emit_terminal_run_latency(&snapshot.run_id, run_started_at.elapsed())
+            .await;
         Ok(LoopResult { snapshot, usage })
     }
 }

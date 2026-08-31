@@ -1,10 +1,41 @@
 mod support;
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use support::{
     QueryWorkflowFixture, call_inspect_schema, call_query_data_execute, call_query_data_preflight,
     completion_response, propose_completion, propose_safe_adhoc_plan, propose_unsafe_adhoc_plan,
 };
 use ys_agent_core::{QueryIntent, RunStatus};
+use ys_agent_runtime::telemetry::{
+    TelemetryDispatcher, TelemetryError, TelemetryEvent, TelemetrySink,
+};
+
+#[derive(Debug)]
+struct AlwaysFailTelemetrySink;
+
+#[async_trait]
+impl TelemetrySink for AlwaysFailTelemetrySink {
+    async fn emit(&self, _event: TelemetryEvent) -> Result<(), TelemetryError> {
+        Err(TelemetryError::Unavailable)
+    }
+}
+
+#[tokio::test]
+async fn failing_telemetry_sink_preserves_completed_query_run() {
+    let telemetry = Arc::new(TelemetryDispatcher::new(Arc::new(AlwaysFailTelemetrySink)));
+    let fixture = QueryWorkflowFixture::successful_metric_query_with_telemetry(telemetry).await;
+
+    let result = fixture
+        .run("GMV for the last seven complete days")
+        .await
+        .expect("query run succeeds despite telemetry failure");
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert!(fixture.has_run_completed_event(&result.run_id).await);
+    assert!(fixture.telemetry_failure_count() > 0);
+}
 
 #[tokio::test]
 async fn query_completion_requires_execution_verification_and_artifact() {

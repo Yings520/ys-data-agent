@@ -26,6 +26,7 @@ use ys_agent_runtime::{
     ServiceEventPublisher,
     doctor::{DoctorInputs, DoctorProbe, ModelReadiness, SourceReadiness, WorkspaceDoctor},
     export::{ArtifactExporter, DefaultExportPolicy, ExportWriter, WrittenExport},
+    telemetry::TelemetryDispatcher,
     tools::{ConnectorToolAvailability, ToolCatalog, ToolRuntime, WorkspaceToolPolicy},
 };
 
@@ -532,6 +533,7 @@ async fn assemble_scheduler(
             catalog: Arc::new(catalog),
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler: Arc::new(ContextAssembler::new(metrics, dbt_context, run_context)),
+            telemetry: Arc::new(TelemetryDispatcher::default()),
         },
         PromptBuilder::new(config.llm_model.clone()),
         HarnessConfig {
