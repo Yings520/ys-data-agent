@@ -12,6 +12,7 @@ use super::{OpenAiCompatibleConfig, required_capabilities};
 
 const PROVIDER_NAME: &str = "openai_compatible";
 const MAX_TRANSPORT_RETRIES: u32 = 2;
+const MAX_PROTOCOL_CORRECTIONS: u32 = 1;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
@@ -140,9 +141,9 @@ impl OpenAiCompatibleProvider {
         }
 
         if message.tool_calls.len() > 1 {
-            return Err(CoreError::validation(
-                "parallel_tool_calls_disabled",
-                "v0.2 accepts at most one Tool Call per model response",
+            return Err(parallel_tool_calls_error(
+                &message.tool_calls,
+                &request.tools,
             ));
         }
 
@@ -209,7 +210,7 @@ impl OpenAiCompatibleProvider {
             )
         })?;
         let action = deserialize_with_path::<AgentAction>(
-            &content,
+            unwrap_single_json_fence(&content),
             "invalid_model_response",
             "assistant action",
         )?;
@@ -363,13 +364,65 @@ where
     let value = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
         CoreError::validation(
             code,
-            format!("{label} is invalid at JSON path {}", error.path()),
+            format!(
+                "{label} is invalid at JSON path {}: {}",
+                error.path(),
+                error.inner()
+            ),
         )
     })?;
     deserializer
         .end()
         .map_err(|_| CoreError::validation(code, format!("{label} contains trailing JSON data")))?;
     Ok(value)
+}
+
+/// Some OpenAI-compatible providers wrap an otherwise valid JSON response in one Markdown
+/// fence even when explicitly asked for JSON-only output. Treat that single, outer transport
+/// wrapper as harmless, while deliberately refusing to search prose for an embedded JSON value.
+fn parallel_tool_calls_error(tool_calls: &[ApiToolCall], tools: &[ToolSpec]) -> CoreError {
+    let names: Vec<&str> = tool_calls
+        .iter()
+        .map(|call| {
+            if tools.iter().any(|spec| spec.name == call.function.name) {
+                call.function.name.as_str()
+            } else {
+                "unknown"
+            }
+        })
+        .collect();
+    CoreError::validation(
+        "parallel_tool_calls_disabled",
+        format!(
+            "v0.2 accepts at most one Tool Call per model response; received {} ({})",
+            tool_calls.len(),
+            names.join(", ")
+        ),
+    )
+}
+
+fn unwrap_single_json_fence(input: &str) -> &str {
+    let trimmed = input.trim();
+    let Some(after_opening) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some((language, body)) = after_opening.split_once('\n') else {
+        return trimmed;
+    };
+    let language = language.trim();
+    if !(language.is_empty() || language.eq_ignore_ascii_case("json")) {
+        return trimmed;
+    }
+    let body = body
+        .strip_suffix("\n```")
+        .or_else(|| body.strip_suffix("\r\n```"));
+    let Some(body) = body else {
+        return trimmed;
+    };
+    if body.contains("```") {
+        return trimmed;
+    }
+    body.trim()
 }
 
 #[derive(Clone, Debug)]
@@ -522,21 +575,62 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 
     async fn complete(&self, request: ModelRequest) -> CoreResult<ModelResponse> {
-        let body = self.build_request(&request)?;
+        let mut body = self.build_request(&request)?;
         let started_at = Instant::now();
+        let mut protocol_corrections = 0_u32;
 
+        loop {
+            match self
+                .complete_transport(&body, &request, started_at, protocol_corrections)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if error.code() == "parallel_tool_calls_disabled"
+                        && protocol_corrections < MAX_PROTOCOL_CORRECTIONS =>
+                {
+                    protocol_corrections += 1;
+                    body.messages.push(ApiRequestMessage {
+                        role: "user",
+                        content: Some(format!(
+                            "PROTOCOL CORRECTION: {error} Return at most one Tool Call. Do not include previous tool arguments."
+                        )),
+                        tool_call_id: None,
+                        name: None,
+                        tool_calls: None,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl OpenAiCompatibleProvider {
+    async fn complete_transport(
+        &self,
+        body: &ApiChatRequest,
+        request: &ModelRequest,
+        started_at: Instant,
+        protocol_corrections: u32,
+    ) -> CoreResult<ModelResponse> {
         for retry_index in 0..=MAX_TRANSPORT_RETRIES {
-            let attempts = retry_index + 1;
-            match self.send_once(&body).await {
+            let attempts = retry_index + 1 + protocol_corrections;
+            match self.send_once(body).await {
                 Ok(wire_response) => {
                     let usage = wire_response.usage;
-                    let parsed = self.parse_response(wire_response, &request);
+                    let parsed = self.parse_response(wire_response, request);
                     self.record_telemetry(
                         started_at,
                         usage,
                         attempts,
                         if parsed.is_ok() {
                             "succeeded"
+                        } else if parsed
+                            .as_ref()
+                            .is_err_and(|error| error.code() == "parallel_tool_calls_disabled")
+                        {
+                            "parallel_tool_calls_disabled"
                         } else {
                             "invalid_response"
                         },
