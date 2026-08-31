@@ -239,6 +239,7 @@ struct AppConfig {
     missing_config_keys: Vec<String>,
     query_budget_explicit: bool,
     query_budget: QueryBudget,
+    artifact_retention_days: u32,
     artifact_root: PathBuf,
     export_root: PathBuf,
 }
@@ -246,45 +247,13 @@ struct AppConfig {
 impl AppConfig {
     fn from_env() -> CoreResult<Self> {
         let source_kind = optional_env("YSDA_DATA_SOURCE_KIND", "sqlite");
-        let mut required_keys = vec![
-            "YSDA_LLM_BASE_URL",
-            "YSDA_LLM_API_KEY",
-            "YSDA_LLM_MODEL",
-            "YSDA_QUERY_POLICY_PATH",
-            "YSDA_TIMEZONE",
-            "YSDA_QUERY_TIMEOUT_SECONDS",
-            "YSDA_QUERY_MAX_ROWS",
-            "YSDA_QUERY_MAX_RESULT_BYTES",
-        ];
-        required_keys.push(if source_kind == "postgres" {
-            "YSDA_DATA_SOURCE_URL"
-        } else {
-            "YSDA_SQLITE_PATH"
-        });
-        let missing_config_keys = required_keys
+        let missing_config_keys = required_config_keys(&source_kind)
             .into_iter()
             .filter(|key| nonempty_env(key).is_none())
             .map(str::to_owned)
             .collect();
-        let query_budget_explicit = [
-            "YSDA_QUERY_TIMEOUT_SECONDS",
-            "YSDA_QUERY_MAX_ROWS",
-            "YSDA_QUERY_MAX_RESULT_BYTES",
-        ]
-        .into_iter()
-        .all(|key| nonempty_env(key).is_some());
-        let mut query_budget = QueryBudget::default();
-        if let Some(value) = nonempty_env("YSDA_QUERY_TIMEOUT_SECONDS") {
-            query_budget.statement_timeout_ms =
-                parse_nonzero(&value, "YSDA_QUERY_TIMEOUT_SECONDS")?.saturating_mul(1_000);
-        }
-        if let Some(value) = nonempty_env("YSDA_QUERY_MAX_ROWS") {
-            query_budget.max_rows = parse_nonzero(&value, "YSDA_QUERY_MAX_ROWS")? as usize;
-        }
-        if let Some(value) = nonempty_env("YSDA_QUERY_MAX_RESULT_BYTES") {
-            query_budget.max_result_bytes =
-                parse_nonzero(&value, "YSDA_QUERY_MAX_RESULT_BYTES")? as usize;
-        }
+        let (query_budget_explicit, query_budget) = query_budget_from_lookup(&nonempty_env)?;
+        let artifact_retention_days = artifact_retention_days_from_lookup(&nonempty_env)?;
         Ok(Self {
             workspace_name: optional_env("YSDA_WORKSPACE_NAME", "local"),
             llm_base_url_ref: CredentialReference::new("env:YSDA_LLM_BASE_URL")?,
@@ -309,10 +278,81 @@ impl AppConfig {
             missing_config_keys,
             query_budget_explicit,
             query_budget,
+            artifact_retention_days,
             artifact_root: PathBuf::from(".ysda/artifacts"),
             export_root: PathBuf::from(".ysda/exports"),
         })
     }
+}
+
+fn required_config_keys(source_kind: &str) -> Vec<&'static str> {
+    let mut keys = vec![
+        "YSDA_LLM_BASE_URL",
+        "YSDA_LLM_API_KEY",
+        "YSDA_LLM_MODEL",
+        "YSDA_QUERY_POLICY_PATH",
+        "YSDA_TIMEZONE",
+        "YSDA_QUERY_TIMEOUT_SECONDS",
+        "YSDA_QUERY_MAX_ROWS",
+        "YSDA_QUERY_MAX_RESULT_BYTES",
+        "YSDA_ARTIFACT_RETENTION_DAYS",
+    ];
+    keys.push(if source_kind == "postgres" {
+        "YSDA_DATA_SOURCE_URL"
+    } else {
+        "YSDA_SQLITE_PATH"
+    });
+    keys
+}
+
+fn query_budget_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> CoreResult<(bool, QueryBudget)> {
+    let required_budget_keys = [
+        "YSDA_QUERY_TIMEOUT_SECONDS",
+        "YSDA_QUERY_MAX_ROWS",
+        "YSDA_QUERY_MAX_RESULT_BYTES",
+    ];
+    let explicit = required_budget_keys
+        .into_iter()
+        .all(|key| lookup(key).is_some());
+    let mut budget = QueryBudget::default();
+    if let Some(value) = lookup("YSDA_QUERY_TIMEOUT_SECONDS") {
+        budget.statement_timeout_ms =
+            parse_nonzero(&value, "YSDA_QUERY_TIMEOUT_SECONDS")?.saturating_mul(1_000);
+    }
+    if let Some(value) = lookup("YSDA_QUERY_MAX_ROWS") {
+        budget.max_rows = parse_nonzero(&value, "YSDA_QUERY_MAX_ROWS")? as usize;
+    }
+    if let Some(value) = lookup("YSDA_QUERY_MAX_RESULT_BYTES") {
+        budget.max_result_bytes = parse_nonzero(&value, "YSDA_QUERY_MAX_RESULT_BYTES")? as usize;
+    }
+    if let Some(value) = lookup("YSDA_QUERY_MAX_ESTIMATED_COST_UNITS") {
+        budget.max_estimated_cost_units = Some(parse_nonzero(
+            &value,
+            "YSDA_QUERY_MAX_ESTIMATED_COST_UNITS",
+        )?);
+    }
+    Ok((explicit, budget))
+}
+
+fn artifact_retention_days_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> CoreResult<u32> {
+    const DEFAULT_ARTIFACT_RETENTION_DAYS: u32 = 7;
+    let Some(value) = lookup("YSDA_ARTIFACT_RETENTION_DAYS") else {
+        return Ok(DEFAULT_ARTIFACT_RETENTION_DAYS);
+    };
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|days| *days > 0)
+        .ok_or_else(|| {
+            CoreError::validation(
+                "invalid_artifact_retention",
+                "YSDA_ARTIFACT_RETENTION_DAYS must be a positive integer",
+            )
+        })
 }
 
 fn nonempty_env(key: &str) -> Option<String> {
@@ -1195,19 +1235,21 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
         config: config.clone(),
         readiness,
     })));
-    let exporter = Arc::new(ArtifactExporter::new(
+    let exporter = Arc::new(ArtifactExporter::with_retention_days(
         runtime_port.clone(),
         artifact_port.clone(),
         Arc::new(OwnerOnlyExportWriter::new(&config.export_root)),
         Arc::new(DefaultExportPolicy),
+        config.artifact_retention_days,
     ));
-    let service = Arc::new(InProcessAgentService::with_dependencies(
+    let service = Arc::new(InProcessAgentService::with_dependencies_and_retention(
         workspace_id,
         runtime_port,
         artifact_port,
         scheduler.clone(),
         doctor,
         exporter,
+        config.artifact_retention_days,
     ));
     if let Some(background) = background {
         background.set_publisher(service.event_publisher());
@@ -1229,8 +1271,50 @@ mod tests {
         time::Duration,
     };
 
-    use super::{acquire_workspace_id_lock, create_private_directory, resolve_workspace_id};
+    use super::{
+        acquire_workspace_id_lock, artifact_retention_days_from_lookup, create_private_directory,
+        query_budget_from_lookup, required_config_keys, resolve_workspace_id,
+    };
     use ys_agent_core::{CoreError, WorkspaceId};
+
+    #[test]
+    fn documented_query_cost_limit_is_parsed_into_the_runtime_budget() {
+        let lookup = |key: &str| match key {
+            "YSDA_QUERY_TIMEOUT_SECONDS" => Some("17".to_owned()),
+            "YSDA_QUERY_MAX_ROWS" => Some("23".to_owned()),
+            "YSDA_QUERY_MAX_RESULT_BYTES" => Some("4096".to_owned()),
+            "YSDA_QUERY_MAX_ESTIMATED_COST_UNITS" => Some("71".to_owned()),
+            _ => None,
+        };
+
+        let (explicit, budget) = query_budget_from_lookup(&lookup).expect("query budget");
+
+        assert!(explicit);
+        assert_eq!(budget.statement_timeout_ms, 17_000);
+        assert_eq!(budget.max_rows, 23);
+        assert_eq!(budget.max_result_bytes, 4_096);
+        assert_eq!(budget.max_estimated_cost_units, Some(71));
+    }
+
+    #[test]
+    fn artifact_retention_is_required_and_parsed_as_positive_days() {
+        assert!(required_config_keys("sqlite").contains(&"YSDA_ARTIFACT_RETENTION_DAYS"));
+        assert_eq!(
+            artifact_retention_days_from_lookup(&|key| {
+                (key == "YSDA_ARTIFACT_RETENTION_DAYS").then(|| "19".to_owned())
+            })
+            .expect("artifact retention"),
+            19
+        );
+    }
+
+    #[test]
+    fn invalid_artifact_retention_has_a_specific_error_code() {
+        let error = artifact_retention_days_from_lookup(&|_| Some("0".to_owned()))
+            .expect_err("zero retention must fail");
+
+        assert_eq!(error.code(), "invalid_artifact_retention");
+    }
 
     #[test]
     fn workspace_id_is_persisted_for_later_bootstraps() {

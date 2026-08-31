@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use ys_agent_core::{
     ArtifactAccessContext, ArtifactAccessPurpose, ArtifactKind, ArtifactStore, CommandId,
-    CommandReceipt, CommandResultKind, ExportFormat, Principal, PutArtifact, RuntimeCommandBatch,
-    RuntimeStore, Sensitivity, TaskId, WorkspaceId,
+    CommandReceipt, CommandResultKind, ExportFormat, Principal, PutArtifact, RetentionPolicy,
+    RuntimeCommandBatch, RuntimeStore, Sensitivity, TaskId, WorkspaceId,
 };
 use ys_agent_runtime::export::{
     ArtifactExportService, ArtifactExporter, DefaultExportPolicy, ExportDisposition, ExportPolicy,
@@ -74,11 +74,12 @@ async fn export_command_replay_returns_the_same_persisted_export_artifact() {
         })
         .await
         .expect("index source artifact");
-    let exporter = ArtifactExporter::new(
+    let exporter = ArtifactExporter::with_retention_days(
         store,
         artifacts,
         Arc::new(OwnerOnlyExportWriter::new(directory.path().join("exports"))),
         Arc::new(DefaultExportPolicy),
+        19,
     );
     let command_id = CommandId::new();
     let access = ArtifactAccessContext {
@@ -99,5 +100,11 @@ async fn export_command_replay_returns_the_same_persisted_export_artifact() {
 
     assert_eq!(first.id, replay.id);
     assert_eq!(first.storage_uri, replay.storage_uri);
+    assert_eq!(
+        first.retention_policy,
+        Some(RetentionPolicy::Days { days: 19 })
+    );
+    let expires_at = first.expires_at.expect("configured export expiry");
+    assert_eq!((expires_at - first.created_at).num_days(), 19);
     assert!(std::path::Path::new(&first.storage_uri).is_file());
 }
