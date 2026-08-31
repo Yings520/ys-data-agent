@@ -40,6 +40,7 @@ impl StoreFixture {
             session_id: None,
             task_id: Some(task.id),
             run_id: Some(run.id),
+            artifact_id: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -142,6 +143,7 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
                 session_id: None,
                 task_id: Some(task.id),
                 run_id: Some(run.id),
+                artifact_id: None,
             },
             new_session: None,
             new_task: Some(task),
@@ -256,6 +258,7 @@ async fn duplicate_command_id_returns_the_origianl_recepit() {
             session_id: None,
             task_id: Some(task.id),
             run_id: Some(run.id),
+            artifact_id: None,
         },
         new_session: None,
         new_task: Some(task),

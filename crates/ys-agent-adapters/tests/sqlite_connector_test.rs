@@ -7,8 +7,9 @@ use ys_agent_adapters::{
     ResultPolicy, SqlReadOnlyPolicy, SqliteConnector, SqliteConnectorConfig, SupportedDialect,
 };
 use ys_agent_core::{
-    CatalogReader, CellValue, CoreError, FreshnessReader, QueryBudget, QueryRequest,
-    SchemaKnowledgeKind, SourceId, SqlQueryExecutor, WorkspaceId,
+    CatalogReader, CellValue, CoreError, FreshnessReader, QueryBudget, QueryPreflightDecision,
+    QueryPreflightReader, QueryRequest, SchemaKnowledgeKind, SourceId, SqlQueryExecutor,
+    WorkspaceId,
 };
 
 fn fixture_path(relative: &str) -> PathBuf {
@@ -112,6 +113,30 @@ async fn sqlite_is_logically_read_only_and_does_not_change_rows() {
         .expect("read rows after rejection");
     assert_eq!(result.row_count, 2);
     assert!(result.truncated);
+}
+
+#[tokio::test]
+async fn sqlite_preflight_uses_the_same_read_only_policy_as_execution() {
+    let fixture = SqliteFixture::from_seed().await;
+
+    let allowed = fixture
+        .connector
+        .preflight(&fixture.request("SELECT order_id FROM mart_orders"))
+        .await
+        .expect("preflight read query");
+    assert_eq!(allowed.decision, QueryPreflightDecision::Allowed);
+
+    let denied = fixture
+        .connector
+        .preflight(&fixture.request("DELETE FROM mart_orders"))
+        .await
+        .expect("preflight rejected query");
+    assert_eq!(denied.decision, QueryPreflightDecision::Rejected);
+    assert!(
+        denied
+            .reason_codes
+            .contains(&"statement_not_read_only".to_owned())
+    );
 }
 
 #[tokio::test]
