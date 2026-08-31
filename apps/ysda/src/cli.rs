@@ -1,9 +1,11 @@
+use std::time::Duration;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use ys_agent_core::{
     ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, CommandId, CoreError, CoreResult,
-    ExportFormat, RunId, Sensitivity, TaskId,
+    ExportFormat, RunId, RunStatus, Sensitivity, TaskId,
 };
-use ys_agent_runtime::{SendMessageRequest, ServiceReply};
+use ys_agent_runtime::{AgentServiceApi, SendMessageRequest, ServiceReply};
 
 use crate::{bootstrap::AppDependencies, tui::run_tui};
 
@@ -90,13 +92,60 @@ async fn dispatch_run(dependencies: &AppDependencies, question: String) -> CoreR
         ))
         .await?
     {
-        ServiceReply::RunScheduled { run_id, .. } => println!("Run scheduled: {run_id}"),
+        ServiceReply::Conversation { message } => println!("{message}"),
+        ServiceReply::RunScheduled { run_id, .. } => {
+            println!("Run scheduled: {run_id}");
+            wait_for_terminal_run(dependencies.service.as_ref(), &run_id).await?;
+        }
         ServiceReply::ClarificationRequired { question, .. } => {
             println!("Clarification required: {question}")
         }
         ServiceReply::UnsupportedCapability { message, .. } => println!("{message}"),
     }
     Ok(())
+}
+
+async fn wait_for_terminal_run(service: &dyn AgentServiceApi, run_id: &RunId) -> CoreResult<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let snapshot = service.get_run(run_id).await?;
+        match snapshot.status {
+            RunStatus::Succeeded => {
+                println!("Run succeeded: {run_id}");
+                if let Some(artifact_id) = snapshot.primary_artifact_id {
+                    println!("Primary artifact: {artifact_id}");
+                }
+                return Ok(());
+            }
+            RunStatus::Failed => {
+                println!("Run failed: {run_id}");
+                return Err(CoreError::validation(
+                    "run_failed",
+                    "the Query Run ended in Failed",
+                ));
+            }
+            RunStatus::Cancelled => {
+                println!("Run cancelled: {run_id}");
+                return Err(CoreError::validation(
+                    "run_cancelled",
+                    "the Query Run was cancelled",
+                ));
+            }
+            RunStatus::WaitingForInput => {
+                println!("Run waiting for input: {run_id}");
+                return Ok(());
+            }
+            RunStatus::Queued | RunStatus::Running => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CoreError::validation(
+                        "run_wait_timeout",
+                        "timed out waiting for the Query Run to finish",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 async fn dispatch_task(dependencies: &AppDependencies, command: TaskCommand) -> CoreResult<()> {

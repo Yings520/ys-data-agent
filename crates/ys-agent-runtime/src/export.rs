@@ -351,6 +351,8 @@ impl ArtifactExportService for ArtifactExporter {
             task_id: Some(source.task_id),
             run_id: Some(source.run_id),
             artifact_id: Some(metadata.id),
+            message: None,
+            capability: None,
         };
         let stored = self
             .runtime_store

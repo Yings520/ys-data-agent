@@ -59,6 +59,14 @@ pub struct ModelResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentAction {
+    Respond {
+        message: String,
+    },
+    StartQuery,
+    UnsupportedCapability {
+        capability: String,
+        message: String,
+    },
     CallTool {
         call: ToolCall,
     },

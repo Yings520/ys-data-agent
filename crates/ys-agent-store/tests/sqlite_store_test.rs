@@ -41,6 +41,8 @@ impl StoreFixture {
             task_id: Some(task.id),
             run_id: Some(run.id),
             artifact_id: None,
+            message: None,
+            capability: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -144,6 +146,8 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
                 task_id: Some(task.id),
                 run_id: Some(run.id),
                 artifact_id: None,
+                message: None,
+                capability: None,
             },
             new_session: None,
             new_task: Some(task),
@@ -151,6 +155,7 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
             new_artifact: None,
             pending_events: vec![],
             snapshot_update: None,
+            capability: None,
         })
         .await
         .expect("seed run");
@@ -259,6 +264,8 @@ async fn duplicate_command_id_returns_the_origianl_recepit() {
             task_id: Some(task.id),
             run_id: Some(run.id),
             artifact_id: None,
+            message: None,
+            capability: None,
         },
         new_session: None,
         new_task: Some(task),

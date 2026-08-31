@@ -573,6 +573,15 @@ impl TuiController {
             .await?;
         self.finish_command();
         match reply {
+            ServiceReply::Conversation { message } => {
+                app.push_transcript(TranscriptItem::Answer(AnswerView {
+                    state: "Chat".to_owned(),
+                    conclusion: message,
+                    key_values: [None, None],
+                    explanation: None,
+                }));
+                app.set_runtime_status("Ready");
+            }
             ServiceReply::RunScheduled { task_id, run_id } => self.focus_run(app, task_id, run_id),
             ServiceReply::ClarificationRequired {
                 task_id,
