@@ -24,6 +24,8 @@ ys-agent-store = { path = "../../crates/ys-agent-store" }
 ys-agent-adapters = { path = "../../crates/ys-agent-adapters" }
 
 [dev-dependencies]
+chrono.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [[bin]]
