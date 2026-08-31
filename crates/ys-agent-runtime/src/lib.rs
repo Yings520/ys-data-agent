@@ -1,5 +1,7 @@
 mod context_assembler;
 mod coordinator;
+pub mod doctor;
+pub mod export;
 mod harness;
 mod loop_driver;
 mod recovery;

@@ -9,12 +9,16 @@ use tokio::sync::broadcast;
 use ys_agent_core::{
     ArtifactAccessContext, ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore,
     CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult, EventActor, EventEnvelope,
-    PendingRunEvent, Principal, PutArtifact, RetentionPolicy, Run, RunEventKind, RunId,
-    RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, Sensitivity, Session, SessionId,
-    Task, TaskId, WorkflowKind, WorkspaceId,
+    ExportFormat, PendingRunEvent, Principal, PutArtifact, RetentionPolicy, Run, RunEventKind,
+    RunId, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, Sensitivity, Session,
+    SessionId, Task, TaskId, WorkflowKind, WorkspaceId,
 };
 
-use crate::coordinator::{CoordinationDecision, Coordinator, FutureWorkflow, RuleBasedCoordinator};
+use crate::{
+    coordinator::{CoordinationDecision, Coordinator, FutureWorkflow, RuleBasedCoordinator},
+    doctor::{DoctorReport, DoctorRunner},
+    export::ArtifactExportService,
+};
 
 const DEFAULT_EVENT_CAPACITY: usize = 64;
 const ARTIFACT_PREVIEW_LIMIT: usize = 4_096;
@@ -161,6 +165,36 @@ impl RunScheduler for NoopRunScheduler {
     }
 }
 
+struct UnconfiguredDoctor;
+
+#[async_trait]
+impl DoctorRunner for UnconfiguredDoctor {
+    async fn run(&self) -> CoreResult<DoctorReport> {
+        Err(CoreError::validation(
+            "workspace_doctor_unconfigured",
+            "Workspace Doctor is not configured",
+        ))
+    }
+}
+
+struct UnconfiguredExporter;
+
+#[async_trait]
+impl ArtifactExportService for UnconfiguredExporter {
+    async fn export(
+        &self,
+        _command_id: CommandId,
+        _artifact_id: &ArtifactId,
+        _format: ExportFormat,
+        _access: ArtifactAccessContext,
+    ) -> CoreResult<ArtifactMetadata> {
+        Err(CoreError::validation(
+            "artifact_export_unconfigured",
+            "Artifact export is not configured",
+        ))
+    }
+}
+
 #[async_trait]
 pub trait AgentServiceApi: Send + Sync {
     async fn create_session(
@@ -205,6 +239,16 @@ pub trait AgentServiceApi: Send + Sync {
         run_id: &RunId,
         reason: String,
     ) -> CoreResult<()>;
+
+    async fn doctor(&self) -> CoreResult<DoctorReport>;
+
+    async fn export_artifact(
+        &self,
+        command_id: CommandId,
+        artifact_id: &ArtifactId,
+        format: ExportFormat,
+        access: ArtifactAccessContext,
+    ) -> CoreResult<ArtifactMetadata>;
 }
 
 pub struct InProcessAgentService {
@@ -212,6 +256,8 @@ pub struct InProcessAgentService {
     store: Arc<dyn RuntimeStore>,
     artifacts: Arc<dyn ArtifactStore>,
     scheduler: Arc<dyn RunScheduler>,
+    doctor: Arc<dyn DoctorRunner>,
+    exporter: Arc<dyn ArtifactExportService>,
     coordinator: RuleBasedCoordinator,
     event_sender: broadcast::Sender<ServiceEvent>,
 }
@@ -239,12 +285,53 @@ impl InProcessAgentService {
         scheduler: Arc<dyn RunScheduler>,
         event_capacity: usize,
     ) -> Self {
+        Self::with_event_capacity_and_dependencies(
+            workspace_id,
+            store,
+            artifacts,
+            scheduler,
+            Arc::new(UnconfiguredDoctor),
+            Arc::new(UnconfiguredExporter),
+            event_capacity,
+        )
+    }
+
+    pub fn with_dependencies(
+        workspace_id: WorkspaceId,
+        store: Arc<dyn RuntimeStore>,
+        artifacts: Arc<dyn ArtifactStore>,
+        scheduler: Arc<dyn RunScheduler>,
+        doctor: Arc<dyn DoctorRunner>,
+        exporter: Arc<dyn ArtifactExportService>,
+    ) -> Self {
+        Self::with_event_capacity_and_dependencies(
+            workspace_id,
+            store,
+            artifacts,
+            scheduler,
+            doctor,
+            exporter,
+            DEFAULT_EVENT_CAPACITY,
+        )
+    }
+
+    fn with_event_capacity_and_dependencies(
+        workspace_id: WorkspaceId,
+        store: Arc<dyn RuntimeStore>,
+        artifacts: Arc<dyn ArtifactStore>,
+        scheduler: Arc<dyn RunScheduler>,
+        doctor: Arc<dyn DoctorRunner>,
+        exporter: Arc<dyn ArtifactExportService>,
+        event_capacity: usize,
+    ) -> Self {
         let (event_sender, _) = broadcast::channel(event_capacity.max(1));
         Self {
             workspace_id,
             store,
             artifacts,
             scheduler,
+            doctor,
+            exporter,
             coordinator: RuleBasedCoordinator,
             event_sender,
         }
@@ -298,6 +385,7 @@ impl InProcessAgentService {
             session_id: None,
             task_id: Some(snapshot.task_id),
             run_id: Some(snapshot.run_id),
+            artifact_id: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -344,6 +432,7 @@ impl AgentServiceApi for InProcessAgentService {
             session_id: Some(session.id),
             task_id: None,
             run_id: None,
+            artifact_id: None,
         };
 
         let stored = self
@@ -392,6 +481,7 @@ impl AgentServiceApi for InProcessAgentService {
             session_id: Some(session.id),
             task_id: Some(task.id),
             run_id: None,
+            artifact_id: None,
         };
         let stored = self
             .store
@@ -532,6 +622,7 @@ impl AgentServiceApi for InProcessAgentService {
                     session_id: Some(session.id),
                     task_id: focused.as_ref().map(|task| task.id),
                     run_id: None,
+                    artifact_id: None,
                 };
                 self.store
                     .commit_command(RuntimeCommandBatch {
@@ -607,6 +698,7 @@ impl AgentServiceApi for InProcessAgentService {
                 session_id: None,
                 task_id: Some(*task_id),
                 run_id: Some(retry.run_id),
+                artifact_id: None,
             };
             self.store
                 .commit_command(RuntimeCommandBatch {
@@ -643,6 +735,7 @@ impl AgentServiceApi for InProcessAgentService {
             session_id: None,
             task_id: Some(*task_id),
             run_id: Some(applied.snapshot.run_id),
+            artifact_id: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -805,6 +898,7 @@ impl AgentServiceApi for InProcessAgentService {
             session_id: None,
             task_id: Some(task.id),
             run_id: Some(*run_id),
+            artifact_id: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -867,6 +961,7 @@ impl AgentServiceApi for InProcessAgentService {
             session_id: None,
             task_id: Some(current.task_id),
             run_id: Some(*run_id),
+            artifact_id: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -938,6 +1033,22 @@ impl AgentServiceApi for InProcessAgentService {
             pending: pending.into(),
             receiver,
         })
+    }
+
+    async fn doctor(&self) -> CoreResult<DoctorReport> {
+        self.doctor.run().await
+    }
+
+    async fn export_artifact(
+        &self,
+        command_id: CommandId,
+        artifact_id: &ArtifactId,
+        format: ExportFormat,
+        access: ArtifactAccessContext,
+    ) -> CoreResult<ArtifactMetadata> {
+        self.exporter
+            .export(command_id, artifact_id, format, access)
+            .await
     }
 }
 
@@ -1046,7 +1157,7 @@ fn ensure_workspace(expected: WorkspaceId, actual: WorkspaceId) -> CoreResult<()
     }
 }
 
-fn command_fingerprint(operation: &str, payload: Value) -> CoreResult<String> {
+pub(crate) fn command_fingerprint(operation: &str, payload: Value) -> CoreResult<String> {
     let canonical = canonicalize(json!({
         "operation": operation,
         "payload": payload,
