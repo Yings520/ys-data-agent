@@ -5,7 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use support::{
     QueryWorkflowFixture, call_inspect_schema, call_query_data_execute, call_query_data_preflight,
-    completion_response, propose_completion, propose_safe_adhoc_plan, propose_unsafe_adhoc_plan,
+    call_resolve_missing_metric, completion_response, propose_completion, propose_safe_adhoc_plan,
+    propose_unsafe_adhoc_plan,
 };
 use ys_agent_core::{QueryIntent, RunStatus};
 use ys_agent_runtime::telemetry::{
@@ -170,6 +171,29 @@ async fn propose_completion_before_query_execution_is_rejected() {
 
     assert_eq!(result.status, RunStatus::Failed);
     assert_eq!(result.failure_code(), Some("completion_gate_failed"));
+}
+
+#[tokio::test]
+async fn a_metric_registry_miss_in_resolve_context_continues_as_adhoc() {
+    let fixture = QueryWorkflowFixture::with_model_actions(vec![
+        call_resolve_missing_metric(),
+        call_inspect_schema(),
+        propose_safe_adhoc_plan(),
+        call_query_data_preflight(),
+        call_query_data_execute(),
+        propose_completion(),
+    ])
+    .await;
+
+    let result = fixture
+        .run("List distinct order channels")
+        .await
+        .expect("adhoc after metric miss");
+
+    assert_eq!(result.status, RunStatus::Succeeded);
+    assert_eq!(fixture.primary_artifact().intent, QueryIntent::AdHocRead);
+    assert_eq!(fixture.tool_call_count("resolve_metric"), 1);
+    assert_eq!(fixture.tool_call_count("inspect_schema"), 1);
 }
 
 #[tokio::test]

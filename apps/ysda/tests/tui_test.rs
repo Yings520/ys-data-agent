@@ -34,6 +34,13 @@ fn slash_new_creates_a_session_command_not_a_cancel_command() {
 }
 
 #[test]
+fn slash_quit_detaches_without_cancelling_a_run() {
+    let action = parse_input("/quit").expect("quit command");
+    assert_eq!(action, InputAction::Quit);
+    assert!(!matches!(action, InputAction::CancelRun { .. }));
+}
+
+#[test]
 fn v02_tui_does_not_offer_unimplemented_modes() {
     let app = TuiApp::for_principal(Principal::local_operator("ysc"));
     let rendered = render_to_string(&app, 100, 28);

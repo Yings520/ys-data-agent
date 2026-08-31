@@ -41,6 +41,7 @@ pub enum TaskCommand {
     List,
     Resume { task_id: TaskId },
     Cancel { run_id: RunId },
+    Answer { run_id: RunId, answer: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -176,6 +177,15 @@ async fn dispatch_task(dependencies: &AppDependencies, command: TaskCommand) -> 
                 .await?;
             println!("Cancelled: {run_id}");
             Ok(())
+        }
+        TaskCommand::Answer { run_id, answer } => {
+            ensure_query_ready(dependencies, "clarification answer").await?;
+            dependencies
+                .service
+                .answer_clarification(CommandId::new(), &run_id, answer)
+                .await?;
+            println!("Clarification accepted; resuming the same Run: {run_id}");
+            wait_for_terminal_run(dependencies.service.as_ref(), &run_id).await
         }
     }
 }

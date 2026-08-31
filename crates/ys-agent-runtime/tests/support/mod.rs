@@ -181,6 +181,10 @@ fn call_resolve_metric() -> ScriptedAction {
     direct_tool_action("resolve_metric", json!({ "metric": "commerce.gmv" }))
 }
 
+pub fn call_resolve_missing_metric() -> ScriptedAction {
+    direct_tool_action("resolve_metric", json!({ "metric": "order.channels" }))
+}
+
 pub fn call_inspect_schema() -> ScriptedAction {
     direct_tool_action(
         "inspect_schema",

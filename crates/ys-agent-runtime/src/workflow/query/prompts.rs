@@ -27,7 +27,7 @@ fn phase_instruction(phase: QueryPhase) -> &'static str {
             "PHASE: ClassifyIntent. Route Metadata versus a data request only; never infer a governed metric from question wording."
         }
         QueryPhase::ResolveContext => {
-            "PHASE: ResolveContext. Resolve data requests against the Active Metric Registry before proposing an AdHoc read. Use the exact source_id from RUNTIME_QUERY_STATE_JSON when inspecting schema. Call at most one tool per turn; never emit parallel Tool Calls. Ask for clarification rather than choosing between competing metric or dimension candidates."
+            "PHASE: ResolveContext. Resolve data requests against the Active Metric Registry before proposing an AdHoc read. Use the exact source_id from RUNTIME_QUERY_STATE_JSON when inspecting schema. Call at most one tool per turn; never emit parallel Tool Calls. If resolve_metric reports metric_not_found_or_inactive, inspect schema next and continue as AdHoc; a metric miss is not a Query failure. Ask for clarification rather than choosing between competing metric or dimension candidates."
         }
         QueryPhase::Plan => concat!(
             "PHASE: Plan. No tools are visible. Return one JSON object only, with no Markdown or prose.\n",
@@ -112,6 +112,7 @@ mod tests {
         let prompt = query_system_instructions(QueryPhase::ResolveContext);
         assert!(prompt.contains("Call at most one tool per turn"));
         assert!(prompt.contains("never emit parallel Tool Calls"));
+        assert!(prompt.contains("metric miss is not a Query failure"));
     }
 
     #[test]
