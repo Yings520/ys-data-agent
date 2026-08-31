@@ -82,7 +82,7 @@ pub trait HarnessStep: Send + Sync {
         &self,
         run_id: &RunId,
         code: &'static str,
-        message: &'static str,
+        message: String,
     ) -> CoreResult<RunSnapshot>;
 }
 
@@ -113,7 +113,7 @@ impl LoopDriver {
                         usage,
                         run_started_at,
                         "loop_step_budget_exceeded",
-                        "Loop step budget exceeded",
+                        "Loop step budget exceeded".to_owned(),
                     )
                     .await;
             }
@@ -125,13 +125,24 @@ impl LoopDriver {
                         usage,
                         run_started_at,
                         "loop_deadline_exceeded",
-                        "Loop deadline exceeded",
+                        "Loop deadline exceeded".to_owned(),
                     )
                     .await;
             }
 
             let outcome = match tokio::time::timeout(remaining, self.harness.step(run_id)).await {
-                Ok(result) => result?,
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => {
+                    return self
+                        .fail(
+                            run_id,
+                            usage,
+                            run_started_at,
+                            error.code(),
+                            error.to_string(),
+                        )
+                        .await;
+                }
                 Err(_) => {
                     return self
                         .fail(
@@ -139,7 +150,7 @@ impl LoopDriver {
                             usage,
                             run_started_at,
                             "loop_deadline_exceeded",
-                            "Loop deadline exceeded during a step",
+                            "Loop deadline exceeded during a step".to_owned(),
                         )
                         .await;
                 }
@@ -157,7 +168,7 @@ impl LoopDriver {
                         usage,
                         run_started_at,
                         "loop_model_call_budget_exceeded",
-                        "Model call budget exceeded",
+                        "Model call budget exceeded".to_owned(),
                     )
                     .await;
             }
@@ -168,7 +179,7 @@ impl LoopDriver {
                         usage,
                         run_started_at,
                         "loop_tool_call_budget_exceeded",
-                        "Tool call budget exceeded",
+                        "Tool call budget exceeded".to_owned(),
                     )
                     .await;
             }
@@ -179,7 +190,7 @@ impl LoopDriver {
                         usage,
                         run_started_at,
                         "loop_token_budget_exceeded",
-                        "Model token budget exceeded",
+                        "Model token budget exceeded".to_owned(),
                     )
                     .await;
             }
@@ -205,7 +216,7 @@ impl LoopDriver {
         usage: LoopUsage,
         run_started_at: Instant,
         code: &'static str,
-        message: &'static str,
+        message: String,
     ) -> CoreResult<LoopResult> {
         let snapshot = self.harness.fail_terminal(run_id, code, message).await?;
         self.harness
@@ -221,12 +232,38 @@ mod tests {
 
     use async_trait::async_trait;
     use tokio::sync::Mutex;
-    use ys_agent_core::{CoreResult, RunId, RunSnapshot, RunStatus, TaskId, WorkflowKind};
+    use ys_agent_core::{
+        CoreError, CoreResult, RunId, RunSnapshot, RunStatus, TaskId, WorkflowKind,
+    };
 
     use super::{HarnessStep, LoopBudget, LoopDriver, StepAccounting, StepOutcome};
 
     struct ScriptedHarness {
         outcomes: Mutex<VecDeque<StepOutcome>>,
+    }
+
+    struct FailingHarness {
+        terminal_failure: Mutex<Option<(&'static str, String)>>,
+    }
+
+    #[async_trait]
+    impl HarnessStep for FailingHarness {
+        async fn step(&self, _run_id: &RunId) -> CoreResult<StepOutcome> {
+            Err(CoreError::validation(
+                "invalid_model_response",
+                "assistant action is invalid",
+            ))
+        }
+
+        async fn fail_terminal(
+            &self,
+            _run_id: &RunId,
+            code: &'static str,
+            message: String,
+        ) -> CoreResult<RunSnapshot> {
+            *self.terminal_failure.lock().await = Some((code, message));
+            Ok(snapshot(RunStatus::Failed))
+        }
     }
 
     fn snapshot(status: RunStatus) -> RunSnapshot {
@@ -260,7 +297,7 @@ mod tests {
             &self,
             _run_id: &RunId,
             _code: &'static str,
-            _message: &'static str,
+            _message: String,
         ) -> CoreResult<RunSnapshot> {
             Ok(snapshot(RunStatus::Failed))
         }
@@ -313,5 +350,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.snapshot.status, RunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn harness_error_is_persisted_as_a_failed_run() {
+        let harness = Arc::new(FailingHarness {
+            terminal_failure: Mutex::new(None),
+        });
+
+        let result = LoopDriver::with_defaults(harness.clone())
+            .run(&RunId::new())
+            .await
+            .expect("driver must turn a step error into terminal state");
+
+        assert_eq!(result.snapshot.status, RunStatus::Failed);
+        assert_eq!(
+            *harness.terminal_failure.lock().await,
+            Some((
+                "invalid_model_response",
+                "assistant action is invalid".to_owned()
+            ))
+        );
     }
 }
