@@ -410,12 +410,14 @@ impl PromptBuilder {
                 content: query_system_instructions(phase),
                 tool_call_id: None,
                 name: None,
+                assistant_tool_call: None,
             },
             ModelMessage {
                 role: ModelRole::User,
                 content: format!("TASK_GOAL:\n{task_goal}"),
                 tool_call_id: None,
                 name: None,
+                assistant_tool_call: None,
             },
         ];
 
@@ -450,6 +452,7 @@ impl PromptBuilder {
                 content: format!("UNTRUSTED_EVIDENCE_JSON:\n{content}"),
                 tool_call_id: None,
                 name: None,
+                assistant_tool_call: None,
             });
         }
 
@@ -459,6 +462,7 @@ impl PromptBuilder {
                 content: format!("UNTRUSTED_TASK_SUMMARY:\n{summary}"),
                 tool_call_id: None,
                 name: None,
+                assistant_tool_call: None,
             });
         }
 

@@ -13,6 +13,13 @@ pub enum ModelRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssistantToolCall {
+    pub provider_call_id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelMessage {
     pub role: ModelRole,
     pub content: String,
@@ -20,6 +27,8 @@ pub struct ModelMessage {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_tool_call: Option<AssistantToolCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

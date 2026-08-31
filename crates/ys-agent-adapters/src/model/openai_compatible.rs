@@ -297,11 +297,50 @@ fn convert_message(message: &ModelMessage) -> CoreResult<ApiRequestMessage> {
         ));
     }
 
+    let tool_calls = match &message.assistant_tool_call {
+        Some(call) => {
+            if message.role != ModelRole::Assistant {
+                return Err(CoreError::validation(
+                    "unexpected_assistant_tool_call",
+                    "only an assistant message may replay a structured Tool Call",
+                ));
+            }
+            if !message.content.trim().is_empty() {
+                return Err(CoreError::validation(
+                    "ambiguous_assistant_tool_call",
+                    "an assistant Tool Call replay cannot also contain text content",
+                ));
+            }
+            if call.provider_call_id.trim().is_empty() || call.name.trim().is_empty() {
+                return Err(CoreError::validation(
+                    "invalid_assistant_tool_call",
+                    "an assistant Tool Call replay needs a provider ID and tool name",
+                ));
+            }
+            Some(vec![ApiRequestToolCall {
+                id: call.provider_call_id.clone(),
+                kind: "function",
+                function: ApiRequestFunctionCall {
+                    name: call.name.clone(),
+                    arguments: serde_json::to_string(&call.arguments).map_err(|error| {
+                        CoreError::validation("invalid_assistant_tool_call", error.to_string())
+                    })?,
+                },
+            }])
+        }
+        None => None,
+    };
+
     Ok(ApiRequestMessage {
         role,
-        content: message.content.clone(),
+        content: if message.assistant_tool_call.is_some() {
+            None
+        } else {
+            Some(message.content.clone())
+        },
         tool_call_id: message.tool_call_id.clone(),
         name: message.name.clone(),
+        tool_calls,
     })
 }
 
@@ -399,11 +438,27 @@ struct ApiChatRequest {
 #[derive(Clone, Debug, Serialize)]
 struct ApiRequestMessage {
     role: &'static str,
-    content: String,
+    content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ApiRequestToolCall>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ApiRequestToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ApiRequestFunctionCall,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ApiRequestFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -44,8 +44,8 @@ pub use ids::{
 
 pub use metric::{MetricDefinition, MetricStatus};
 pub use model::{
-    AgentAction, ModelCapabilities, ModelMessage, ModelRequest, ModelResponse, ModelRole,
-    ModelUsage,
+    AgentAction, AssistantToolCall, ModelCapabilities, ModelMessage, ModelRequest, ModelResponse,
+    ModelRole, ModelUsage,
 };
 
 pub use ports::{
