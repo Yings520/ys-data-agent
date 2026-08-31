@@ -704,6 +704,7 @@ impl DoctorProbe for RuntimeDoctorProbe {
 }
 
 const DOCTOR_TOOL_NAME: &str = "ysda_doctor_probe";
+const DOCTOR_DECOY_TOOL_NAME: &str = "ysda_doctor_decoy";
 
 #[derive(Clone)]
 struct ModelProtocolProbe {
@@ -777,7 +778,7 @@ async fn probe_model_protocol(
                     assistant_tool_call: None,
                 },
             ],
-            tools: vec![tool.clone()],
+            tools: vec![tool.clone(), doctor_decoy_tool()],
             context_manifest: ContextManifest::empty(512),
             temperature: Some(0.0),
         })
@@ -828,15 +829,36 @@ async fn probe_model_protocol(
                     assistant_tool_call: None,
                 },
             ],
-            tools: vec![tool],
+            tools: vec![tool, doctor_decoy_tool()],
             context_manifest: ContextManifest::empty(512),
             temperature: Some(0.0),
         })
         .await?;
-    if matches!(second.action, AgentAction::CallTool { .. }) {
-        return Err(model_protocol_error(
-            "probe follow-up response called another tool",
-        ));
+    match second.action {
+        AgentAction::ProposeCompletion {
+            summary,
+            primary_artifact_hint,
+        } if summary == "protocol probe complete" && primary_artifact_hint.is_none() => {}
+        AgentAction::CallTool { .. } => {
+            return Err(model_protocol_error(
+                "probe follow-up response called another tool",
+            ));
+        }
+        AgentAction::Respond { .. } => {
+            return Err(model_protocol_error(
+                "probe follow-up response used respond instead of propose_completion",
+            ));
+        }
+        AgentAction::RequestClarification { .. } => {
+            return Err(model_protocol_error(
+                "probe follow-up response used request_clarification instead of propose_completion",
+            ));
+        }
+        _ => {
+            return Err(model_protocol_error(
+                "probe follow-up response was not the required propose_completion action",
+            ));
+        }
     }
 
     let capabilities = model.capabilities();
@@ -852,6 +874,33 @@ async fn probe_model_protocol(
         supports_multi_turn_tool_results: true,
         context_limit: Some(u64::from(capabilities.max_context_tokens)),
     })
+}
+
+fn doctor_decoy_tool() -> ToolSpec {
+    ToolSpec {
+        name: DOCTOR_DECOY_TOOL_NAME.to_owned(),
+        description: "A decoy protocol probe that must never be called".to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        output_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "ready": { "type": "boolean" } },
+            "required": ["ready"],
+            "additionalProperties": false
+        }),
+        risk: ToolRisk::Low,
+        side_effect: SideEffect::None,
+        idempotent: true,
+        timeout_ms: 1_000,
+        max_output_bytes: 128,
+        required_permissions: Vec::new(),
+        input_sensitivity: Sensitivity::Internal,
+        output_sensitivity: Sensitivity::Internal,
+        version: "1.0.0".to_owned(),
+    }
 }
 
 fn doctor_probe_tool() -> ToolSpec {
@@ -997,7 +1046,11 @@ impl RunScheduler for BackgroundScheduler {
                         publisher.notify(run_id, result.snapshot.version);
                     }
                 }
-                Err(error) => tracing::warn!(code = error.code(), "background run driver failed"),
+                Err(error) => tracing::warn!(
+                    code = error.code(),
+                    error = %error,
+                    "background run driver failed"
+                ),
             }
         });
         Ok(())
@@ -1416,29 +1469,34 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
     )?);
     let runtime_port: Arc<dyn RuntimeStore> = runtime_store.clone();
     let artifact_port: Arc<dyn ArtifactStore> = artifact_store.clone();
-    let (scheduler, readiness, background, model_protocol) = match assemble_scheduler(
-        &config,
-        workspace_id,
-        principal.clone(),
-        runtime_port.clone(),
-        artifact_port.clone(),
-    )
-    .await
-    {
-        Ok((background, readiness, model)) => {
-            let scheduler: Arc<dyn RunScheduler> = background.clone();
-            (
-                scheduler,
-                readiness,
-                Some(background),
-                Some(ModelProtocolProbe::new(model, config.llm_model.clone())),
-            )
-        }
-        Err(_) => {
-            let scheduler: Arc<dyn RunScheduler> = Arc::new(ys_agent_runtime::NoopRunScheduler);
-            (scheduler, safe_readiness_inputs(&config), None, None)
-        }
-    };
+    let (scheduler, readiness, background, model_protocol, conversation_model) =
+        match assemble_scheduler(
+            &config,
+            workspace_id,
+            principal.clone(),
+            runtime_port.clone(),
+            artifact_port.clone(),
+        )
+        .await
+        {
+            Ok((background, readiness, model)) => {
+                let scheduler: Arc<dyn RunScheduler> = background.clone();
+                (
+                    scheduler,
+                    readiness,
+                    Some(background),
+                    Some(ModelProtocolProbe::new(
+                        model.clone(),
+                        config.llm_model.clone(),
+                    )),
+                    Some(model),
+                )
+            }
+            Err(_) => {
+                let scheduler: Arc<dyn RunScheduler> = Arc::new(ys_agent_runtime::NoopRunScheduler);
+                (scheduler, safe_readiness_inputs(&config), None, None, None)
+            }
+        };
     let doctor = Arc::new(WorkspaceDoctor::new(Arc::new(RuntimeDoctorProbe {
         config: config.clone(),
         readiness,
@@ -1451,7 +1509,7 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
         Arc::new(DefaultExportPolicy),
         config.artifact_retention_days,
     ));
-    let service = Arc::new(InProcessAgentService::with_dependencies_and_retention(
+    let mut service = InProcessAgentService::with_dependencies_and_retention(
         workspace_id,
         runtime_port,
         artifact_port,
@@ -1459,7 +1517,11 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
         doctor,
         exporter,
         config.artifact_retention_days,
-    ));
+    );
+    if let Some(model) = conversation_model {
+        service = service.with_conversation_model(model, config.llm_model.clone());
+    }
+    let service = Arc::new(service);
     if let Some(background) = background {
         background.set_publisher(service.event_publisher());
     }
@@ -1582,7 +1644,10 @@ mod tests {
             2,
             "cached probe must not call the model again"
         );
+        assert_eq!(requests[0].tools.len(), 2);
         assert_eq!(requests[0].tools[0].name, "ysda_doctor_probe");
+        assert_eq!(requests[0].tools[1].name, "ysda_doctor_decoy");
+        assert_eq!(requests[1].tools.len(), 2);
         let tool_result = requests[1]
             .messages
             .iter()
@@ -1597,6 +1662,59 @@ mod tests {
             .expect("second request replays the assistant Tool Call");
         assert_eq!(assistant_call.provider_call_id, "call_probe_1");
         assert_eq!(assistant_call.name, "ysda_doctor_probe");
+    }
+
+    #[tokio::test]
+    async fn model_protocol_probe_fails_closed_when_the_second_turn_responds() {
+        let model = Arc::new(ScriptedDoctorModel::new(vec![
+            doctor_tool_call("ysda_doctor_probe", Some("call_probe_respond")),
+            ModelResponse {
+                action: AgentAction::Respond {
+                    message: "ready".to_owned(),
+                },
+                raw_content: None,
+                usage: None,
+            },
+        ]));
+        let probe = ModelProtocolProbe::new(model, "test-model".to_owned());
+
+        let readiness = probe.readiness().await;
+
+        assert!(!readiness.reachable);
+        assert!(!readiness.supports_tool_calls);
+    }
+
+    #[tokio::test]
+    async fn model_protocol_probe_fails_closed_when_the_second_turn_is_not_exact_completion() {
+        let model = Arc::new(ScriptedDoctorModel::new(vec![
+            doctor_tool_call("ysda_doctor_probe", Some("call_probe_wrong")),
+            ModelResponse {
+                action: AgentAction::ProposeCompletion {
+                    summary: "almost".to_owned(),
+                    primary_artifact_hint: None,
+                },
+                raw_content: None,
+                usage: None,
+            },
+        ]));
+        let probe = ModelProtocolProbe::new(model, "test-model".to_owned());
+
+        let readiness = probe.readiness().await;
+
+        assert!(!readiness.reachable);
+    }
+
+    #[tokio::test]
+    async fn model_protocol_probe_fails_closed_when_the_first_turn_calls_the_decoy() {
+        let model = Arc::new(ScriptedDoctorModel::new(vec![
+            doctor_tool_call("ysda_doctor_decoy", Some("call_decoy")),
+            doctor_completion(),
+        ]));
+        let probe = ModelProtocolProbe::new(model, "test-model".to_owned());
+
+        let readiness = probe.readiness().await;
+
+        assert!(!readiness.reachable);
     }
 
     #[tokio::test]
