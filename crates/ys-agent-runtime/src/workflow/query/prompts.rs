@@ -27,23 +27,36 @@ fn phase_instruction(phase: QueryPhase) -> &'static str {
             "PHASE: ClassifyIntent. Route Metadata versus a data request only; never infer a governed metric from question wording."
         }
         QueryPhase::ResolveContext => {
-            "PHASE: ResolveContext. Resolve data requests against the Active Metric Registry before proposing an AdHoc read. Ask for clarification rather than choosing between competing metric or dimension candidates."
+            "PHASE: ResolveContext. Resolve data requests against the Active Metric Registry before proposing an AdHoc read. Use the exact source_id from RUNTIME_QUERY_STATE_JSON when inspecting schema. Call at most one tool per turn; never emit parallel Tool Calls. Ask for clarification rather than choosing between competing metric or dimension candidates."
         }
-        QueryPhase::Plan => "PHASE: Plan. Propose one structured QueryPlan. No tools are visible.",
+        QueryPhase::Plan => concat!(
+            "PHASE: Plan. No tools are visible. Return one JSON object only, with no Markdown or prose.\n",
+            "Do not wrap the JSON in Markdown. Use the exact source_id and evidence IDs from RUNTIME_QUERY_STATE_JSON.\n",
+            "For a governed metric return exactly this shape: ",
+            r#"{"type":"propose_query_plan","plan":{"source_id":"<configured source ID>","execution":{"kind":"metric","metric_id":"<active metric ID>","start":"<RFC3339 UTC>","end":"<RFC3339 UTC>","dimensions":[]}}}"#,
+            "\nFor an ad-hoc read return exactly this shape: ",
+            r#"{"type":"propose_query_plan","plan":{"source_id":"<configured source ID>","execution":{"kind":"ad_hoc","sql":"SELECT ...","assumption_refs":["<ContextEvidence Artifact ID>"]}}}"#,
+            "\nNever invent an ID, hash, metric, relation, column, or time range. Request clarification if required values are absent."
+        ),
         QueryPhase::ValidateAndPreflight => {
-            "PHASE: ValidateAndPreflight. Call query_data with action preflight only."
+            "PHASE: ValidateAndPreflight. Call query_data with action preflight only. Copy plan_artifact_id and plan_hash exactly from RUNTIME_QUERY_STATE_JSON; never invent or alter either value."
         }
         QueryPhase::Execute => {
-            "PHASE: Execute. Call query_data with action execute and exact Artifact hashes only."
+            "PHASE: Execute. Call query_data with action execute. Copy plan_artifact_id, plan_hash, preflight_artifact_id, and preflight_hash exactly from RUNTIME_QUERY_STATE_JSON; never invent or alter them."
         }
         QueryPhase::Verify => {
-            "PHASE: Verify. Read freshness only when needed; do not self-certify correctness."
+            "PHASE: Verify. When read_freshness is visible, copy source_id, relation, and time_column from the Active Metric workflow evidence. Do not invent freshness inputs or self-certify correctness."
         }
         QueryPhase::Package => {
             "PHASE: Package. Summarize only verified evidence and preserve warning codes."
         }
         QueryPhase::ReadyToComplete => {
-            "PHASE: ReadyToComplete. Propose completion without adding unsupported claims."
+            concat!(
+                "PHASE: ReadyToComplete. Return one JSON object only, with no Markdown or prose. ",
+                "Use only the verified model preview and warnings from workflow evidence. ",
+                r#"Return exactly this shape: {"type":"propose_completion","summary":"<concise verified answer>","primary_artifact_hint":null}."#,
+                " Do not add unsupported claims."
+            )
         }
     }
 }
@@ -81,5 +94,31 @@ mod tests {
 
         assert!(prompt.contains("never infer a governed metric"));
         assert!(!prompt.contains("Choose GovernedMetric"));
+    }
+
+    #[test]
+    fn plan_phase_defines_the_exact_typed_action_contract() {
+        let prompt = query_system_instructions(QueryPhase::Plan);
+
+        assert!(prompt.contains("JSON object only"));
+        assert!(prompt.contains(r#""type":"propose_query_plan""#));
+        assert!(prompt.contains(r#""kind":"metric""#));
+        assert!(prompt.contains(r#""kind":"ad_hoc""#));
+        assert!(prompt.contains("Do not wrap the JSON in Markdown"));
+    }
+
+    #[test]
+    fn resolve_context_forbids_parallel_tool_calls() {
+        let prompt = query_system_instructions(QueryPhase::ResolveContext);
+        assert!(prompt.contains("Call at most one tool per turn"));
+        assert!(prompt.contains("never emit parallel Tool Calls"));
+    }
+
+    fn completion_phase_defines_the_exact_typed_action_contract() {
+        let prompt = query_system_instructions(QueryPhase::ReadyToComplete);
+
+        assert!(prompt.contains("JSON object only"));
+        assert!(prompt.contains(r#""type":"propose_completion""#));
+        assert!(prompt.contains(r#""primary_artifact_hint":null"#));
     }
 }

@@ -257,6 +257,184 @@ async fn never_accepts_a_tool_call_from_free_form_content() {
 }
 
 #[tokio::test]
+async fn invalid_typed_action_reports_the_safe_serde_reason() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"type\":\"unknown_action\"}"
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let error = provider_for(&server)
+        .complete(model_request_with_schema_tool())
+        .await
+        .expect_err("unknown action must fail");
+
+    assert_eq!(error.code(), "invalid_model_response");
+    assert!(error.to_string().contains("unknown variant"));
+}
+
+#[tokio::test]
+async fn accepts_one_markdown_fence_around_an_otherwise_valid_typed_action() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "```json\n{\"type\":\"request_clarification\",\"question\":\"Which range?\"}\n```"
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let response = provider_for(&server)
+        .complete(model_request_with_schema_tool())
+        .await
+        .expect("a single JSON fence is a transport wrapper");
+
+    assert!(matches!(
+        response.action,
+        AgentAction::RequestClarification { .. }
+    ));
+}
+
+#[tokio::test]
+async fn rejects_prose_around_a_fenced_typed_action() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Here is the result:\n```json\n{\"type\":\"request_clarification\",\"question\":\"Which range?\"}\n```"
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let error = provider_for(&server)
+        .complete(model_request_with_schema_tool())
+        .await
+        .expect_err("prose must not be searched for embedded JSON");
+
+    assert_eq!(error.code(), "invalid_model_response");
+}
+
+fn two_tools_request() -> ModelRequest {
+    let mut request = model_request_with_schema_tool();
+    let mut decoy = schema_tool();
+    decoy.name = "resolve_metric".to_owned();
+    request.tools.push(decoy);
+    request
+}
+
+fn parallel_tool_calls_body() -> serde_json::Value {
+    json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {
+                        "id": "call_one",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect_schema",
+                            "arguments": "{\"source_id\":\"secret-source\",\"sql\":\"SELECT * FROM customers\"}"
+                        }
+                    },
+                    {
+                        "id": "call_two",
+                        "type": "function",
+                        "function": {
+                            "name": "resolve_metric",
+                            "arguments": "{\"metric_id\":\"commerce.gmv\"}"
+                        }
+                    }
+                ]
+            }
+        }]
+    })
+}
+
+#[tokio::test]
+async fn retries_once_when_the_model_returns_parallel_tool_calls() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(parallel_tool_calls_body()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_retry",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect_schema",
+                            "arguments": "{\"source_id\":\"warehouse\"}"
+                        }
+                    }]
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let response = provider_for(&server)
+        .complete(two_tools_request())
+        .await
+        .expect("protocol correction should recover a single Tool Call");
+
+    assert!(matches!(
+        response.action,
+        AgentAction::CallTool { ref call } if call.name == "inspect_schema"
+    ));
+}
+
+#[tokio::test]
+async fn parallel_tool_calls_fail_closed_after_one_protocol_correction() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(parallel_tool_calls_body()))
+        .mount(&server)
+        .await;
+
+    let error = provider_for(&server)
+        .complete(two_tools_request())
+        .await
+        .expect_err("uncorrected parallel Tool Calls must fail");
+
+    assert_eq!(error.code(), "parallel_tool_calls_disabled");
+    let rendered = error.to_string();
+    assert!(rendered.contains("received 2"));
+    assert!(rendered.contains("inspect_schema"));
+    assert!(rendered.contains("resolve_metric"));
+    assert!(!rendered.contains("secret-source"));
+    assert!(!rendered.contains("customers"));
+    assert!(!rendered.contains("commerce.gmv"));
+}
+
+#[tokio::test]
 async fn reports_invalid_structured_arguments_without_echoing_them() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
