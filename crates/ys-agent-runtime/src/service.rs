@@ -530,25 +530,10 @@ impl InProcessAgentService {
 
     async fn commit_front_door_reply(
         &self,
-        command_id: CommandId,
         fingerprint: String,
-        session_id: SessionId,
-        task_id: Option<TaskId>,
-        result_kind: CommandResultKind,
-        message: Option<String>,
-        capability: Option<String>,
+        receipt: CommandReceipt,
     ) -> CoreResult<CommandReceipt> {
-        let receipt = CommandReceipt {
-            command_id,
-            command_fingerprint: fingerprint.clone(),
-            result_kind,
-            session_id: Some(session_id),
-            task_id,
-            run_id: None,
-            artifact_id: None,
-            message,
-            capability,
-        };
+        let command_id = receipt.command_id;
         self.store
             .commit_command(RuntimeCommandBatch {
                 command_id,
@@ -575,13 +560,18 @@ impl InProcessAgentService {
         message: String,
     ) -> CoreResult<ServiceReply> {
         self.commit_front_door_reply(
-            command_id,
-            fingerprint,
-            session_id,
-            task_id,
-            CommandResultKind::UnsupportedCapability,
-            Some(message.clone()),
-            Some(workflow.capability_name().to_owned()),
+            fingerprint.clone(),
+            CommandReceipt {
+                command_id,
+                command_fingerprint: fingerprint,
+                result_kind: CommandResultKind::UnsupportedCapability,
+                session_id: Some(session_id),
+                task_id,
+                run_id: None,
+                artifact_id: None,
+                message: Some(message.clone()),
+                capability: Some(workflow.capability_name().to_owned()),
+            },
         )
         .await?;
         Ok(ServiceReply::UnsupportedCapability {
@@ -792,13 +782,18 @@ impl AgentServiceApi for InProcessAgentService {
                 match self.classify_front_door(&input).await? {
                     FrontDoorDecision::Respond(message) => {
                         self.commit_front_door_reply(
-                            request.command_id,
-                            fingerprint,
-                            session.id,
-                            focused.as_ref().map(|task| task.id),
-                            CommandResultKind::ConversationResponded,
-                            Some(message.clone()),
-                            None,
+                            fingerprint.clone(),
+                            CommandReceipt {
+                                command_id: request.command_id,
+                                command_fingerprint: fingerprint,
+                                result_kind: CommandResultKind::ConversationResponded,
+                                session_id: Some(session.id),
+                                task_id: focused.as_ref().map(|task| task.id),
+                                run_id: None,
+                                artifact_id: None,
+                                message: Some(message.clone()),
+                                capability: None,
+                            },
                         )
                         .await?;
                         Ok(ServiceReply::Conversation { message })

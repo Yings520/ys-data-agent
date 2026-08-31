@@ -114,6 +114,7 @@ mod tests {
         assert!(prompt.contains("never emit parallel Tool Calls"));
     }
 
+    #[test]
     fn completion_phase_defines_the_exact_typed_action_contract() {
         let prompt = query_system_instructions(QueryPhase::ReadyToComplete);
 

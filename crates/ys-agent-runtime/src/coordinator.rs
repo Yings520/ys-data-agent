@@ -213,7 +213,7 @@ fn unsupported_workflow(input: &str) -> Option<FutureWorkflow> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FutureWorkflow, unsupported_workflow};
+    use super::unsupported_workflow;
 
     #[test]
     fn chat_is_not_classified_by_greeting_keywords() {
