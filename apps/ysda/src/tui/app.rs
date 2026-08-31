@@ -195,12 +195,23 @@ impl TuiApp {
     }
 
     pub fn sync_slash_palette(&mut self) {
+        if self
+            .transient
+            .is_some_and(|view| view != TransientView::SlashPalette)
+        {
+            return;
+        }
+
         let was_open = self.transient == Some(TransientView::SlashPalette);
         let command_has_argument = self
             .composer
             .text()
             .strip_prefix('/')
-            .is_some_and(|command| command.chars().any(char::is_whitespace));
+            .is_some_and(|command| {
+                command
+                    .split_once(char::is_whitespace)
+                    .is_some_and(|(token, _)| !token.is_empty())
+            });
         let visible = if command_has_argument {
             self.slash_palette.clear();
             false
