@@ -196,7 +196,17 @@ impl TuiApp {
 
     pub fn sync_slash_palette(&mut self) {
         let was_open = self.transient == Some(TransientView::SlashPalette);
-        let visible = self.slash_palette.update(self.composer.text());
+        let command_has_argument = self
+            .composer
+            .text()
+            .strip_prefix('/')
+            .is_some_and(|command| command.chars().any(char::is_whitespace));
+        let visible = if command_has_argument {
+            self.slash_palette.clear();
+            false
+        } else {
+            self.slash_palette.update(self.composer.text())
+        };
         if visible && !was_open {
             self.palette_draft = Some(String::new());
         } else if !visible {
