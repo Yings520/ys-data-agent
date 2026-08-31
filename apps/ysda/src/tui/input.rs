@@ -96,7 +96,7 @@ pub fn parse_input(raw: &str) -> Result<InputAction, InputError> {
         "/artifact" => parse_optional_artifact(words.collect()),
         "/export" => parse_export(words.collect()),
         _ => Err(InputError::new(format!(
-            "unknown command {command}; type /help"
+            "unknown command {command}; / starts commands, delete the leading / to send chat, or type /help"
         ))),
     }
 }
