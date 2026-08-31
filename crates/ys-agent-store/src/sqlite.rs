@@ -5,9 +5,9 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use ys_agent_core::{
-    ArtifactId, ArtifactMetadata, CommandId, CommandReceipt, CoreError, CoreResult, EventEnvelope,
-    EventId, PendingRunEvent, RunId, RunSnapshot, RuntimeCommandBatch, RuntimeStore, Session,
-    SessionId, Task, TaskId, VersionedRunEvent, WorkspaceId,
+    ArtifactId, ArtifactMetadata, CommandId, CommandReceipt, CoreError, CoreResult, EventActor,
+    EventEnvelope, EventId, PendingRunEvent, RunEventKind, RunId, RunSnapshot, RuntimeCommandBatch,
+    RuntimeStore, Session, SessionId, Task, TaskId, VersionedRunEvent, WorkspaceId,
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_runtime.sql");
@@ -239,6 +239,15 @@ fn event_type(event: &VersionedRunEvent) -> CoreResult<String> {
         })
 }
 
+fn projection_event(snapshot: &RunSnapshot) -> PendingRunEvent {
+    PendingRunEvent {
+        actor: EventActor::System,
+        kind: RunEventKind::RunStateProjected {
+            snapshot: Box::new(snapshot.clone()),
+        },
+    }
+}
+
 fn insert_events(
     transaction: &Transaction<'_>,
     run_id: &RunId,
@@ -353,7 +362,7 @@ fn append_in_transaction(
     run_id: &RunId,
     expected_version: u64,
     artifacts: Vec<ArtifactMetadata>,
-    events: Vec<PendingRunEvent>,
+    mut events: Vec<PendingRunEvent>,
     snapshot: &RunSnapshot,
 ) -> CoreResult<()> {
     if snapshot.run_id != *run_id || snapshot.version != expected_version + 1 {
@@ -378,6 +387,7 @@ fn append_in_transaction(
         }
         insert_artifact(transaction, artifact)?;
     }
+    events.push(projection_event(snapshot));
     insert_events(transaction, run_id, events)?;
     update_snapshot(transaction, expected_version, snapshot)
 }
@@ -448,7 +458,9 @@ fn commit_command_on_connection(
 
     match (&batch.new_run_snapshot, &batch.snapshot_update) {
         (Some(snapshot), None) => {
-            insert_events(&transaction, &snapshot.run_id, batch.pending_events)?;
+            let mut events = batch.pending_events;
+            events.push(projection_event(snapshot));
+            insert_events(&transaction, &snapshot.run_id, events)?;
         }
         (None, Some(snapshot)) => {
             let expected_version =
@@ -551,6 +563,27 @@ impl RuntimeStore for SqliteRuntimeStore {
         .await
     }
 
+    async fn list_runs_for_task(&self, task_id: &TaskId) -> CoreResult<Vec<RunSnapshot>> {
+        let task_id = *task_id;
+        self.with_connection(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT snapshot_json FROM runs
+                     WHERE task_id = ?1 ORDER BY created_at, run_id",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([task_id.to_string()], |row| row.get::<_, String>(0))
+                .map_err(storage_error)?;
+            let mut snapshots = Vec::new();
+            for row in rows {
+                snapshots.push(from_json(&row.map_err(storage_error)?)?);
+            }
+            Ok(snapshots)
+        })
+        .await
+    }
+
     async fn load_artifact(&self, artifact_id: &ArtifactId) -> CoreResult<ArtifactMetadata> {
         let artifact_id = *artifact_id;
         self.with_connection(move |connection| {
@@ -594,7 +627,7 @@ impl RuntimeStore for SqliteRuntimeStore {
         self.with_connection(move |connection| {
             let mut statement = connection
                 .prepare(
-                    "SELECT payload_json FROM run_events
+                    "SELECT sequence, payload_json FROM run_events
                         WHERE run_id = ?1 AND sequence > ?2 ORDER BY sequence",
                 )
                 .map_err(storage_error)?;
@@ -604,14 +637,58 @@ impl RuntimeStore for SqliteRuntimeStore {
                         run_id.to_string(),
                         i64::try_from(after_sequence).map_err(storage_error)?
                     ],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )
                 .map_err(storage_error)?;
             let mut events = Vec::new();
             for row in rows {
-                events.push(from_json(&row.map_err(storage_error)?)?);
+                let (stored_sequence, payload) = row.map_err(storage_error)?;
+                let stored_sequence = u64::try_from(stored_sequence).map_err(storage_error)?;
+                let event: EventEnvelope =
+                    from_json(&payload).map_err(|error| CoreError::CorruptRunHistory {
+                        run_id: run_id.to_string(),
+                        reason: format!("invalid Event envelope: {error}"),
+                    })?;
+                if event.sequence != stored_sequence {
+                    return Err(CoreError::CorruptRunHistory {
+                        run_id: run_id.to_string(),
+                        reason: format!(
+                            "run_events sequence {stored_sequence} disagrees with Event payload sequence {}",
+                            event.sequence
+                        ),
+                    });
+                }
+                events.push(event);
             }
             Ok(events)
+        })
+        .await
+    }
+
+    async fn replace_snapshot_cache(&self, snapshot: &RunSnapshot) -> CoreResult<()> {
+        let snapshot = snapshot.clone();
+        self.with_connection(move |connection| {
+            let changed = connection
+                .execute(
+                    "UPDATE runs
+                     SET status = ?1, version = ?2, snapshot_json = ?3, updated_at = ?4
+                     WHERE run_id = ?5",
+                    params![
+                        serialized_name(&snapshot.status)?,
+                        i64::try_from(snapshot.version).map_err(storage_error)?,
+                        to_json(&snapshot)?,
+                        Utc::now().to_rfc3339(),
+                        snapshot.run_id.to_string(),
+                    ],
+                )
+                .map_err(storage_error)?;
+            if changed != 1 {
+                return Err(CoreError::NotFound {
+                    entity: "run",
+                    id: snapshot.run_id.to_string(),
+                });
+            }
+            Ok(())
         })
         .await
     }

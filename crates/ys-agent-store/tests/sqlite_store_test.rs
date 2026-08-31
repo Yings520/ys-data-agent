@@ -108,7 +108,13 @@ async fn append_is_atomic_and_optimistically_versioned() {
         .load_events(&original.run_id, 0)
         .await
         .expect("load events");
-    assert_eq!(events.len(), 1, "failed append must add no event");
+    assert!(
+        events.len() >= 2,
+        "each successful mutation must append its state projection"
+    );
+    let last_kind = serde_json::to_value(&events.last().expect("projected event").event.kind)
+        .expect("serialize event kind");
+    assert_eq!(last_kind["type"], "run_state_projected");
 }
 
 #[tokio::test]
@@ -173,9 +179,17 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
 
     assert_eq!(loaded.status, RunStatus::WaitingForInput);
     assert_eq!(loaded.version, 2);
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 4);
     assert_eq!(events[0].sequence, 1);
-    assert_eq!(events[1].sequence, 2);
+    assert_eq!(events[3].sequence, 4);
+    assert!(matches!(
+        events[0].event.kind,
+        RunEventKind::RunStateProjected { .. }
+    ));
+    assert!(matches!(
+        events[3].event.kind,
+        RunEventKind::RunStateProjected { .. }
+    ));
 }
 
 #[tokio::test]

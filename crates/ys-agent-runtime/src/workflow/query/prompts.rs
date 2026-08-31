@@ -24,10 +24,10 @@ fn phase_instruction(phase: QueryPhase) -> &'static str {
             "PHASE: Clarify. Ask one concise question only when ambiguity changes meaning."
         }
         QueryPhase::ClassifyIntent => {
-            "PHASE: ClassifyIntent. Choose GovernedMetric, AdHocRead, or Metadata only."
+            "PHASE: ClassifyIntent. Route Metadata versus a data request only; never infer a governed metric from question wording."
         }
         QueryPhase::ResolveContext => {
-            "PHASE: ResolveContext. Use only the visible metric or schema tools."
+            "PHASE: ResolveContext. Resolve data requests against the Active Metric Registry before proposing an AdHoc read. Ask for clarification rather than choosing between competing metric or dimension candidates."
         }
         QueryPhase::Plan => "PHASE: Plan. Propose one structured QueryPlan. No tools are visible.",
         QueryPhase::ValidateAndPreflight => {
@@ -73,5 +73,13 @@ mod tests {
             assert!(prompt.contains("empty result is not numeric zero"));
             assert!(prompt.contains("Do not simulate Analysis"));
         }
+    }
+
+    #[test]
+    fn intent_classification_defers_governed_metric_to_context_resolution() {
+        let prompt = query_system_instructions(QueryPhase::ClassifyIntent);
+
+        assert!(prompt.contains("never infer a governed metric"));
+        assert!(!prompt.contains("Choose GovernedMetric"));
     }
 }

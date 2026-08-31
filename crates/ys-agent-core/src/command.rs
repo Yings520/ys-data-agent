@@ -8,6 +8,7 @@ pub enum CommandResultKind {
     SessionCreated,
     TaskCreated,
     RunStarted,
+    RunResumed,
     ClarificationAnswered,
     RunCancelled,
     NoopReplay,

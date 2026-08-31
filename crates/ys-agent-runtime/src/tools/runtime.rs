@@ -257,6 +257,7 @@ impl ToolRuntime {
                         },
                         kind: RunEventKind::ToolExecutionStarted {
                             call_id: context.execution.call_id,
+                            cost_class: context.expected_cost_class,
                         },
                     },
                 ],
@@ -382,6 +383,7 @@ impl ToolRuntime {
                 },
                 kind: RunEventKind::ToolExecutionStarted {
                     call_id: context.call_id,
+                    cost_class: context.expected_cost_class,
                 },
             })
             .await

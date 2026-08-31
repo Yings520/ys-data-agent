@@ -42,6 +42,24 @@ fn terminal_run_cannot_resume() {
 }
 
 #[test]
+fn first_persistable_running_snapshot_has_version_one() {
+    let mut run = Run::new(TaskId::new(), WorkflowKind::Query);
+
+    run.start().expect("queued to running");
+
+    assert_eq!(run.version, 1);
+}
+
+#[test]
+fn first_persistable_queued_snapshot_has_version_one() {
+    let run = Run::new(TaskId::new(), WorkflowKind::Query);
+
+    let snapshot = run.snapshot(serde_json::json!({}), None, None, None);
+
+    assert_eq!(snapshot.version, 1);
+}
+
+#[test]
 fn waiting_does_not_create_a_new_run() {
     let mut run = Run::new(TaskId::new(), WorkflowKind::Query);
 

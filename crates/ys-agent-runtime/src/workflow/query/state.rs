@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use ys_agent_core::{ArtifactRef, CoreError, CoreResult, PolicyDecision, QueryIntent};
+use ys_agent_core::{
+    ArtifactRef, CoreError, CoreResult, CostClass, PolicyDecision, QueryIntent, ToolCall,
+};
 
 use crate::tools::QueryPhase;
 
@@ -27,6 +29,11 @@ pub struct QueryWorkflowState {
     pub assumptions: Vec<String>,
     pub warnings: Vec<String>,
     pub pending_clarification: Option<ClarificationNeed>,
+    pub clarification_evidence: Vec<ArtifactRef>,
+    pub answered_clarification_ids: Vec<String>,
+    pub pending_recovery_call: Option<ToolCall>,
+    pub pending_recovery_cost_class: Option<CostClass>,
+    pub recovery_confirmation_granted: bool,
     pub last_tool_output: Option<Value>,
 }
 
@@ -54,6 +61,11 @@ impl QueryWorkflowState {
             assumptions: Vec::new(),
             warnings: Vec::new(),
             pending_clarification: None,
+            clarification_evidence: Vec::new(),
+            answered_clarification_ids: Vec::new(),
+            pending_recovery_call: None,
+            pending_recovery_cost_class: None,
+            recovery_confirmation_granted: false,
             last_tool_output: None,
         })
     }
@@ -184,13 +196,6 @@ pub fn material_ambiguity(question: &str) -> Option<ClarificationNeed> {
             reason: "material_query_ambiguity".to_owned(),
         });
     }
-    if lower.contains("gmv") && lower.contains("by region") && lower.contains("or market") {
-        return Some(ClarificationNeed {
-            id: "query-dimension-v1".to_owned(),
-            question: "Should the governed dimension be region or market?".to_owned(),
-            reason: "material_query_ambiguity".to_owned(),
-        });
-    }
     None
 }
 
@@ -201,11 +206,6 @@ pub fn classify_intent(question: &str) -> QueryIntent {
         .any(|phrase| lower.contains(phrase))
     {
         QueryIntent::Metadata
-    } else if ["gmv", "revenue", "orders", "conversion rate"]
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-    {
-        QueryIntent::GovernedMetric
     } else {
         QueryIntent::AdHocRead
     }
@@ -216,4 +216,22 @@ pub fn requires_current_freshness(question: &str) -> bool {
     ["current", "latest", "right now", "sla"]
         .iter()
         .any(|phrase| lower.contains(phrase))
+}
+
+#[cfg(test)]
+mod tests {
+    use ys_agent_core::QueryIntent;
+
+    use super::classify_intent;
+
+    #[test]
+    fn data_requests_remain_provisional_until_the_registry_resolves_them() {
+        for question in [
+            "GMV by channel for last month",
+            "Show revenue for the current quarter",
+            "How many orders were placed yesterday?",
+        ] {
+            assert_eq!(classify_intent(question), QueryIntent::AdHocRead);
+        }
+    }
 }
