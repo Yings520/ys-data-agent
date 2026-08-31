@@ -529,6 +529,7 @@ fn acquire_workspace_id_lock(path: &Path) -> CoreResult<fs::File> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .mode(0o600)
         .open(path)
         .map_err(storage_error("open workspace ID lock"))?;
@@ -543,6 +544,7 @@ fn acquire_workspace_id_lock(path: &Path) -> CoreResult<fs::File> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(path)
         .map_err(storage_error("open workspace ID lock"))?;
     file.lock().map_err(storage_error("lock workspace ID"))?;
