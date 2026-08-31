@@ -1,10 +1,5 @@
-//! A safe, observable Data Query Agent runtime seed.
+//! YSDA application composition, command-line interface, and terminal user interface.
 
-pub mod domain;
-pub mod error;
-pub mod llm;
-
-pub mod agent;
+pub mod bootstrap;
 pub mod cli;
-pub mod output;
-pub mod trace;
+pub mod tui;

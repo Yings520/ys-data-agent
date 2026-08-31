@@ -53,6 +53,13 @@ impl CredentialReference {
         }
         Ok(Self(value))
     }
+
+    /// Returns the name of the environment variable identified by this reference.
+    pub fn environment_variable_name(&self) -> &str {
+        self.0
+            .strip_prefix("env:")
+            .expect("CredentialReference only permits env references")
+    }
 }
 
 // Database abilities → schema seen → cost check → query request → query result

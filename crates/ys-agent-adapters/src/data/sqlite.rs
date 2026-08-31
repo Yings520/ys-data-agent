@@ -7,8 +7,9 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, params_from_iter, types::Value as SqliteValue};
 use ys_agent_core::{
     CapabilityDescriptor, CatalogReader, CellValue, CoreError, CoreResult, FreshnessObservation,
-    FreshnessReader, ObservedColumn, ObservedRelation, ObservedSchema, QueryParameter,
-    QueryRequest, QueryResult, SchemaKnowledgeKind, SourceId, SqlQueryExecutor,
+    FreshnessReader, ObservedColumn, ObservedRelation, ObservedSchema, QueryCostEstimate,
+    QueryParameter, QueryPreflight, QueryPreflightDecision, QueryPreflightReader, QueryRequest,
+    QueryResult, SchemaKnowledgeKind, SourceId, SqlQueryExecutor,
 };
 
 use super::result_policy::{
@@ -295,6 +296,34 @@ fn read_sqlite_freshness(
         data_as_of,
         lag_seconds,
     })
+}
+
+#[async_trait]
+impl QueryPreflightReader for SqliteConnector {
+    async fn preflight(&self, request: &QueryRequest) -> CoreResult<QueryPreflight> {
+        validate_request_source(&self.config.source_id, request)?;
+        let policy = self.sql_policy.evaluate(&request.sql, &request.scope);
+        Ok(QueryPreflight {
+            sql: request.sql.clone(),
+            decision: match policy.disposition {
+                super::sql_policy::SqlPolicyDisposition::Allowed => QueryPreflightDecision::Allowed,
+                super::sql_policy::SqlPolicyDisposition::Rejected => {
+                    QueryPreflightDecision::Rejected
+                }
+            },
+            cost: QueryCostEstimate {
+                estimated_cost_units: None,
+                scanned_bytes: None,
+                estimator_version: None,
+            },
+            reason_codes: policy
+                .reasons
+                .into_iter()
+                .map(|reason| reason.code)
+                .collect(),
+            warnings: Vec::new(),
+        })
+    }
 }
 
 #[async_trait]
