@@ -20,10 +20,32 @@ impl FutureWorkflow {
             Self::MlDataPrep => "ML Data Prep",
         }
     }
+
+    pub fn from_capability(capability: &str) -> Option<Self> {
+        match capability.trim().to_ascii_lowercase().as_str() {
+            "analysis" => Some(Self::Analysis),
+            "build_change" | "build/change" | "build-change" => Some(Self::BuildChange),
+            "operate" => Some(Self::Operate),
+            "ml_data_prep" | "ml-data-prep" | "ml" => Some(Self::MlDataPrep),
+            _ => None,
+        }
+    }
+
+    pub fn capability_name(self) -> &'static str {
+        match self {
+            Self::Analysis => "analysis",
+            Self::BuildChange => "build_change",
+            Self::Operate => "operate",
+            Self::MlDataPrep => "ml_data_prep",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinationDecision {
+    FrontDoor {
+        input: String,
+    },
     ContinueCurrentTask {
         task_id: TaskId,
     },
@@ -99,26 +121,52 @@ impl Coordinator for RuleBasedCoordinator {
             });
         }
 
-        let Some(task) = focused_task else {
-            return Ok(CoordinationDecision::CreateNewTask {
-                goal: input.to_owned(),
-            });
-        };
-
-        if is_ambiguous_follow_up(&lower) {
-            return Ok(CoordinationDecision::RequestClarification {
-                question: "What should change in the current query?".to_owned(),
-            });
+        if let Some(task) = focused_task {
+            if is_ambiguous_follow_up(&lower) {
+                return Ok(CoordinationDecision::RequestClarification {
+                    question: "What should change in the current query?".to_owned(),
+                });
+            }
+            if is_active(task.status) && is_short_contextual_follow_up(&lower) {
+                return Ok(CoordinationDecision::ContinueCurrentTask { task_id: task.id });
+            }
         }
 
-        if is_active(task.status) && is_short_contextual_follow_up(&lower) {
-            return Ok(CoordinationDecision::ContinueCurrentTask { task_id: task.id });
-        }
-
-        Ok(CoordinationDecision::CreateNewTask {
-            goal: input.to_owned(),
+        Ok(CoordinationDecision::FrontDoor {
+            input: input.to_owned(),
         })
     }
+}
+
+fn is_active(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Waiting
+    )
+}
+
+fn is_ambiguous_follow_up(input: &str) -> bool {
+    matches!(input, "change it" | "do the other one" | "something else")
+}
+
+fn is_short_contextual_follow_up(input: &str) -> bool {
+    if input.split_whitespace().count() > 12 {
+        return false;
+    }
+
+    let markers = [
+        "same ",
+        "instead",
+        "what about",
+        "break it down",
+        " by ",
+        "only ",
+        "include ",
+        "exclude ",
+        "also ",
+        "those ",
+    ];
+    markers.iter().any(|marker| input.contains(marker))
 }
 
 fn unsupported_workflow(input: &str) -> Option<FutureWorkflow> {
@@ -163,33 +211,14 @@ fn unsupported_workflow(input: &str) -> Option<FutureWorkflow> {
         .then_some(FutureWorkflow::Analysis)
 }
 
-fn is_active(status: TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Waiting
-    )
-}
+#[cfg(test)]
+mod tests {
+    use super::{FutureWorkflow, unsupported_workflow};
 
-fn is_ambiguous_follow_up(input: &str) -> bool {
-    matches!(input, "change it" | "do the other one" | "something else")
-}
-
-fn is_short_contextual_follow_up(input: &str) -> bool {
-    if input.split_whitespace().count() > 12 {
-        return false;
+    #[test]
+    fn chat_is_not_classified_by_greeting_keywords() {
+        assert_eq!(unsupported_workflow("你好，介绍一下你自己"), None);
+        assert_eq!(unsupported_workflow("hello there, who are you?"), None);
+        assert_eq!(unsupported_workflow("你今天怎么样"), None);
     }
-
-    let markers = [
-        "same ",
-        "instead",
-        "what about",
-        "break it down",
-        " by ",
-        "only ",
-        "include ",
-        "exclude ",
-        "also ",
-        "those ",
-    ];
-    markers.iter().any(|marker| input.contains(marker))
 }

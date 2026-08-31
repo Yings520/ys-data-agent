@@ -75,6 +75,27 @@ fn answer_is_full_width_concise_and_uses_ys_da_role() {
 }
 
 #[test]
+fn chat_reply_renders_as_a_ys_da_answer_without_starting_a_query_view() {
+    let mut app = TuiApp::test_home("ecommerce", "fixture", "read-only", "fixture-model");
+    app.transcript.push(ysda::tui::TranscriptItem::UserMessage(
+        "你好，介绍一下你自己".to_owned(),
+    ));
+    app.transcript
+        .push(ysda::tui::TranscriptItem::Answer(ysda::tui::AnswerView {
+            state: "Chat".to_owned(),
+            conclusion: "I am Ys-da. I answer chat without starting a Query Run.".to_owned(),
+            key_values: [None, None],
+            explanation: None,
+        }));
+    let rendered = render_to_string(&app, 100, 28);
+
+    assert!(rendered.contains("Ys-da"));
+    assert!(rendered.contains("Chat"));
+    assert!(rendered.contains("I am Ys-da. I answer chat without starting a Query Run."));
+    assert!(!rendered.contains("Query scheduled"));
+}
+
+#[test]
 fn slash_palette_replaces_composer_and_keeps_one_input_surface() {
     let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
     app.composer.set_text("/");

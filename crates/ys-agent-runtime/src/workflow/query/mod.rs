@@ -102,6 +102,12 @@ impl QueryWorkflow {
         action: &AgentAction,
     ) -> CoreResult<WorkflowEffect> {
         match action {
+            AgentAction::Respond { .. }
+            | AgentAction::StartQuery
+            | AgentAction::UnsupportedCapability { .. } => Err(CoreError::validation(
+                "conversation_response_in_query_workflow",
+                "a front-door action cannot enter the Query workflow",
+            )),
             AgentAction::CallTool { call } => {
                 let allowed = match state.phase {
                     QueryPhase::ResolveContext => {

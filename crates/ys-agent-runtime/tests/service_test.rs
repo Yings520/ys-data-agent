@@ -1,11 +1,14 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use ys_agent_core::{
-    CommandId, CoreError, CoreResult, EventActor, PendingRunEvent, Principal, RunEventKind, RunId,
-    RunStatus, RuntimeStore, StepId, TaskStatus, WorkspaceId,
+    AgentAction, CommandId, CoreError, CoreResult, EventActor, ModelResponse, PendingRunEvent,
+    Principal, RunEventKind, RunId, RunStatus, RuntimeStore, StepId, TaskStatus, WorkspaceId,
 };
 use ys_agent_runtime::{
     AgentServiceApi, CoordinationDecision, Coordinator, CreateTaskRequest, InProcessAgentService,
@@ -47,6 +50,14 @@ struct ServiceFixture {
 
 impl ServiceFixture {
     async fn new() -> Self {
+        Self::build(None).await
+    }
+
+    async fn with_conversation_model(model: Arc<dyn ys_agent_core::ModelProvider>) -> Self {
+        Self::build(Some(model)).await
+    }
+
+    async fn build(model: Option<Arc<dyn ys_agent_core::ModelProvider>>) -> Self {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = Arc::new(
             SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -57,13 +68,17 @@ impl ServiceFixture {
             Arc::new(LocalArtifactStore::new(directory.path()).expect("local artifact store"));
         let scheduler = Arc::new(CountingScheduler::default());
         let workspace_id = WorkspaceId::new();
-        let service = Arc::new(InProcessAgentService::with_event_capacity(
+        let mut service = InProcessAgentService::with_event_capacity(
             workspace_id,
             store.clone(),
             artifacts,
             scheduler.clone(),
             2,
-        ));
+        );
+        if let Some(model) = model {
+            service = service.with_conversation_model(model, "test-model");
+        }
+        let service = Arc::new(service);
         let principal = Principal::local_operator("Data Engineer");
         let session = service
             .create_session(CommandId::new(), principal.clone())
@@ -91,6 +106,150 @@ impl ServiceFixture {
     async fn created_run_count(&self) -> u64 {
         self.store.run_count().await.expect("count runs")
     }
+}
+
+fn front_door_model(
+    calls: Arc<AtomicUsize>,
+    action: AgentAction,
+) -> Arc<ys_agent_adapters::model::FakeModelProvider> {
+    Arc::new(ys_agent_adapters::model::FakeModelProvider::new({
+        move |request| {
+            let calls = calls.clone();
+            let action = action.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert!(request.tools.is_empty());
+                assert!(request.messages.iter().any(|message| {
+                    message.content.contains("front-door agent")
+                        && message.content.contains(r#""type":"respond""#)
+                        && message.content.contains(r#""type":"start_query""#)
+                        && message
+                            .content
+                            .contains(r#""type":"unsupported_capability""#)
+                }));
+                Ok(ModelResponse {
+                    action,
+                    raw_content: None,
+                    usage: None,
+                })
+            }
+        }
+    }))
+}
+
+#[tokio::test]
+async fn greeting_calls_the_model_once_without_starting_a_query_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = front_door_model(
+        calls.clone(),
+        AgentAction::Respond {
+            message: "你好！我可以帮你查询已配置的数据源。".to_owned(),
+        },
+    );
+    let fixture = ServiceFixture::with_conversation_model(model).await;
+    let command_id = CommandId::new();
+    let request = SendMessageRequest::new(command_id, fixture.session_id(), "你好，介绍一下你自己");
+
+    let first = fixture
+        .service
+        .send_message(request.clone())
+        .await
+        .expect("first greeting");
+    let replay = fixture
+        .service
+        .send_message(request)
+        .await
+        .expect("idempotent greeting replay");
+
+    assert!(matches!(
+        first,
+        ServiceReply::Conversation { ref message }
+            if message == "你好！我可以帮你查询已配置的数据源。"
+    ));
+    assert_eq!(first, replay);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.created_run_count().await, 0);
+}
+
+#[tokio::test]
+async fn non_keyword_chat_is_classified_as_respond_without_a_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = front_door_model(
+        calls.clone(),
+        AgentAction::Respond {
+            message: "我是 Ys-da，可以回答已配置数据源上的事实问题。".to_owned(),
+        },
+    );
+    let fixture = ServiceFixture::with_conversation_model(model).await;
+
+    let reply = fixture
+        .service
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            fixture.session_id(),
+            "你今天怎么样，能聊聊吗？",
+        ))
+        .await
+        .expect("chat reply");
+
+    assert!(matches!(reply, ServiceReply::Conversation { .. }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.created_run_count().await, 0);
+}
+
+#[tokio::test]
+async fn data_request_start_query_creates_exactly_one_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = front_door_model(calls.clone(), AgentAction::StartQuery);
+    let fixture = ServiceFixture::with_conversation_model(model).await;
+    let command_id = CommandId::new();
+    let request = SendMessageRequest::new(
+        command_id,
+        fixture.session_id(),
+        "GMV from 2026-08-12 through 2026-08-15 UTC",
+    );
+
+    let first = fixture
+        .service
+        .send_message(request.clone())
+        .await
+        .expect("start query");
+    let replay = fixture
+        .service
+        .send_message(request)
+        .await
+        .expect("replay start query");
+
+    assert_eq!(first.run_id(), replay.run_id());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.created_run_count().await, 1);
+}
+
+#[tokio::test]
+async fn front_door_unsupported_capability_creates_no_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = front_door_model(
+        calls.clone(),
+        AgentAction::UnsupportedCapability {
+            capability: "analysis".to_owned(),
+            message: "Forecasting is not executable in v0.2; no Run was created.".to_owned(),
+        },
+    );
+    let fixture = ServiceFixture::with_conversation_model(model).await;
+
+    let reply = fixture
+        .service
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            fixture.session_id(),
+            "Forecast next quarter GMV",
+        ))
+        .await
+        .expect("unsupported reply");
+
+    assert!(matches!(reply, ServiceReply::UnsupportedCapability { .. }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.created_run_count().await, 0);
 }
 
 #[tokio::test]
@@ -155,10 +314,7 @@ async fn unrelated_input_creates_a_new_task() {
         .await
         .expect("route");
 
-    assert!(matches!(
-        decision,
-        CoordinationDecision::CreateNewTask { .. }
-    ));
+    assert!(matches!(decision, CoordinationDecision::FrontDoor { .. }));
 }
 
 #[tokio::test]

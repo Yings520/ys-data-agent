@@ -12,6 +12,8 @@ pub enum CommandResultKind {
     ClarificationAnswered,
     RunCancelled,
     ArtifactExported,
+    ConversationResponded,
+    UnsupportedCapability,
     NoopReplay,
 }
 
@@ -26,6 +28,10 @@ pub struct CommandReceipt {
     pub run_id: Option<RunId>,
     #[serde(default)]
     pub artifact_id: Option<ArtifactId>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub capability: Option<String>,
 }
 
 #[cfg(test)]
@@ -48,5 +54,7 @@ mod tests {
 
         assert_eq!(receipt.result_kind, CommandResultKind::RunResumed);
         assert_eq!(receipt.artifact_id, None);
+        assert_eq!(receipt.message, None);
+        assert_eq!(receipt.capability, None);
     }
 }

@@ -188,6 +188,12 @@ impl EvalFixture {
             .await
             .expect("send deterministic Eval question");
         match reply {
+            ServiceReply::Conversation { message } => {
+                panic!(
+                    "Eval case {} unexpectedly routed to Chat: {message}",
+                    case.id
+                )
+            }
             ServiceReply::UnsupportedCapability {
                 workflow, message, ..
             } => EvalObservation {

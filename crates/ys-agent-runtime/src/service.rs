@@ -8,10 +8,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use ys_agent_core::{
     ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, ArtifactKind, ArtifactMetadata,
-    ArtifactRef, ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CoreError,
-    CoreResult, EventActor, EventEnvelope, ExportFormat, PendingRunEvent, Principal, PutArtifact,
-    RetentionPolicy, Run, RunEventKind, RunId, RunSnapshot, RunStatus, RuntimeCommandBatch,
-    RuntimeStore, Sensitivity, Session, SessionId, Task, TaskId, WorkflowKind, WorkspaceId,
+    ArtifactRef, ArtifactStore, CommandId, CommandReceipt, CommandResultKind, ContextManifest,
+    CoreError, CoreResult, EventActor, EventEnvelope, ExportFormat, ModelMessage, ModelProvider,
+    ModelRequest, ModelRole, PendingRunEvent, Principal, PutArtifact, RetentionPolicy, Run,
+    RunEventKind, RunId, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, Sensitivity,
+    Session, SessionId, Task, TaskId, WorkflowKind, WorkspaceId,
 };
 
 use crate::{
@@ -53,6 +54,9 @@ impl SendMessageRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceReply {
+    Conversation {
+        message: String,
+    },
     RunScheduled {
         task_id: TaskId,
         run_id: RunId,
@@ -75,7 +79,7 @@ impl ServiceReply {
             Self::RunScheduled { run_id, .. } | Self::ClarificationRequired { run_id, .. } => {
                 Some(*run_id)
             }
-            Self::UnsupportedCapability { .. } => None,
+            Self::Conversation { .. } | Self::UnsupportedCapability { .. } => None,
         }
     }
 }
@@ -262,6 +266,33 @@ pub struct InProcessAgentService {
     coordinator: RuleBasedCoordinator,
     event_sender: broadcast::Sender<ServiceEvent>,
     artifact_retention_days: u32,
+    front_door: Option<FrontDoorAgent>,
+}
+
+#[derive(Clone)]
+struct FrontDoorAgent {
+    provider: Arc<dyn ModelProvider>,
+    model_name: String,
+}
+
+const FRONT_DOOR_SYSTEM_PROMPT: &str = concat!(
+    "You are Ys-da, the v0.2 front-door agent for a trustworthy query product. ",
+    "Return one JSON object only, with no Markdown or prose. Do not call tools. ",
+    "Classify the user message as exactly one of these actions:\n",
+    r#"Chat, greetings, introductions, or questions about you rather than data: {"type":"respond","message":"<concise reply in the user's language>"}. "#,
+    r#"A factual Query against configured data (governed metric, ad-hoc read, or metadata): {"type":"start_query"}. "#,
+    r#"Work v0.2 cannot execute (analysis/root-cause, build/change, operate/deploy, ML data prep): {"type":"unsupported_capability","capability":"<analysis|build_change|operate|ml_data_prep>","message":"<safe refusal>"}. "#,
+    "Never start a Query Run for chat. Never claim that data was queried in a respond message. ",
+    "capability must be one of analysis, build_change, operate, ml_data_prep."
+);
+
+enum FrontDoorDecision {
+    Respond(String),
+    StartQuery,
+    Unsupported {
+        workflow: FutureWorkflow,
+        message: String,
+    },
 }
 
 struct ServiceOptions {
@@ -371,7 +402,193 @@ impl InProcessAgentService {
             coordinator: RuleBasedCoordinator,
             event_sender,
             artifact_retention_days: options.artifact_retention_days,
+            front_door: None,
         }
+    }
+
+    pub fn with_front_door_agent(
+        mut self,
+        provider: Arc<dyn ModelProvider>,
+        model_name: impl Into<String>,
+    ) -> Self {
+        self.front_door = Some(FrontDoorAgent {
+            provider,
+            model_name: model_name.into(),
+        });
+        self
+    }
+
+    pub fn with_conversation_model(
+        self,
+        provider: Arc<dyn ModelProvider>,
+        model_name: impl Into<String>,
+    ) -> Self {
+        self.with_front_door_agent(provider, model_name)
+    }
+
+    async fn classify_front_door(&self, input: &str) -> CoreResult<FrontDoorDecision> {
+        let Some(front_door) = self.front_door.as_ref() else {
+            return Ok(FrontDoorDecision::StartQuery);
+        };
+        let response = front_door
+            .provider
+            .complete(ModelRequest {
+                model: front_door.model_name.clone(),
+                messages: vec![
+                    ModelMessage {
+                        role: ModelRole::System,
+                        content: FRONT_DOOR_SYSTEM_PROMPT.to_owned(),
+                        tool_call_id: None,
+                        name: None,
+                        assistant_tool_call: None,
+                    },
+                    ModelMessage {
+                        role: ModelRole::User,
+                        content: input.to_owned(),
+                        tool_call_id: None,
+                        name: None,
+                        assistant_tool_call: None,
+                    },
+                ],
+                tools: Vec::new(),
+                context_manifest: ContextManifest::empty(1_024),
+                temperature: Some(0.0),
+            })
+            .await?;
+        match response.action {
+            ys_agent_core::AgentAction::Respond { message } => {
+                let message = message.trim();
+                if message.is_empty() || message.len() > 4_096 {
+                    return Err(CoreError::validation(
+                        "invalid_front_door_response",
+                        "the conversational response must contain 1 to 4096 bytes",
+                    ));
+                }
+                Ok(FrontDoorDecision::Respond(message.to_owned()))
+            }
+            ys_agent_core::AgentAction::StartQuery => Ok(FrontDoorDecision::StartQuery),
+            ys_agent_core::AgentAction::UnsupportedCapability {
+                capability,
+                message,
+            } => {
+                let workflow = FutureWorkflow::from_capability(&capability).ok_or_else(|| {
+                    CoreError::validation(
+                        "invalid_front_door_response",
+                        "unsupported_capability.capability is not a known v0.2 exclusion",
+                    )
+                })?;
+                let message = message.trim();
+                if message.is_empty() || message.len() > 4_096 {
+                    return Err(CoreError::validation(
+                        "invalid_front_door_response",
+                        "the unsupported response must contain 1 to 4096 bytes",
+                    ));
+                }
+                Ok(FrontDoorDecision::Unsupported {
+                    workflow,
+                    message: message.to_owned(),
+                })
+            }
+            _ => Err(CoreError::validation(
+                "invalid_front_door_response",
+                "the front-door agent must return respond, start_query, or unsupported_capability",
+            )),
+        }
+    }
+
+    async fn start_query_run(
+        &self,
+        command_id: CommandId,
+        fingerprint: String,
+        session: &Session,
+        goal: String,
+        text: &str,
+    ) -> CoreResult<ServiceReply> {
+        let mut task = Task::new(session.workspace_id, session.principal_id, goal);
+        task.start()?;
+        let snapshot = running_snapshot(task.id, text)?;
+        let proposed_run_id = snapshot.run_id;
+        let stored = self
+            .commit_run(
+                command_id,
+                fingerprint,
+                Some(task),
+                snapshot,
+                vec![system_event(RunEventKind::RunStarted)],
+            )
+            .await?;
+        let run_id = required_run_id(&stored)?;
+        if run_id == proposed_run_id {
+            self.scheduler.schedule(run_id).await?;
+            self.event_publisher().notify(run_id, 1);
+        }
+        Ok(ServiceReply::RunScheduled {
+            task_id: required_task_id(&stored)?,
+            run_id,
+        })
+    }
+
+    async fn commit_front_door_reply(
+        &self,
+        command_id: CommandId,
+        fingerprint: String,
+        session_id: SessionId,
+        task_id: Option<TaskId>,
+        result_kind: CommandResultKind,
+        message: Option<String>,
+        capability: Option<String>,
+    ) -> CoreResult<CommandReceipt> {
+        let receipt = CommandReceipt {
+            command_id,
+            command_fingerprint: fingerprint.clone(),
+            result_kind,
+            session_id: Some(session_id),
+            task_id,
+            run_id: None,
+            artifact_id: None,
+            message,
+            capability,
+        };
+        self.store
+            .commit_command(RuntimeCommandBatch {
+                command_id,
+                command_fingerprint: fingerprint,
+                receipt: receipt.clone(),
+                new_session: None,
+                new_task: None,
+                new_run_snapshot: None,
+                new_artifact: None,
+                pending_events: vec![],
+                snapshot_update: None,
+            })
+            .await?;
+        Ok(receipt)
+    }
+
+    async fn commit_unsupported(
+        &self,
+        command_id: CommandId,
+        fingerprint: String,
+        session_id: SessionId,
+        task_id: Option<TaskId>,
+        workflow: FutureWorkflow,
+        message: String,
+    ) -> CoreResult<ServiceReply> {
+        self.commit_front_door_reply(
+            command_id,
+            fingerprint,
+            session_id,
+            task_id,
+            CommandResultKind::UnsupportedCapability,
+            Some(message.clone()),
+            Some(workflow.capability_name().to_owned()),
+        )
+        .await?;
+        Ok(ServiceReply::UnsupportedCapability {
+            workflow,
+            message,
+            safe_evidence_refs: Vec::new(),
+        })
     }
 
     pub fn event_publisher(&self) -> ServiceEventPublisher {
@@ -423,6 +640,8 @@ impl InProcessAgentService {
             task_id: Some(snapshot.task_id),
             run_id: Some(snapshot.run_id),
             artifact_id: None,
+            message: None,
+            capability: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -470,6 +689,8 @@ impl AgentServiceApi for InProcessAgentService {
             task_id: None,
             run_id: None,
             artifact_id: None,
+            message: None,
+            capability: None,
         };
 
         let stored = self
@@ -519,6 +740,8 @@ impl AgentServiceApi for InProcessAgentService {
             task_id: Some(task.id),
             run_id: None,
             artifact_id: None,
+            message: None,
+            capability: None,
         };
         let stored = self
             .store
@@ -555,39 +778,63 @@ impl AgentServiceApi for InProcessAgentService {
         let focused = self
             .load_focused_task(&session, request.focused_task_id)
             .await?;
+        if let Some(receipt) = replayed_receipt {
+            return reply_from_receipt(&receipt);
+        }
+
         let decision = self
             .coordinator
             .route(&session, focused.as_ref(), &request.text)
             .await?;
 
-        if let Some(receipt) = replayed_receipt {
-            return reply_from_receipt(decision, &receipt);
-        }
-
         match decision {
-            CoordinationDecision::CreateNewTask { goal } => {
-                let mut task = Task::new(session.workspace_id, session.principal_id, goal);
-                task.start()?;
-                let snapshot = running_snapshot(task.id, &request.text)?;
-                let proposed_run_id = snapshot.run_id;
-                let stored = self
-                    .commit_run(
-                        request.command_id,
-                        fingerprint,
-                        Some(task),
-                        snapshot,
-                        vec![system_event(RunEventKind::RunStarted)],
-                    )
-                    .await?;
-                let run_id = required_run_id(&stored)?;
-                if run_id == proposed_run_id {
-                    self.scheduler.schedule(run_id).await?;
-                    self.event_publisher().notify(run_id, 1);
+            CoordinationDecision::FrontDoor { input } => {
+                match self.classify_front_door(&input).await? {
+                    FrontDoorDecision::Respond(message) => {
+                        self.commit_front_door_reply(
+                            request.command_id,
+                            fingerprint,
+                            session.id,
+                            focused.as_ref().map(|task| task.id),
+                            CommandResultKind::ConversationResponded,
+                            Some(message.clone()),
+                            None,
+                        )
+                        .await?;
+                        Ok(ServiceReply::Conversation { message })
+                    }
+                    FrontDoorDecision::StartQuery => {
+                        self.start_query_run(
+                            request.command_id,
+                            fingerprint,
+                            &session,
+                            input,
+                            &request.text,
+                        )
+                        .await
+                    }
+                    FrontDoorDecision::Unsupported { workflow, message } => {
+                        self.commit_unsupported(
+                            request.command_id,
+                            fingerprint,
+                            session.id,
+                            focused.as_ref().map(|task| task.id),
+                            workflow,
+                            message,
+                        )
+                        .await
+                    }
                 }
-                Ok(ServiceReply::RunScheduled {
-                    task_id: required_task_id(&stored)?,
-                    run_id,
-                })
+            }
+            CoordinationDecision::CreateNewTask { goal } => {
+                self.start_query_run(
+                    request.command_id,
+                    fingerprint,
+                    &session,
+                    goal,
+                    &request.text,
+                )
+                .await
             }
 
             CoordinationDecision::ContinueCurrentTask { task_id } => {
@@ -648,37 +895,17 @@ impl AgentServiceApi for InProcessAgentService {
             }
 
             CoordinationDecision::UnsupportedCapability {
-                workflow,
-                message,
-                safe_evidence_refs,
+                workflow, message, ..
             } => {
-                let receipt = CommandReceipt {
-                    command_id: request.command_id,
-                    command_fingerprint: fingerprint.clone(),
-                    result_kind: CommandResultKind::NoopReplay,
-                    session_id: Some(session.id),
-                    task_id: focused.as_ref().map(|task| task.id),
-                    run_id: None,
-                    artifact_id: None,
-                };
-                self.store
-                    .commit_command(RuntimeCommandBatch {
-                        command_id: request.command_id,
-                        command_fingerprint: fingerprint,
-                        receipt,
-                        new_session: None,
-                        new_task: None,
-                        new_run_snapshot: None,
-                        new_artifact: None,
-                        pending_events: vec![],
-                        snapshot_update: None,
-                    })
-                    .await?;
-                Ok(ServiceReply::UnsupportedCapability {
+                self.commit_unsupported(
+                    request.command_id,
+                    fingerprint,
+                    session.id,
+                    focused.as_ref().map(|task| task.id),
                     workflow,
                     message,
-                    safe_evidence_refs,
-                })
+                )
+                .await
             }
         }
     }
@@ -736,6 +963,8 @@ impl AgentServiceApi for InProcessAgentService {
                 task_id: Some(*task_id),
                 run_id: Some(retry.run_id),
                 artifact_id: None,
+                message: None,
+                capability: None,
             };
             self.store
                 .commit_command(RuntimeCommandBatch {
@@ -773,6 +1002,8 @@ impl AgentServiceApi for InProcessAgentService {
             task_id: Some(*task_id),
             run_id: Some(applied.snapshot.run_id),
             artifact_id: None,
+            message: None,
+            capability: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -933,6 +1164,8 @@ impl AgentServiceApi for InProcessAgentService {
             task_id: Some(task.id),
             run_id: Some(*run_id),
             artifact_id: None,
+            message: None,
+            capability: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -996,6 +1229,8 @@ impl AgentServiceApi for InProcessAgentService {
             task_id: Some(current.task_id),
             run_id: Some(*run_id),
             artifact_id: None,
+            message: None,
+            capability: None,
         };
         self.store
             .commit_command(RuntimeCommandBatch {
@@ -1140,32 +1375,42 @@ fn system_event(kind: RunEventKind) -> PendingRunEvent {
     }
 }
 
-fn reply_from_receipt(
-    decision: CoordinationDecision,
-    receipt: &CommandReceipt,
-) -> CoreResult<ServiceReply> {
-    match decision {
-        CoordinationDecision::CreateNewTask { .. }
-        | CoordinationDecision::ContinueCurrentTask { .. } => Ok(ServiceReply::RunScheduled {
-            task_id: required_task_id(receipt)?,
-            run_id: required_run_id(receipt)?,
+fn reply_from_receipt(receipt: &CommandReceipt) -> CoreResult<ServiceReply> {
+    match receipt.result_kind {
+        CommandResultKind::ConversationResponded => Ok(ServiceReply::Conversation {
+            message: receipt
+                .message
+                .clone()
+                .ok_or_else(|| malformed_receipt("message"))?,
         }),
-        CoordinationDecision::RequestClarification { question } => {
-            Ok(ServiceReply::ClarificationRequired {
+        CommandResultKind::RunStarted | CommandResultKind::TaskCreated => {
+            Ok(ServiceReply::RunScheduled {
                 task_id: required_task_id(receipt)?,
                 run_id: required_run_id(receipt)?,
-                question,
             })
         }
-        CoordinationDecision::UnsupportedCapability {
-            workflow,
-            message,
-            safe_evidence_refs,
-        } => Ok(ServiceReply::UnsupportedCapability {
-            workflow,
-            message,
-            safe_evidence_refs,
-        }),
+        CommandResultKind::UnsupportedCapability | CommandResultKind::NoopReplay => {
+            let workflow = receipt
+                .capability
+                .as_deref()
+                .and_then(FutureWorkflow::from_capability)
+                .unwrap_or(FutureWorkflow::Analysis);
+            Ok(ServiceReply::UnsupportedCapability {
+                workflow,
+                message: receipt.message.clone().unwrap_or_else(|| {
+                    format!(
+                        "{} is not executable in v0.2; no Run was created.",
+                        workflow.display_name()
+                    )
+                }),
+                safe_evidence_refs: Vec::new(),
+            })
+        }
+        CommandResultKind::ClarificationAnswered
+        | CommandResultKind::RunResumed
+        | CommandResultKind::RunCancelled
+        | CommandResultKind::ArtifactExported
+        | CommandResultKind::SessionCreated => Err(malformed_receipt("result_kind")),
     }
 }
 
