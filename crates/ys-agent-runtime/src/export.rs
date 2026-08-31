@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ys_agent_core::{
@@ -226,6 +227,7 @@ pub struct ArtifactExporter {
     artifact_store: Arc<dyn ArtifactStore>,
     writer: Arc<dyn ExportWriter>,
     policy: Arc<dyn ExportPolicy>,
+    retention_days: u32,
 }
 
 impl ArtifactExporter {
@@ -235,11 +237,22 @@ impl ArtifactExporter {
         writer: Arc<dyn ExportWriter>,
         policy: Arc<dyn ExportPolicy>,
     ) -> Self {
+        Self::with_retention_days(runtime_store, artifact_store, writer, policy, 7)
+    }
+
+    pub fn with_retention_days(
+        runtime_store: Arc<dyn RuntimeStore>,
+        artifact_store: Arc<dyn ArtifactStore>,
+        writer: Arc<dyn ExportWriter>,
+        policy: Arc<dyn ExportPolicy>,
+        retention_days: u32,
+    ) -> Self {
         Self {
             runtime_store,
             artifact_store,
             writer,
             policy,
+            retention_days,
         }
     }
 
@@ -314,7 +327,7 @@ impl ArtifactExportService for ArtifactExporter {
             format_export(format, &query_bytes, result_bytes.as_deref())?;
         let written = self.writer.write(*artifact_id, extension, &output).await?;
 
-        let metadata = ArtifactMetadata::builder(source.sensitivity)
+        let mut metadata = ArtifactMetadata::builder(source.sensitivity)
             .workspace_id(source.workspace_id)
             .task_id(source.task_id)
             .run_id(source.run_id)
@@ -324,8 +337,12 @@ impl ArtifactExportService for ArtifactExporter {
             .size_bytes(written.size_bytes)
             .storage_uri(written.storage_uri)
             .owner(access.principal_id)
-            .retention_policy(RetentionPolicy::Days { days: 7 })
+            .retention_policy(RetentionPolicy::Days {
+                days: self.retention_days,
+            })
             .build()?;
+        metadata.expires_at =
+            Some(metadata.created_at + TimeDelta::days(i64::from(self.retention_days)));
         let receipt = CommandReceipt {
             command_id,
             command_fingerprint: fingerprint.clone(),

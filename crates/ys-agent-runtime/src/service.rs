@@ -22,6 +22,7 @@ use crate::{
 
 const DEFAULT_EVENT_CAPACITY: usize = 64;
 const ARTIFACT_PREVIEW_LIMIT: usize = 4_096;
+const DEFAULT_ARTIFACT_RETENTION_DAYS: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateTaskRequest {
@@ -260,6 +261,12 @@ pub struct InProcessAgentService {
     exporter: Arc<dyn ArtifactExportService>,
     coordinator: RuleBasedCoordinator,
     event_sender: broadcast::Sender<ServiceEvent>,
+    artifact_retention_days: u32,
+}
+
+struct ServiceOptions {
+    event_capacity: usize,
+    artifact_retention_days: u32,
 }
 
 impl InProcessAgentService {
@@ -292,7 +299,10 @@ impl InProcessAgentService {
             scheduler,
             Arc::new(UnconfiguredDoctor),
             Arc::new(UnconfiguredExporter),
-            event_capacity,
+            ServiceOptions {
+                event_capacity,
+                artifact_retention_days: DEFAULT_ARTIFACT_RETENTION_DAYS,
+            },
         )
     }
 
@@ -311,7 +321,33 @@ impl InProcessAgentService {
             scheduler,
             doctor,
             exporter,
-            DEFAULT_EVENT_CAPACITY,
+            ServiceOptions {
+                event_capacity: DEFAULT_EVENT_CAPACITY,
+                artifact_retention_days: DEFAULT_ARTIFACT_RETENTION_DAYS,
+            },
+        )
+    }
+
+    pub fn with_dependencies_and_retention(
+        workspace_id: WorkspaceId,
+        store: Arc<dyn RuntimeStore>,
+        artifacts: Arc<dyn ArtifactStore>,
+        scheduler: Arc<dyn RunScheduler>,
+        doctor: Arc<dyn DoctorRunner>,
+        exporter: Arc<dyn ArtifactExportService>,
+        artifact_retention_days: u32,
+    ) -> Self {
+        Self::with_event_capacity_and_dependencies(
+            workspace_id,
+            store,
+            artifacts,
+            scheduler,
+            doctor,
+            exporter,
+            ServiceOptions {
+                event_capacity: DEFAULT_EVENT_CAPACITY,
+                artifact_retention_days,
+            },
         )
     }
 
@@ -322,9 +358,9 @@ impl InProcessAgentService {
         scheduler: Arc<dyn RunScheduler>,
         doctor: Arc<dyn DoctorRunner>,
         exporter: Arc<dyn ArtifactExportService>,
-        event_capacity: usize,
+        options: ServiceOptions,
     ) -> Self {
-        let (event_sender, _) = broadcast::channel(event_capacity.max(1));
+        let (event_sender, _) = broadcast::channel(options.event_capacity.max(1));
         Self {
             workspace_id,
             store,
@@ -334,6 +370,7 @@ impl InProcessAgentService {
             exporter,
             coordinator: RuleBasedCoordinator,
             event_sender,
+            artifact_retention_days: options.artifact_retention_days,
         }
     }
 
@@ -844,7 +881,8 @@ impl AgentServiceApi for InProcessAgentService {
         ensure_workspace(self.workspace_id, task.workspace_id)?;
         let restricted =
             pending.get("answer_sensitivity").and_then(Value::as_str) == Some("restricted");
-        let expires_at = restricted.then(|| Utc::now() + TimeDelta::days(7));
+        let (retention_policy, expires_at) =
+            clarification_retention(restricted, self.artifact_retention_days, Utc::now());
         let metadata = self
             .artifacts
             .put(PutArtifact {
@@ -860,11 +898,7 @@ impl AgentServiceApi for InProcessAgentService {
                     Sensitivity::Internal
                 },
                 owner: restricted.then_some(task.created_by),
-                retention_policy: Some(if restricted {
-                    RetentionPolicy::Days { days: 7 }
-                } else {
-                    RetentionPolicy::Session
-                }),
+                retention_policy,
                 expires_at,
                 producer_step_id: None,
             })
@@ -1166,6 +1200,23 @@ fn ensure_workspace(expected: WorkspaceId, actual: WorkspaceId) -> CoreResult<()
     }
 }
 
+fn clarification_retention(
+    restricted: bool,
+    artifact_retention_days: u32,
+    now: chrono::DateTime<Utc>,
+) -> (Option<RetentionPolicy>, Option<chrono::DateTime<Utc>>) {
+    if restricted {
+        (
+            Some(RetentionPolicy::Days {
+                days: artifact_retention_days,
+            }),
+            Some(now + TimeDelta::days(i64::from(artifact_retention_days))),
+        )
+    } else {
+        (Some(RetentionPolicy::Session), None)
+    }
+}
+
 pub(crate) fn command_fingerprint(operation: &str, payload: Value) -> CoreResult<String> {
     let canonical = canonicalize(json!({
         "operation": operation,
@@ -1197,5 +1248,23 @@ fn canonicalize(value: Value) -> Value {
             Value::Object(sorted)
         }
         scalar => scalar,
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use chrono::{TimeDelta, Utc};
+    use ys_agent_core::RetentionPolicy;
+
+    use super::clarification_retention;
+
+    #[test]
+    fn restricted_clarification_uses_the_configured_retention_days() {
+        let now = Utc::now();
+
+        let (policy, expires_at) = clarification_retention(true, 19, now);
+
+        assert_eq!(policy, Some(RetentionPolicy::Days { days: 19 }));
+        assert_eq!(expires_at, Some(now + TimeDelta::days(19)));
     }
 }
