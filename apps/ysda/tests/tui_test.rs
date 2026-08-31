@@ -106,6 +106,27 @@ fn slash_palette_closes_after_a_command_argument_without_changing_the_composer()
 }
 
 #[test]
+fn slash_prefix_with_only_whitespace_keeps_the_palette_open() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    app.composer.set_text("/ ");
+    app.sync_slash_palette();
+
+    assert_eq!(app.transient, Some(TransientView::SlashPalette));
+    assert_eq!(app.composer.text(), "/ ");
+}
+
+#[test]
+fn slash_argument_does_not_replace_an_open_theme_picker() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    app.transient = Some(TransientView::ThemePicker);
+    app.composer.set_text("/resume task");
+    app.sync_slash_palette();
+
+    assert_eq!(app.transient, Some(TransientView::ThemePicker));
+    assert_eq!(app.composer.text(), "/resume task");
+}
+
+#[test]
 fn supported_terminal_sizes_render_without_panicking() {
     let app = TuiApp::for_principal(Principal::local_operator("ysc"));
     for (width, height) in [(60, 12), (80, 20), (100, 28), (150, 40)] {
