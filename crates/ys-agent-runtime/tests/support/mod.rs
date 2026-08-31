@@ -272,6 +272,7 @@ pub struct QueryWorkflowFixture {
     transport_retries: std::sync::atomic::AtomicUsize,
     cached_primary: std::sync::Mutex<Option<ys_agent_runtime::QueryArtifact>>,
     telemetry: Arc<TelemetryDispatcher>,
+    model_requests: Arc<Mutex<Vec<ys_agent_core::ModelRequest>>>,
 }
 
 impl QueryWorkflowFixture {
@@ -310,15 +311,19 @@ impl QueryWorkflowFixture {
         .expect("create test session");
         let scripted_actions = Arc::new(Mutex::new(VecDeque::from(actions)));
         let current_run_id = Arc::new(Mutex::new(None));
+        let model_requests = Arc::new(Mutex::new(Vec::new()));
         let model = Arc::new(ys_agent_adapters::model::FakeModelProvider::new({
             let scripted_actions = scripted_actions.clone();
             let current_run_id = current_run_id.clone();
             let runtime = runtime.clone();
-            move |_request| {
+            let model_requests = model_requests.clone();
+            move |request| {
                 let scripted_actions = scripted_actions.clone();
                 let current_run_id = current_run_id.clone();
                 let runtime = runtime.clone();
+                let model_requests = model_requests.clone();
                 async move {
+                    model_requests.lock().await.push(request);
                     let scripted = scripted_actions.lock().await.pop_front().ok_or_else(|| {
                         ys_agent_core::CoreError::validation(
                             "model_script_exhausted",
@@ -367,6 +372,7 @@ impl QueryWorkflowFixture {
             transport_retries: std::sync::atomic::AtomicUsize::new(0),
             cached_primary: std::sync::Mutex::new(None),
             telemetry,
+            model_requests,
         }
     }
 }
@@ -798,6 +804,10 @@ impl QueryWorkflowFixture {
 
     pub fn telemetry_failure_count(&self) -> u64 {
         self.telemetry.failure_count()
+    }
+
+    pub async fn model_requests(&self) -> Vec<ys_agent_core::ModelRequest> {
+        self.model_requests.lock().await.clone()
     }
 
     pub async fn has_run_completed_event(&self, run_id: &ys_agent_core::RunId) -> bool {

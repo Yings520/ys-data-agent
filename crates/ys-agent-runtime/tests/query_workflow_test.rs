@@ -12,6 +12,43 @@ use ys_agent_runtime::telemetry::{
     TelemetryDispatcher, TelemetryError, TelemetryEvent, TelemetrySink,
 };
 
+fn request_for_phase<'a>(
+    requests: &'a [ys_agent_core::ModelRequest],
+    phase: &str,
+) -> &'a ys_agent_core::ModelRequest {
+    requests
+        .iter()
+        .find(|request| {
+            request.messages.iter().any(|message| {
+                message.role == ys_agent_core::ModelRole::System
+                    && message.content.contains(&format!("PHASE: {phase}."))
+            })
+        })
+        .unwrap_or_else(|| panic!("missing model request for phase {phase}"))
+}
+
+fn runtime_state(request: &ys_agent_core::ModelRequest) -> serde_json::Value {
+    let content = request
+        .messages
+        .iter()
+        .find_map(|message| message.content.strip_prefix("RUNTIME_QUERY_STATE_JSON:\n"))
+        .expect("runtime-owned query state message");
+    serde_json::from_str(content).expect("runtime query state JSON")
+}
+
+fn workflow_evidence(request: &ys_agent_core::ModelRequest) -> Vec<serde_json::Value> {
+    request
+        .messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .content
+                .strip_prefix("UNTRUSTED_WORKFLOW_EVIDENCE_JSON:\n")
+        })
+        .map(|content| serde_json::from_str(content).expect("workflow evidence JSON"))
+        .collect()
+}
+
 #[derive(Debug)]
 struct AlwaysFailTelemetrySink;
 
@@ -54,6 +91,74 @@ async fn query_completion_requires_execution_verification_and_artifact() {
     assert!(artifact.executed_sql.is_some());
     assert!(artifact.verification.hard_failures.is_empty());
     assert!(artifact.freshness.is_some());
+}
+
+#[tokio::test]
+async fn each_live_model_phase_receives_the_runtime_identities_it_must_reuse() {
+    let fixture = QueryWorkflowFixture::successful_metric_query().await;
+    let result = fixture
+        .run("GMV for the last seven complete days")
+        .await
+        .expect("query run");
+    assert_eq!(result.status, RunStatus::Succeeded);
+
+    let requests = fixture.model_requests().await;
+    let plan = runtime_state(request_for_phase(&requests, "Plan"));
+    assert_eq!(plan["source_id"], "sqlite-demo");
+    assert_eq!(plan["intent"], "governed_metric");
+    assert!(plan["artifacts"]["metric_evidence"]["artifact_id"].is_string());
+    assert!(plan["artifacts"]["metric_evidence"]["content_hash"].is_string());
+    assert!(
+        workflow_evidence(request_for_phase(&requests, "Plan"))
+            .iter()
+            .any(|evidence| evidence["content"]["id"] == "commerce.gmv")
+    );
+
+    let preflight = runtime_state(request_for_phase(&requests, "ValidateAndPreflight"));
+    assert!(preflight["artifacts"]["execution_plan"]["artifact_id"].is_string());
+    assert!(preflight["artifacts"]["execution_plan"]["content_hash"].is_string());
+
+    let execute = runtime_state(request_for_phase(&requests, "Execute"));
+    assert_eq!(
+        execute["artifacts"]["execution_plan"],
+        preflight["artifacts"]["execution_plan"]
+    );
+    assert!(execute["artifacts"]["preflight"]["artifact_id"].is_string());
+    assert!(execute["artifacts"]["preflight"]["content_hash"].is_string());
+
+    let verify = runtime_state(request_for_phase(&requests, "Verify"));
+    assert!(verify["artifacts"]["query_result"]["artifact_id"].is_string());
+    assert!(
+        workflow_evidence(request_for_phase(&requests, "Verify"))
+            .iter()
+            .any(|evidence| evidence["content"]["time_column"] == "paid_at")
+    );
+
+    let complete = runtime_state(request_for_phase(&requests, "ReadyToComplete"));
+    assert!(complete["artifacts"]["verification_report"]["artifact_id"].is_string());
+    let completion_evidence = workflow_evidence(request_for_phase(&requests, "ReadyToComplete"));
+    assert!(completion_evidence.iter().any(|evidence| {
+        evidence["content"]["model_preview"]
+            .as_str()
+            .is_some_and(|preview| !preview.is_empty())
+    }));
+    assert!(
+        completion_evidence
+            .iter()
+            .any(|evidence| evidence["content"]["hard_failures"].is_array())
+    );
+    assert!(
+        completion_evidence
+            .iter()
+            .all(|evidence| evidence["content"].get("rows").is_none()),
+        "raw result rows must not enter the model context"
+    );
+    let verify_evidence = workflow_evidence(request_for_phase(&requests, "Verify"));
+    assert!(verify_evidence.iter().any(|evidence| {
+        evidence["content"].get("time_column").is_some()
+            || evidence["content"].get("latest_data_at").is_some()
+            || evidence["content"].get("relation").is_some()
+    }));
 }
 
 #[tokio::test]
