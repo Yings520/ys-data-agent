@@ -585,16 +585,14 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(error)
-                    if error.code() == "parallel_tool_calls_disabled"
-                        && protocol_corrections < MAX_PROTOCOL_CORRECTIONS =>
-                {
+                Err(error) if protocol_corrections < MAX_PROTOCOL_CORRECTIONS => {
+                    let Some(content) = protocol_correction_message(&error) else {
+                        return Err(error);
+                    };
                     protocol_corrections += 1;
                     body.messages.push(ApiRequestMessage {
                         role: "user",
-                        content: Some(format!(
-                            "PROTOCOL CORRECTION: {error} Return at most one Tool Call. Do not include previous tool arguments."
-                        )),
+                        content: Some(content),
                         tool_call_id: None,
                         name: None,
                         tool_calls: None,
@@ -603,6 +601,19 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+fn protocol_correction_message(error: &CoreError) -> Option<String> {
+    match error.code() {
+        "invalid_model_response" => Some(
+            "PROTOCOL CORRECTION: Return exactly one valid typed AgentAction JSON object with all required fields, no Markdown or prose. For clarification use {\"type\":\"request_clarification\",\"question\":\"<one concise question>\"}."
+                .to_owned(),
+        ),
+        "parallel_tool_calls_disabled" => Some(format!(
+            "PROTOCOL CORRECTION: {error} Return at most one Tool Call. Do not include previous tool arguments."
+        )),
+        _ => None,
     }
 }
 
