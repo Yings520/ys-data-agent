@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tokio::task::JoinHandle;
+
 use ys_agent_core::{
     ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, CommandId, EventEnvelope,
     ExportFormat, Principal, RunEventKind, RunId, RunStatus, Sensitivity, SessionId, StepId,
@@ -279,6 +281,15 @@ pub struct TuiController {
     focused_run_id: Option<RunId>,
     subscription: Option<EventSubscription>,
     pending_command_id: Option<CommandId>,
+    pending_submission: Option<JoinHandle<ys_agent_core::CoreResult<SubmissionCompletion>>>,
+}
+
+pub(super) enum SubmissionCompletion {
+    Message {
+        session_id: SessionId,
+        reply: ServiceReply,
+    },
+    ClarificationAnswered,
 }
 
 impl TuiController {
@@ -296,6 +307,51 @@ impl TuiController {
             focused_run_id: None,
             subscription: None,
             pending_command_id: None,
+            pending_submission: None,
+        }
+    }
+
+    pub fn submission_in_flight(&self) -> bool {
+        self.pending_submission.is_some()
+    }
+
+    pub(super) async fn take_ready_submission(
+        &mut self,
+    ) -> Option<ys_agent_core::CoreResult<SubmissionCompletion>> {
+        if !self
+            .pending_submission
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            return None;
+        }
+        let handle = self
+            .pending_submission
+            .take()
+            .expect("finished submission exists");
+        Some(handle.await.unwrap_or_else(|error| {
+            Err(ys_agent_core::CoreError::Storage {
+                message: format!("TUI submission task failed: {error}"),
+            })
+        }))
+    }
+
+    pub(super) fn complete_submission(
+        &mut self,
+        app: &mut TuiApp,
+        completion: SubmissionCompletion,
+    ) {
+        match completion {
+            SubmissionCompletion::Message { session_id, reply } => {
+                self.session_id = Some(session_id);
+                app.diagnostics.session_id = Some(session_id);
+                self.apply_message_reply(app, reply);
+            }
+            SubmissionCompletion::ClarificationAnswered => {
+                app.set_runtime_status("Clarification accepted; resuming the same Run");
+                app.close_transient();
+                app.base_view = BaseView::Home;
+            }
         }
     }
 
@@ -408,23 +464,9 @@ impl TuiController {
             } => self.export(app, artifact_id, format).await?,
             InputAction::SendMessage(text) => {
                 if app.base_view == BaseView::Clarification {
-                    let run_id = self.focused_run_id.ok_or_else(|| {
-                        ys_agent_core::CoreError::validation(
-                            "missing_waiting_run",
-                            "clarification mode has no focused Run",
-                        )
-                    })?;
-                    let command_id = self.begin_command();
-                    self.service
-                        .answer_clarification(command_id, &run_id, text.clone())
-                        .await?;
-                    self.finish_command();
-                    app.push_transcript(TranscriptItem::UserMessage(text));
-                    app.set_runtime_status("Clarification accepted; resuming the same Run");
-                    app.close_transient();
-                    app.base_view = BaseView::Home;
+                    self.start_clarification_submission(app, text)?;
                 } else {
-                    self.send(app, text).await?;
+                    self.start_message_submission(app, text)?;
                 }
             }
         }
@@ -550,7 +592,11 @@ impl TuiController {
         Ok(())
     }
 
-    async fn send(&mut self, app: &mut TuiApp, text: String) -> ys_agent_core::CoreResult<()> {
+    fn start_message_submission(
+        &mut self,
+        app: &mut TuiApp,
+        text: String,
+    ) -> ys_agent_core::CoreResult<()> {
         if !app.query_submission_enabled() {
             app.transient = Some(TransientView::Repair);
             app.push_transcript(TranscriptItem::Warning(
@@ -558,20 +604,72 @@ impl TuiController {
             ));
             return Ok(());
         }
-        let session_id = self.ensure_session().await?;
-        app.diagnostics.session_id = Some(session_id);
+        if self.submission_in_flight() {
+            return Err(ys_agent_core::CoreError::validation(
+                "submission_in_progress",
+                "Wait for the current request to finish",
+            ));
+        }
         app.push_transcript(TranscriptItem::UserMessage(text.clone()));
-        let command_id = self.begin_command();
-        let reply = self
-            .service
-            .send_message(SendMessageRequest {
-                command_id,
-                session_id,
-                focused_task_id: self.focused_task_id,
-                text,
-            })
-            .await?;
-        self.finish_command();
+        app.set_runtime_status("Thinking…");
+
+        let service = self.service.clone();
+        let principal = self.principal.clone();
+        let existing_session_id = self.session_id;
+        let focused_task_id = self.focused_task_id;
+        self.pending_submission = Some(tokio::spawn(async move {
+            let session_id = match existing_session_id {
+                Some(session_id) => session_id,
+                None => {
+                    service
+                        .create_session(CommandId::new(), principal)
+                        .await?
+                        .id
+                }
+            };
+            let reply = service
+                .send_message(SendMessageRequest {
+                    command_id: CommandId::new(),
+                    session_id,
+                    focused_task_id,
+                    text,
+                })
+                .await?;
+            Ok(SubmissionCompletion::Message { session_id, reply })
+        }));
+        Ok(())
+    }
+
+    fn start_clarification_submission(
+        &mut self,
+        app: &mut TuiApp,
+        text: String,
+    ) -> ys_agent_core::CoreResult<()> {
+        if self.submission_in_flight() {
+            return Err(ys_agent_core::CoreError::validation(
+                "submission_in_progress",
+                "Wait for the current request to finish",
+            ));
+        }
+        let run_id = self.focused_run_id.ok_or_else(|| {
+            ys_agent_core::CoreError::validation(
+                "missing_waiting_run",
+                "clarification mode has no focused Run",
+            )
+        })?;
+        app.push_transcript(TranscriptItem::UserMessage(text.clone()));
+        app.set_runtime_status("Submitting clarification…");
+        let service = self.service.clone();
+        self.pending_submission = Some(tokio::spawn(async move {
+            service
+                .answer_clarification(CommandId::new(), &run_id, text)
+                .await?;
+            Ok(SubmissionCompletion::ClarificationAnswered)
+        }));
+        Ok(())
+    }
+
+    fn apply_message_reply(&mut self, app: &mut TuiApp, reply: ServiceReply) {
         match reply {
             ServiceReply::Conversation { message } => {
                 app.push_transcript(TranscriptItem::Answer(AnswerView {
@@ -601,7 +699,6 @@ impl TuiController {
                 "Unsupported {workflow:?}: {message}"
             ))),
         }
-        Ok(())
     }
 
     fn focus_run(&mut self, app: &mut TuiApp, task_id: TaskId, run_id: RunId) {
@@ -925,6 +1022,14 @@ impl TuiController {
             values[index] = Some(concise_line(&format!("{column}: {rendered}"), 80));
         }
         values
+    }
+}
+
+impl Drop for TuiController {
+    fn drop(&mut self) {
+        if let Some(handle) = self.pending_submission.take() {
+            handle.abort();
+        }
     }
 }
 

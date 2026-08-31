@@ -159,6 +159,16 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
             app.safe_warning = Some(error.code().to_owned());
             dirty = true;
         }
+        if let Some(completion) = controller.take_ready_submission().await {
+            match completion {
+                Ok(completion) => controller.complete_submission(&mut app, completion),
+                Err(error) => {
+                    app.runtime_status = None;
+                    app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
+                }
+            }
+            dirty = true;
+        }
         if app.should_quit {
             return Ok(());
         }
@@ -362,14 +372,24 @@ fn preview_theme(app: &mut TuiApp) -> CoreResult<()> {
 }
 
 async fn submit_composer(app: &mut TuiApp, controller: &mut TuiController) -> CoreResult<()> {
-    let raw = app.composer.submit();
+    let raw = app.composer.text();
     match parse_input(&raw) {
         Ok(action) => {
+            if controller.submission_in_flight() && action != super::InputAction::Quit {
+                app.push_transcript(TranscriptItem::Warning(
+                    "A request is already in progress; your draft was kept".to_owned(),
+                ));
+                return Ok(());
+            }
+            app.composer.submit();
             if let Err(error) = controller.apply(app, action).await {
                 app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
             }
         }
-        Err(error) => app.push_transcript(TranscriptItem::Warning(error.to_string())),
+        Err(error) => {
+            app.composer.submit();
+            app.push_transcript(TranscriptItem::Warning(error.to_string()));
+        }
     }
     Ok(())
 }
@@ -402,7 +422,24 @@ mod tests {
     };
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
-    use super::{TuiApp, TuiController, handle_terminal_event};
+    use crate::tui::render_to_string;
+
+    use super::{TuiApp, TuiController, handle_terminal_event, user_readable_error};
+
+    async fn take_submission(
+        controller: &mut TuiController,
+    ) -> ys_agent_core::CoreResult<super::super::app::SubmissionCompletion> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(completion) = controller.take_ready_submission().await {
+                    return completion;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("submission completion")
+    }
 
     #[tokio::test]
     async fn tui_submission_acknowledges_before_model_returns() {
@@ -413,8 +450,7 @@ mod tests {
                 .expect("runtime store"),
         );
         let artifacts = Arc::new(
-            LocalArtifactStore::new(directory.path().join("artifacts"))
-                .expect("artifact store"),
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
         );
         let release_model = Arc::new(Semaphore::new(0));
         let model = Arc::new(FakeModelProvider::new({
@@ -435,13 +471,8 @@ mod tests {
         }));
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
-            InProcessAgentService::new(
-                workspace_id,
-                store,
-                artifacts,
-                Arc::new(NoopRunScheduler),
-            )
-            .with_conversation_model(model, "delayed-test-model"),
+            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_conversation_model(model, "delayed-test-model"),
         );
         let principal = Principal::local_operator("test-operator");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());
@@ -472,7 +503,109 @@ mod tests {
             Some(super::TranscriptItem::UserMessage(text)) if text == "你好"
         ));
         assert_eq!(app.runtime_status.as_deref(), Some("Thinking…"));
+        let acknowledged = render_to_string(&app, 80, 20);
+        assert!(acknowledged.contains("You"));
+        assert!(acknowledged.contains("Thinking"));
+
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        )
+        .await
+        .expect("typing while model is pending");
+        assert_eq!(app.composer.text(), "x");
+
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("duplicate Enter handling");
+        assert_eq!(app.composer.text(), "x");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(super::TranscriptItem::Warning(text)) if text.contains("draft was kept")
+        ));
+
+        let detached = handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        )
+        .await
+        .expect("Ctrl-C handling");
+        assert!(detached);
 
         release_model.add_permits(1);
+        let completion = take_submission(&mut controller)
+            .await
+            .expect("successful submission");
+        controller.complete_submission(&mut app, completion);
+        assert!(matches!(
+            app.transcript.last(),
+            Some(super::TranscriptItem::Answer(answer)) if answer.conclusion == "你好！"
+        ));
+        assert!(render_to_string(&app, 80, 20).contains("Ys-da"));
+        assert_eq!(app.runtime_status.as_deref(), Some("Ready"));
+    }
+
+    #[tokio::test]
+    async fn tui_submission_timeout_is_rendered_after_non_blocking_ack() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let model = Arc::new(FakeModelProvider::new(move |_| async move {
+            Err(ys_agent_core::CoreError::validation(
+                "provider_timeout",
+                "test timeout",
+            ))
+        }));
+        let workspace_id = WorkspaceId::new();
+        let service = Arc::new(
+            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_conversation_model(model, "timeout-test-model"),
+        );
+        let principal = Principal::local_operator("test-operator");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.doctor_report = Some(DoctorReport {
+            blocker_codes: Vec::new(),
+            warning_codes: Vec::new(),
+            ready_capabilities: vec![QueryCapability::AdHocRead],
+            repairs: Vec::new(),
+        });
+        app.composer.set_text("你好");
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ),
+        )
+        .await
+        .expect("Enter must not wait for a failing model")
+        .expect("Enter handling");
+        assert_eq!(app.runtime_status.as_deref(), Some("Thinking…"));
+
+        let error = match take_submission(&mut controller).await {
+            Ok(_) => panic!("expected provider timeout"),
+            Err(error) => error,
+        };
+        app.runtime_status = None;
+        app.push_transcript(super::TranscriptItem::Error(user_readable_error(&error)));
+
+        let rendered = render_to_string(&app, 80, 20);
+        assert!(rendered.contains("provider_timeout"));
+        assert!(app.runtime_status.is_none());
     }
 }

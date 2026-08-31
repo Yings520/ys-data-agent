@@ -125,18 +125,32 @@ fn render_body(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMode
     } else {
         Borders::BOTTOM
     };
-    frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(theme.text).bg(theme.background))
-            .block(
-                Block::default()
-                    .borders(borders)
-                    .border_style(Style::default().fg(theme.border)),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((app.scroll, 0)),
-        area,
-    );
+    let rendered_height = text
+        .lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(usize::from(area.width.max(1))))
+        .sum::<usize>();
+    let visible_height = area
+        .height
+        .saturating_sub(u16::from(mode != LayoutMode::Compact));
+    let scroll = if app.scroll == u16::MAX {
+        rendered_height
+            .saturating_sub(usize::from(visible_height))
+            .try_into()
+            .unwrap_or(u16::MAX)
+    } else {
+        app.scroll
+    };
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(theme.text).bg(theme.background))
+        .block(
+            Block::default()
+                .borders(borders)
+                .border_style(Style::default().fg(theme.border)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(paragraph, area);
 }
 
 fn transcript_lines(app: &TuiApp) -> Text<'static> {
