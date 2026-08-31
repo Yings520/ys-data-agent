@@ -278,6 +278,7 @@ impl Harness {
                 ),
                 tool_call_id: None,
                 name: None,
+                assistant_tool_call: None,
             });
         }
         Ok(messages)

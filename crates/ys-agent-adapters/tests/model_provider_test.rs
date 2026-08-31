@@ -10,8 +10,9 @@ use ys_agent_adapters::model::{
     ReplayModelProvider, SecretString,
 };
 use ys_agent_core::{
-    AgentAction, ContextManifest, CoreError, ModelMessage, ModelProvider, ModelRequest,
-    ModelResponse, ModelRole, Sensitivity, SideEffect, ToolCall, ToolCallId, ToolRisk, ToolSpec,
+    AgentAction, AssistantToolCall, ContextManifest, CoreError, ModelMessage, ModelProvider,
+    ModelRequest, ModelResponse, ModelRole, Sensitivity, SideEffect, ToolCall, ToolCallId,
+    ToolRisk, ToolSpec,
 };
 
 fn schema_tool() -> ToolSpec {
@@ -53,6 +54,7 @@ fn model_request_with_schema_tool() -> ModelRequest {
             content: "Which columns exist?".to_owned(),
             tool_call_id: None,
             name: None,
+            assistant_tool_call: None,
         }],
         tools: vec![schema_tool()],
         context_manifest: ContextManifest::empty(8_000),
@@ -180,12 +182,26 @@ async fn returns_the_original_tool_call_id_with_a_tool_result() {
 
     let provider = provider_for(&server);
     let mut request = model_request_with_schema_tool();
-    request.messages = vec![ModelMessage {
-        role: ModelRole::Tool,
-        content: "{\"relations\":[]}".to_owned(),
-        tool_call_id: Some("call_original".to_owned()),
-        name: Some("inspect_schema".to_owned()),
-    }];
+    request.messages = vec![
+        ModelMessage {
+            role: ModelRole::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            name: None,
+            assistant_tool_call: Some(AssistantToolCall {
+                provider_call_id: "call_original".to_owned(),
+                name: "inspect_schema".to_owned(),
+                arguments: json!({ "source_id": "warehouse" }),
+            }),
+        },
+        ModelMessage {
+            role: ModelRole::Tool,
+            content: "{\"relations\":[]}".to_owned(),
+            tool_call_id: Some("call_original".to_owned()),
+            name: Some("inspect_schema".to_owned()),
+            assistant_tool_call: None,
+        },
+    ];
 
     provider.complete(request).await.expect("valid response");
 
@@ -194,8 +210,15 @@ async fn returns_the_original_tool_call_id_with_a_tool_result() {
         .await
         .expect("request recording is enabled");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("request JSON");
-    assert_eq!(body["messages"][0]["role"], "tool");
-    assert_eq!(body["messages"][0]["tool_call_id"], "call_original");
+    assert_eq!(body["messages"][0]["role"], "assistant");
+    assert_eq!(body["messages"][0]["content"], serde_json::Value::Null);
+    assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_original");
+    assert_eq!(
+        body["messages"][0]["tool_calls"][0]["function"]["name"],
+        "inspect_schema"
+    );
+    assert_eq!(body["messages"][1]["role"], "tool");
+    assert_eq!(body["messages"][1]["tool_call_id"], "call_original");
 }
 
 #[tokio::test]

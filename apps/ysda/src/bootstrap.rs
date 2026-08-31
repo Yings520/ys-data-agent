@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use ys_agent_adapters::model::{
     OpenAiCompatibleConfig, OpenAiCompatibleProvider, ReplayModelProvider, SecretString,
 };
@@ -19,10 +19,11 @@ use ys_agent_adapters::{
     SqliteConnectorConfig, SupportedDialect,
 };
 use ys_agent_core::{
-    AgentAction, ArtifactId, ArtifactStore, CoreError, CoreResult, CredentialReference,
-    MetricDefinition, MetricProvider, ModelCapabilities, ModelProvider, ModelRequest,
-    ModelResponse, QueryBudget, QueryContextProvider, QueryExecutionPlan, RunId, RuntimeStore,
-    SourceId, WorkspaceId,
+    AgentAction, ArtifactId, ArtifactStore, AssistantToolCall, ContextManifest, CoreError,
+    CoreResult, CredentialReference, MetricDefinition, MetricProvider, ModelCapabilities,
+    ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelRole, QueryBudget,
+    QueryContextProvider, QueryExecutionPlan, RunId, RuntimeStore, Sensitivity, SideEffect,
+    SourceId, ToolRisk, ToolSpec, WorkspaceId,
 };
 use ys_agent_runtime::{
     AgentServiceApi, ContextAssembler, Harness, HarnessConfig, HarnessDependencies,
@@ -665,12 +666,16 @@ fn storage_error(context: &'static str) -> impl FnOnce(std::io::Error) -> CoreEr
 struct RuntimeDoctorProbe {
     config: AppConfig,
     readiness: DoctorInputs,
+    model_protocol: Option<ModelProtocolProbe>,
 }
 
 #[async_trait]
 impl DoctorProbe for RuntimeDoctorProbe {
     async fn inspect(&self) -> CoreResult<DoctorInputs> {
         let mut inputs = self.readiness.clone();
+        if let Some(model_protocol) = &self.model_protocol {
+            inputs.model = model_protocol.readiness().await;
+        }
         inputs.query_policy_valid = fs::read(&self.config.query_policy_path)
             .ok()
             .and_then(|bytes| ResultPolicy::from_json_bytes(&bytes).ok())
@@ -696,6 +701,199 @@ impl DoctorProbe for RuntimeDoctorProbe {
         inputs.source.freshness_capability &= inputs.source.reachable;
         Ok(inputs)
     }
+}
+
+const DOCTOR_TOOL_NAME: &str = "ysda_doctor_probe";
+
+#[derive(Clone)]
+struct ModelProtocolProbe {
+    model: Arc<dyn ModelProvider>,
+    model_name: String,
+    cached: Arc<OnceCell<ModelReadiness>>,
+}
+
+impl ModelProtocolProbe {
+    fn new(model: Arc<dyn ModelProvider>, model_name: String) -> Self {
+        Self {
+            model,
+            model_name,
+            cached: Arc::new(OnceCell::new()),
+        }
+    }
+
+    async fn readiness(&self) -> ModelReadiness {
+        self.cached
+            .get_or_init(|| async {
+                match tokio::time::timeout(
+                    Duration::from_secs(45),
+                    probe_model_protocol(self.model.as_ref(), &self.model_name),
+                )
+                .await
+                {
+                    Ok(Ok(readiness)) => readiness,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            code = error.code(),
+                            "model protocol readiness probe failed"
+                        );
+                        incompatible_model_readiness()
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            code = "model_protocol_probe_timeout",
+                            "model protocol readiness probe timed out"
+                        );
+                        incompatible_model_readiness()
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+}
+
+async fn probe_model_protocol(
+    model: &dyn ModelProvider,
+    model_name: &str,
+) -> CoreResult<ModelReadiness> {
+    let tool = doctor_probe_tool();
+    let first = model
+        .complete(ModelRequest {
+            model: model_name.to_owned(),
+            messages: vec![
+                ModelMessage {
+                    role: ModelRole::System,
+                    content: "This is a YSDA protocol readiness probe. It contains no business data. Call exactly the supplied ysda_doctor_probe tool with an empty object."
+                        .to_owned(),
+                    tool_call_id: None,
+                    name: None,
+                    assistant_tool_call: None,
+                },
+                ModelMessage {
+                    role: ModelRole::User,
+                    content: "Call ysda_doctor_probe now.".to_owned(),
+                    tool_call_id: None,
+                    name: None,
+                    assistant_tool_call: None,
+                },
+            ],
+            tools: vec![tool.clone()],
+            context_manifest: ContextManifest::empty(512),
+            temperature: Some(0.0),
+        })
+        .await?;
+    let AgentAction::CallTool { call } = first.action else {
+        return Err(model_protocol_error(
+            "probe response did not contain a structured Tool Call",
+        ));
+    };
+    if call.name != DOCTOR_TOOL_NAME {
+        return Err(model_protocol_error(
+            "probe response called a different tool",
+        ));
+    }
+    let provider_call_id = call
+        .provider_call_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| model_protocol_error("probe Tool Call had no provider call ID"))?;
+
+    let second = model
+        .complete(ModelRequest {
+            model: model_name.to_owned(),
+            messages: vec![
+                ModelMessage {
+                    role: ModelRole::System,
+                    content: r#"This is a YSDA protocol readiness probe with no business data. After the Tool result, return exactly this JSON and nothing else: {"type":"propose_completion","summary":"protocol probe complete","primary_artifact_hint":null}. Do not call another tool."#
+                        .to_owned(),
+                    tool_call_id: None,
+                    name: None,
+                    assistant_tool_call: None,
+                },
+                ModelMessage {
+                    role: ModelRole::Assistant,
+                    content: String::new(),
+                    tool_call_id: None,
+                    name: None,
+                    assistant_tool_call: Some(AssistantToolCall {
+                        provider_call_id: provider_call_id.clone(),
+                        name: DOCTOR_TOOL_NAME.to_owned(),
+                        arguments: call.arguments,
+                    }),
+                },
+                ModelMessage {
+                    role: ModelRole::Tool,
+                    content: r#"{"ready":true}"#.to_owned(),
+                    tool_call_id: Some(provider_call_id),
+                    name: Some(DOCTOR_TOOL_NAME.to_owned()),
+                    assistant_tool_call: None,
+                },
+            ],
+            tools: vec![tool],
+            context_manifest: ContextManifest::empty(512),
+            temperature: Some(0.0),
+        })
+        .await?;
+    if matches!(second.action, AgentAction::CallTool { .. }) {
+        return Err(model_protocol_error(
+            "probe follow-up response called another tool",
+        ));
+    }
+
+    let capabilities = model.capabilities();
+    if capabilities.max_context_tokens == 0 {
+        return Err(model_protocol_error(
+            "model reported an unknown context limit",
+        ));
+    }
+    Ok(ModelReadiness {
+        reachable: true,
+        supports_tool_calls: true,
+        supports_tool_call_ids: true,
+        supports_multi_turn_tool_results: true,
+        context_limit: Some(u64::from(capabilities.max_context_tokens)),
+    })
+}
+
+fn doctor_probe_tool() -> ToolSpec {
+    ToolSpec {
+        name: DOCTOR_TOOL_NAME.to_owned(),
+        description: "A harmless protocol-only readiness probe that returns no business data"
+            .to_owned(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        output_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "ready": { "type": "boolean" } },
+            "required": ["ready"],
+            "additionalProperties": false
+        }),
+        risk: ToolRisk::Low,
+        side_effect: SideEffect::None,
+        idempotent: true,
+        timeout_ms: 1_000,
+        max_output_bytes: 128,
+        required_permissions: Vec::new(),
+        input_sensitivity: Sensitivity::Internal,
+        output_sensitivity: Sensitivity::Internal,
+        version: "1.0.0".to_owned(),
+    }
+}
+
+fn incompatible_model_readiness() -> ModelReadiness {
+    ModelReadiness {
+        reachable: false,
+        supports_tool_calls: false,
+        supports_tool_call_ids: false,
+        supports_multi_turn_tool_results: false,
+        context_limit: None,
+    }
+}
+
+fn model_protocol_error(message: &'static str) -> CoreError {
+    CoreError::validation("model_protocol_incompatible", message)
 }
 
 #[cfg(unix)]
@@ -812,7 +1010,11 @@ async fn assemble_scheduler(
     principal: ys_agent_core::Principal,
     runtime_store: Arc<dyn RuntimeStore>,
     artifact_store: Arc<dyn ArtifactStore>,
-) -> CoreResult<(Arc<BackgroundScheduler>, DoctorInputs)> {
+) -> CoreResult<(
+    Arc<BackgroundScheduler>,
+    DoctorInputs,
+    Arc<dyn ModelProvider>,
+)> {
     let base_url = resolve_env_reference(&config.llm_base_url_ref)?;
     let api_key = resolve_env_reference(&config.llm_api_key_ref)?;
     let model: Arc<dyn ModelProvider> =
@@ -946,7 +1148,7 @@ async fn assemble_scheduler(
         HarnessDependencies {
             store: runtime_store,
             artifacts: artifact_store,
-            model,
+            model: model.clone(),
             catalog: Arc::new(catalog),
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler: Arc::new(ContextAssembler::new(metrics, dbt_context, run_context)),
@@ -1000,6 +1202,7 @@ async fn assemble_scheduler(
             LoopDriver::with_defaults(harness),
         ))),
         readiness,
+        model,
     ))
 }
 
@@ -1213,7 +1416,7 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
     )?);
     let runtime_port: Arc<dyn RuntimeStore> = runtime_store.clone();
     let artifact_port: Arc<dyn ArtifactStore> = artifact_store.clone();
-    let (scheduler, readiness, background) = match assemble_scheduler(
+    let (scheduler, readiness, background, model_protocol) = match assemble_scheduler(
         &config,
         workspace_id,
         principal.clone(),
@@ -1222,18 +1425,24 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
     )
     .await
     {
-        Ok((background, readiness)) => {
+        Ok((background, readiness, model)) => {
             let scheduler: Arc<dyn RunScheduler> = background.clone();
-            (scheduler, readiness, Some(background))
+            (
+                scheduler,
+                readiness,
+                Some(background),
+                Some(ModelProtocolProbe::new(model, config.llm_model.clone())),
+            )
         }
         Err(_) => {
             let scheduler: Arc<dyn RunScheduler> = Arc::new(ys_agent_runtime::NoopRunScheduler);
-            (scheduler, safe_readiness_inputs(&config), None)
+            (scheduler, safe_readiness_inputs(&config), None, None)
         }
     };
     let doctor = Arc::new(WorkspaceDoctor::new(Arc::new(RuntimeDoctorProbe {
         config: config.clone(),
         readiness,
+        model_protocol,
     })));
     let exporter = Arc::new(ArtifactExporter::with_retention_days(
         runtime_port.clone(),
@@ -1265,17 +1474,147 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         fs,
         sync::{Arc, Barrier, mpsc},
         thread,
         time::Duration,
     };
 
+    use async_trait::async_trait;
+    use serde_json::json;
+    use tokio::sync::Mutex as AsyncMutex;
+
     use super::{
-        acquire_workspace_id_lock, artifact_retention_days_from_lookup, create_private_directory,
-        query_budget_from_lookup, required_config_keys, resolve_workspace_id,
+        ModelProtocolProbe, acquire_workspace_id_lock, artifact_retention_days_from_lookup,
+        create_private_directory, query_budget_from_lookup, required_config_keys,
+        resolve_workspace_id,
     };
-    use ys_agent_core::{CoreError, WorkspaceId};
+    use ys_agent_core::{
+        AgentAction, CoreError, CoreResult, ModelCapabilities, ModelProvider, ModelRequest,
+        ModelResponse, ToolCall, ToolCallId, WorkspaceId,
+    };
+
+    #[derive(Clone)]
+    struct ScriptedDoctorModel {
+        responses: Arc<AsyncMutex<VecDeque<ModelResponse>>>,
+        requests: Arc<AsyncMutex<Vec<ModelRequest>>>,
+    }
+
+    impl ScriptedDoctorModel {
+        fn new(responses: Vec<ModelResponse>) -> Self {
+            Self {
+                responses: Arc::new(AsyncMutex::new(responses.into())),
+                requests: Arc::new(AsyncMutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptedDoctorModel {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                tool_calling: true,
+                structured_outputs: true,
+                max_context_tokens: 32_768,
+                parallel_tool_calls: false,
+                streaming: false,
+            }
+        }
+
+        async fn complete(&self, request: ModelRequest) -> CoreResult<ModelResponse> {
+            self.requests.lock().await.push(request);
+            self.responses
+                .lock()
+                .await
+                .pop_front()
+                .ok_or(CoreError::ReplayExhausted)
+        }
+    }
+
+    fn doctor_tool_call(name: &str, provider_call_id: Option<&str>) -> ModelResponse {
+        ModelResponse {
+            action: AgentAction::CallTool {
+                call: ToolCall {
+                    id: ToolCallId::new(),
+                    provider_call_id: provider_call_id.map(str::to_owned),
+                    name: name.to_owned(),
+                    arguments: json!({}),
+                    version: "1.0.0".to_owned(),
+                },
+            },
+            raw_content: None,
+            usage: None,
+        }
+    }
+
+    fn doctor_completion() -> ModelResponse {
+        ModelResponse {
+            action: AgentAction::ProposeCompletion {
+                summary: "protocol probe complete".to_owned(),
+                primary_artifact_hint: None,
+            },
+            raw_content: None,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn model_protocol_probe_uses_the_original_tool_call_id_and_caches_success() {
+        let model = Arc::new(ScriptedDoctorModel::new(vec![
+            doctor_tool_call("ysda_doctor_probe", Some("call_probe_1")),
+            doctor_completion(),
+        ]));
+        let probe = ModelProtocolProbe::new(model.clone(), "test-model".to_owned());
+
+        let first = probe.readiness().await;
+        let second = probe.readiness().await;
+
+        assert_eq!(first, second);
+        assert!(first.reachable);
+        assert!(first.supports_tool_calls);
+        assert!(first.supports_tool_call_ids);
+        assert!(first.supports_multi_turn_tool_results);
+        assert_eq!(first.context_limit, Some(32_768));
+        let requests = model.requests.lock().await;
+        assert_eq!(
+            requests.len(),
+            2,
+            "cached probe must not call the model again"
+        );
+        assert_eq!(requests[0].tools[0].name, "ysda_doctor_probe");
+        let tool_result = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == ys_agent_core::ModelRole::Tool)
+            .expect("second request contains a Tool result");
+        assert_eq!(tool_result.tool_call_id.as_deref(), Some("call_probe_1"));
+        assert_eq!(tool_result.name.as_deref(), Some("ysda_doctor_probe"));
+        let assistant_call = requests[1]
+            .messages
+            .iter()
+            .find_map(|message| message.assistant_tool_call.as_ref())
+            .expect("second request replays the assistant Tool Call");
+        assert_eq!(assistant_call.provider_call_id, "call_probe_1");
+        assert_eq!(assistant_call.name, "ysda_doctor_probe");
+    }
+
+    #[tokio::test]
+    async fn model_protocol_probe_fails_closed_when_the_second_turn_calls_a_tool_again() {
+        let model = Arc::new(ScriptedDoctorModel::new(vec![
+            doctor_tool_call("ysda_doctor_probe", Some("call_probe_2")),
+            doctor_tool_call("ysda_doctor_probe", Some("call_probe_3")),
+        ]));
+        let probe = ModelProtocolProbe::new(model, "test-model".to_owned());
+
+        let readiness = probe.readiness().await;
+
+        assert!(!readiness.reachable);
+        assert!(!readiness.supports_tool_calls);
+        assert!(!readiness.supports_tool_call_ids);
+        assert!(!readiness.supports_multi_turn_tool_results);
+        assert_eq!(readiness.context_limit, None);
+    }
 
     #[test]
     fn documented_query_cost_limit_is_parsed_into_the_runtime_budget() {
