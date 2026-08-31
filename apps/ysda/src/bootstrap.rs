@@ -416,6 +416,27 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> CoreResult<()> {
     fs::write(path, bytes).map_err(storage_error("write export file"))
 }
 
+fn resolve_workspace_id(workspace_root: &Path) -> CoreResult<WorkspaceId> {
+    let path = workspace_root.join("workspace-id");
+    match fs::read_to_string(&path) {
+        Ok(value) => value.trim().parse::<WorkspaceId>().map_err(|error| {
+            CoreError::validation(
+                "workspace_id_invalid",
+                format!(
+                    "persisted workspace ID at {} is malformed: {error}",
+                    path.display()
+                ),
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let workspace_id = WorkspaceId::new();
+            write_private_file(&path, format!("{workspace_id}\n").as_bytes())?;
+            Ok(workspace_id)
+        }
+        Err(error) => Err(storage_error("read workspace ID")(error)),
+    }
+}
+
 fn storage_error(context: &'static str) -> impl FnOnce(std::io::Error) -> CoreError {
     move |error| CoreError::Storage {
         message: format!("{context}: {error}"),
@@ -957,7 +978,7 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
     create_private_directory(Path::new(".ysda"))?;
     create_private_directory(&config.artifact_root)?;
     create_private_directory(&config.export_root)?;
-    let workspace_id = WorkspaceId::new();
+    let workspace_id = resolve_workspace_id(Path::new(".ysda"))?;
     let principal = ys_agent_core::Principal::local_operator(
         env::var("USER").unwrap_or_else(|_| "local-operator".to_owned()),
     );
@@ -1019,4 +1040,66 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
         principal,
         display,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{create_private_directory, resolve_workspace_id};
+    use ys_agent_core::{CoreError, WorkspaceId};
+
+    #[test]
+    fn workspace_id_is_persisted_for_later_bootstraps() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_root = directory.path().join(".ysda");
+        create_private_directory(&workspace_root).expect("create workspace directory");
+
+        let first = resolve_workspace_id(&workspace_root).expect("resolve first workspace ID");
+        let second = resolve_workspace_id(&workspace_root).expect("resolve second workspace ID");
+        let persisted = fs::read_to_string(workspace_root.join("workspace-id"))
+            .expect("read persisted workspace ID");
+
+        assert_eq!(first, second);
+        assert_eq!(persisted, format!("{first}\n"));
+        assert_eq!(
+            persisted
+                .trim()
+                .parse::<WorkspaceId>()
+                .expect("parse workspace ID"),
+            first
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(workspace_root.join("workspace-id"))
+                .expect("read workspace ID metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn malformed_persisted_workspace_id_is_rejected() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let workspace_root = directory.path().join(".ysda");
+        create_private_directory(&workspace_root).expect("create workspace directory");
+        fs::write(workspace_root.join("workspace-id"), "not-a-workspace-id\n")
+            .expect("write malformed workspace ID");
+
+        let error =
+            resolve_workspace_id(&workspace_root).expect_err("reject malformed workspace ID");
+
+        assert!(matches!(
+            error,
+            CoreError::Validation {
+                code: "workspace_id_invalid",
+                ..
+            }
+        ));
+    }
 }
