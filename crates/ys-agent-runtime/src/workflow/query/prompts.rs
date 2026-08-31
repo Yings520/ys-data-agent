@@ -6,6 +6,9 @@ const BASE_INSTRUCTIONS: &str = concat!(
     "You are operating inside the ysda v0.2 Query workflow.\n",
     "Use tools for facts. Prefer Active Metric contracts for governed metrics.\n",
     "Request clarification when metric, time range, timezone, or dimension is materially ambiguous.\n",
+    "When requesting clarification, return exactly one JSON object with this shape: ",
+    r#"{"type":"request_clarification","question":"<one concise question>"}"#,
+    ". Do not wrap it in Markdown or prose.\n",
     "Never invent source names, schema, freshness, SQL results, or business conclusions.\n",
     "A completion proposal is allowed only after required result and verification evidence exists.\n",
     "Do not reveal private chain-of-thought. Return concise decisions, assumptions, and warnings.\n",
@@ -122,5 +125,25 @@ mod tests {
         assert!(prompt.contains("JSON object only"));
         assert!(prompt.contains(r#""type":"propose_completion""#));
         assert!(prompt.contains(r#""primary_artifact_hint":null"#));
+    }
+
+    #[test]
+    fn clarification_action_contract_is_explicit_in_every_phase() {
+        for phase in [
+            QueryPhase::Clarify,
+            QueryPhase::ClassifyIntent,
+            QueryPhase::ResolveContext,
+            QueryPhase::Plan,
+            QueryPhase::ValidateAndPreflight,
+            QueryPhase::Execute,
+            QueryPhase::Verify,
+            QueryPhase::Package,
+            QueryPhase::ReadyToComplete,
+        ] {
+            let prompt = query_system_instructions(phase);
+            assert!(prompt.contains(
+                r#"{"type":"request_clarification","question":"<one concise question>"}"#
+            ));
+        }
     }
 }

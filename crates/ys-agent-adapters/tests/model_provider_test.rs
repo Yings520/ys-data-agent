@@ -279,6 +279,70 @@ async fn invalid_typed_action_reports_the_safe_serde_reason() {
 
     assert_eq!(error.code(), "invalid_model_response");
     assert!(error.to_string().contains("unknown variant"));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    assert_eq!(requests.len(), 2, "one protocol correction is allowed");
+}
+
+#[tokio::test]
+async fn corrects_one_invalid_typed_action_without_replaying_its_content() {
+    const CANARY: &str = "private-response-canary";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": format!(
+                        r#"{{"type":"request_clarification","private":"{CANARY}"}}"#
+                    )
+                }
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": r#"{"type":"request_clarification","question":"Which time range?"}"#
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let response = provider_for(&server)
+        .complete(model_request_with_schema_tool())
+        .await
+        .expect("one protocol correction should recover the typed action");
+
+    assert!(matches!(
+        response.action,
+        AgentAction::RequestClarification { ref question } if question == "Which time range?"
+    ));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    assert_eq!(requests.len(), 2);
+    let retry_body: serde_json::Value =
+        serde_json::from_slice(&requests[1].body).expect("request JSON");
+    let correction = retry_body["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .expect("protocol correction message");
+    assert!(correction.contains("PROTOCOL CORRECTION"));
+    assert!(correction.contains("request_clarification"));
+    assert!(!correction.contains(CANARY));
 }
 
 #[tokio::test]
