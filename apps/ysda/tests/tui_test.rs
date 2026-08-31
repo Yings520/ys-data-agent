@@ -92,6 +92,20 @@ fn slash_palette_replaces_composer_and_keeps_one_input_surface() {
 }
 
 #[test]
+fn slash_palette_closes_after_a_command_argument_without_changing_the_composer() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    app.composer.set_text("/resume");
+    app.sync_slash_palette();
+    assert_eq!(app.transient, Some(TransientView::SlashPalette));
+
+    app.composer.set_text("/resume task");
+    app.sync_slash_palette();
+
+    assert_eq!(app.transient, None);
+    assert_eq!(app.composer.text(), "/resume task");
+}
+
+#[test]
 fn supported_terminal_sizes_render_without_panicking() {
     let app = TuiApp::for_principal(Principal::local_operator("ysc"));
     for (width, height) in [(60, 12), (80, 20), (100, 28), (150, 40)] {
