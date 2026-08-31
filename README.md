@@ -144,6 +144,7 @@ YSDA_LLM_BASE_URL
 YSDA_LLM_API_KEY
 YSDA_LLM_MODEL
 YSDA_DATA_SOURCE_KIND
+YSDA_DATA_SOURCE_ID
 YSDA_DATA_SOURCE_URL or YSDA_SQLITE_PATH
 YSDA_METRIC_REGISTRY_PATH
 YSDA_DBT_MANIFEST_PATH
@@ -166,6 +167,10 @@ An OpenAI-compatible provider must support Tool Calls, Tool Call IDs, multi-turn
 rtk mkdir -p .ysda
 rtk sqlite3 .ysda/demo.db ".read fixtures/sql/sqlite_seed.sql"
 ```
+
+For the SQLite demo, the template sets `YSDA_DATA_SOURCE_ID=sqlite_demo`, which
+matches the source ID authorized by `fixtures/policy/query-policy.json`. Keep
+this value aligned with the selected policy source ID.
 
 Real PostgreSQL Pilot users do not create the demo database. They configure `YSDA_DATA_SOURCE_KIND=postgres` and supply a least-privilege `CredentialReference` through `YSDA_DATA_SOURCE_URL`.
 
