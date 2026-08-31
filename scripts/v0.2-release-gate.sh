@@ -35,6 +35,11 @@ rtk env \
   -- --ignored
 
 rtk cargo test -p ysda --test query_eval_test
+rtk cargo test -p ysda model_protocol_probe --lib
+rtk cargo test \
+  -p ys-agent-adapters \
+  --test model_provider_test \
+  returns_the_original_tool_call_id_with_a_tool_result
 rtk cargo test -p ysda --test doctor_test
 rtk cargo test -p ysda --test export_test
 rtk cargo test -p ysda --test tui_test

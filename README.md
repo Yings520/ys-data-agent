@@ -38,7 +38,7 @@ A suitable v0.2 Pilot has:
 - an OpenAI-compatible model endpoint with Tool Calls, Tool Call IDs, multi-turn Tool Result messages, and a known context limit;
 - local owner-only storage for Runtime state and Artifacts.
 
-Run `ysda doctor` before the first query. Doctor checks the configured path to a trusted answer and prints safe repair instructions. It never prints credential values.
+Run `ysda doctor` before the first query. Doctor checks the configured path to a trusted answer and prints safe repair instructions. Its model check makes two small synthetic calls once per process: first a harmless Tool Call, then a Tool Result continuation using the provider's original call ID. The probe contains no business data, is cached for the life of the process, and never prints credential values. An invalid or unreachable response produces the `model_protocol_incompatible` blocker and disables query submission.
 
 ## Task-centric architecture
 
@@ -159,6 +159,8 @@ YSDA_ARTIFACT_RETENTION_DAYS
 
 An OpenAI-compatible provider must support Tool Calls, Tool Call IDs, multi-turn Tool Result messages, and a known context limit.
 
+`YSDA_QUERY_MAX_ESTIMATED_COST_UNITS` is optional. When set to a positive integer, it is enforced by connectors that provide preflight cost estimates. `YSDA_ARTIFACT_RETENTION_DAYS` is required and must be a positive integer; it controls expiry for day-retained clarification evidence and exported Artifacts. Invalid values fail bootstrap instead of silently falling back.
+
 ### 3. Create the SQLite demo source
 
 `sqlite3` is required only for this demo setup:
@@ -182,7 +184,7 @@ Load `.env` with your preferred local environment tool, then run:
 rtk cargo run -p ysda -- doctor
 ```
 
-Repair every blocker before submitting a query. A warning may disable only one capability, such as GovernedMetric when the Metric Registry is missing.
+Repair every blocker before submitting a query. The first Doctor run can take two model round trips; later Doctor checks in the same process reuse the cached verdict. A warning may disable only one capability, such as GovernedMetric when the Metric Registry is missing.
 
 ### 5. Open the TUI
 
@@ -266,7 +268,7 @@ Complete release gate, including the fixture PostgreSQL integration:
 rtk ./scripts/v0.2-release-gate.sh
 ```
 
-The gate uses Fake or Replay model providers. It requires no live model request and spends no model tokens.
+The gate uses Fake, Replay, or Wiremock model providers, including a focused two-stage model-protocol test. It requires no live model request and spends no model tokens.
 
 ## Recovery promise
 
