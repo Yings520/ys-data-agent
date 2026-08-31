@@ -238,7 +238,160 @@ fn artifact_events(artifacts: &[ArtifactMetadata]) -> Vec<PendingRunEvent> {
         .collect()
 }
 
+fn artifact_identity(artifact: &ArtifactRef) -> serde_json::Value {
+    json!({
+        "artifact_id": artifact.id(),
+        "kind": artifact.metadata.kind,
+        "content_hash": artifact.metadata.content_hash,
+    })
+}
+
 impl Harness {
+    fn runtime_query_state_message(
+        &self,
+        state: &QueryWorkflowState,
+    ) -> CoreResult<ys_agent_core::ModelMessage> {
+        let content = serde_json::to_string(&json!({
+            "phase": state.phase,
+            "source_id": self.config.data_scope.source_id,
+            "intent": state.intent,
+            "artifacts": {
+                "metric_evidence": state.metric_evidence.as_ref().map(artifact_identity),
+                "schema_evidence": state.schema_evidence.iter().map(artifact_identity).collect::<Vec<_>>(),
+                "freshness_evidence": state.freshness_evidence.as_ref().map(artifact_identity),
+                "execution_plan": state.execution_plan.as_ref().map(artifact_identity),
+                "preflight": state.preflight.as_ref().map(artifact_identity),
+                "query_result": state.query_result.as_ref().map(artifact_identity),
+                "verification_report": state.verification_report.as_ref().map(artifact_identity),
+            },
+            "assumptions": state.assumptions,
+            "warnings": state.warnings,
+        }))
+        .map_err(|error| {
+            CoreError::validation("runtime_query_state_serialization_failed", error.to_string())
+        })?;
+        Ok(ys_agent_core::ModelMessage {
+            role: ys_agent_core::ModelRole::User,
+            content: format!("RUNTIME_QUERY_STATE_JSON:\n{content}"),
+            tool_call_id: None,
+            name: None,
+            assistant_tool_call: None,
+        })
+    }
+
+    async fn read_model_safe_json<T>(&self, artifact: &ArtifactRef) -> CoreResult<Option<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if artifact.metadata.sensitivity > Sensitivity::Internal {
+            return Ok(None);
+        }
+        let bytes = self
+            .artifacts
+            .get(
+                artifact,
+                &ys_agent_core::ArtifactAccessContext {
+                    workspace_id: self.config.workspace_id,
+                    principal_id: self.config.principal.id,
+                    purpose: ys_agent_core::ArtifactAccessPurpose::ModelPreview,
+                    max_sensitivity: Sensitivity::Internal,
+                },
+            )
+            .await?;
+        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            CoreError::validation("model_workflow_evidence_invalid", error.to_string())
+        })
+    }
+
+    fn workflow_evidence_message(
+        artifact: &ArtifactRef,
+        content: serde_json::Value,
+    ) -> CoreResult<ys_agent_core::ModelMessage> {
+        let content = serde_json::to_string(&json!({
+            "artifact": artifact_identity(artifact),
+            "content": content,
+        }))
+        .map_err(|error| {
+            CoreError::validation("workflow_evidence_serialization_failed", error.to_string())
+        })?;
+        Ok(ys_agent_core::ModelMessage {
+            role: ys_agent_core::ModelRole::User,
+            content: format!("UNTRUSTED_WORKFLOW_EVIDENCE_JSON:\n{content}"),
+            tool_call_id: None,
+            name: None,
+            assistant_tool_call: None,
+        })
+    }
+
+    async fn workflow_evidence_messages(
+        &self,
+        state: &QueryWorkflowState,
+    ) -> CoreResult<Vec<ys_agent_core::ModelMessage>> {
+        let mut messages = Vec::new();
+        if matches!(
+            state.phase,
+            QueryPhase::Plan | QueryPhase::Verify | QueryPhase::ReadyToComplete
+        ) && let Some(artifact) = &state.metric_evidence
+            && let Some(content) = self.read_model_safe_json(artifact).await?
+        {
+            messages.push(Self::workflow_evidence_message(artifact, content)?);
+        }
+        if matches!(state.phase, QueryPhase::Plan | QueryPhase::ReadyToComplete) {
+            for artifact in &state.schema_evidence {
+                if let Some(content) = self.read_model_safe_json(artifact).await? {
+                    messages.push(Self::workflow_evidence_message(artifact, content)?);
+                }
+            }
+        }
+        if matches!(
+            state.phase,
+            QueryPhase::Verify | QueryPhase::ReadyToComplete
+        ) && let Some(artifact) = &state.freshness_evidence
+            && let Some(content) = self.read_model_safe_json(artifact).await?
+        {
+            messages.push(Self::workflow_evidence_message(artifact, content)?);
+        }
+        if state.phase == QueryPhase::ReadyToComplete {
+            if let Some(artifact) = &state.query_result
+                && let Some(result) = self
+                    .read_model_safe_json::<StoredResultEvidence>(artifact)
+                    .await?
+            {
+                messages.push(Self::workflow_evidence_message(
+                    artifact,
+                    json!({
+                        "source_id": result.compiled.source_id,
+                        "source_relations": result.compiled.source_relations,
+                        "metric_id": result.compiled.metric_id,
+                        "metric_version": result.compiled.metric_version,
+                        "semantic_status": result.compiled.semantic_status,
+                        "columns": result.result.columns,
+                        "row_count": result.result.row_count,
+                        "truncated": result.result.truncated,
+                        "warning_codes": result.result.warning_codes,
+                        "model_preview": result.result.model_preview,
+                    }),
+                )?);
+            }
+            if let Some(artifact) = &state.verification_report
+                && let Some(report) = self
+                    .read_model_safe_json::<crate::workflow::query::VerificationReport>(artifact)
+                    .await?
+            {
+                messages.push(Self::workflow_evidence_message(
+                    artifact,
+                    serde_json::to_value(report).map_err(|error| {
+                        CoreError::validation(
+                            "verification_evidence_serialization_failed",
+                            error.to_string(),
+                        )
+                    })?,
+                )?);
+            }
+        }
+        Ok(messages)
+    }
+
     async fn clarification_messages(
         &self,
         state: &QueryWorkflowState,
@@ -341,7 +494,13 @@ impl Harness {
         )?;
         request
             .messages
+            .push(self.runtime_query_state_message(&state)?);
+        request
+            .messages
             .extend(self.clarification_messages(&state).await?);
+        request
+            .messages
+            .extend(self.workflow_evidence_messages(&state).await?);
 
         let started = self.next_snapshot(
             &current,
@@ -944,7 +1103,7 @@ impl HarnessStep for Harness {
         &self,
         run_id: &RunId,
         code: &'static str,
-        message: &'static str,
+        message: String,
     ) -> CoreResult<RunSnapshot> {
         let current = self.store.load_run(run_id).await?;
         let state = QueryWorkflowState::from_snapshot(current.workflow_state.clone())?;
@@ -961,7 +1120,7 @@ impl HarnessStep for Harness {
             vec![],
             vec![system_event(RunEventKind::RunFailed {
                 code: code.to_owned(),
-                message: message.to_owned(),
+                message,
             })],
             &next,
         )
