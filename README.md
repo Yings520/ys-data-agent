@@ -221,13 +221,14 @@ Both paths use the same `AgentServiceApi`, Harness, policies, and stores.
 
 ```text
 .ysda/runtime.db    Agent control state: Sessions, Tasks, Runs, Events, and Snapshots
+.ysda/workspace-id  owner-only local Workspace identity for reopening Task and Run state after restart
 .ysda/artifacts/    Query, verification, result, and context Artifacts
 .ysda/exports/      policy-approved, content-addressed exports
 .ysda/ui.toml       owner-only local theme and UI preferences
 user PostgreSQL     business data queried through user-scoped credentials
 ```
 
-`.ysda` is not a general log directory. Deleting it loses local Task and clarification recovery. Back it up or remove it only as an explicit Workspace reset.
+`.ysda` is not a general log directory. Deleting it loses local Task and clarification recovery, removes the local Workspace identity, and intentionally resets local recovery. Back it up or remove it only as an explicit Workspace reset.
 
 Runtime, Artifact, export, and UI preference paths must be owner-only and writable. Artifacts carry sensitivity, retention, and expiry metadata. `.ysda/ui.toml` contains only validated theme preferences; it is not Runtime recovery state and never contains Prompt, SQL, rows, credentials, or Telemetry. Cleanup must be explicit and policy-aware. Secret values never belong in these paths.
 
