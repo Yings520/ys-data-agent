@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -8,7 +8,10 @@ use std::{
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use ys_agent_adapters::model::{OpenAiCompatibleConfig, OpenAiCompatibleProvider, SecretString};
+use tokio::sync::Mutex as AsyncMutex;
+use ys_agent_adapters::model::{
+    OpenAiCompatibleConfig, OpenAiCompatibleProvider, ReplayModelProvider, SecretString,
+};
 use ys_agent_adapters::{
     ConnectorRegistry, DbtManifestAdapter, FileMetricRegistry, InspectSchemaTool, MetricSqlDialect,
     PostgresConnector, PostgresConnectorConfig, QueryDataTool, ReadFreshnessTool,
@@ -16,8 +19,9 @@ use ys_agent_adapters::{
     SqliteConnectorConfig, SupportedDialect,
 };
 use ys_agent_core::{
-    ArtifactId, ArtifactStore, CoreError, CoreResult, CredentialReference, MetricDefinition,
-    MetricProvider, ModelProvider, QueryBudget, QueryContextProvider, RunId, RuntimeStore,
+    AgentAction, ArtifactId, ArtifactStore, CoreError, CoreResult, CredentialReference,
+    MetricDefinition, MetricProvider, ModelCapabilities, ModelProvider, ModelRequest,
+    ModelResponse, QueryBudget, QueryContextProvider, QueryExecutionPlan, RunId, RuntimeStore,
     SourceId, WorkspaceId,
 };
 use ys_agent_runtime::{
@@ -26,8 +30,11 @@ use ys_agent_runtime::{
     ServiceEventPublisher,
     doctor::{DoctorInputs, DoctorProbe, ModelReadiness, SourceReadiness, WorkspaceDoctor},
     export::{ArtifactExporter, DefaultExportPolicy, ExportWriter, WrittenExport},
-    telemetry::TelemetryDispatcher,
-    tools::{ConnectorToolAvailability, ToolCatalog, ToolRuntime, WorkspaceToolPolicy},
+    telemetry::{TelemetryDispatcher, TracingTelemetrySink},
+    tools::{
+        ConnectorToolAvailability, QueryPhase, ToolCatalog, ToolRuntime, ToolViewBuilder,
+        WorkspaceToolPolicy,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -43,6 +50,176 @@ pub struct AppDependencies {
     pub workspace_id: WorkspaceId,
     pub principal: ys_agent_core::Principal,
     pub display: DisplayMetadata,
+}
+
+/// Deterministic inputs for the production-shaped Query Eval composition.
+///
+/// This entry point deliberately accepts paths instead of reading application environment
+/// variables. It is only used by the release Eval and never selects a live model provider.
+#[derive(Debug, Clone)]
+pub struct DeterministicRuntimeConfig {
+    pub runtime_path: PathBuf,
+    pub artifact_path: PathBuf,
+    pub sqlite_path: PathBuf,
+    pub metric_registry_path: PathBuf,
+    pub dbt_manifest_path: PathBuf,
+    pub query_policy_path: PathBuf,
+    pub timezone: Option<String>,
+    pub replay: Vec<ModelResponse>,
+    pub secret_canary: String,
+}
+
+pub struct DeterministicRuntimeAssembly {
+    pub service: Arc<dyn AgentServiceApi>,
+    pub workspace_id: WorkspaceId,
+    pub principal: ys_agent_core::Principal,
+    pub phase_tool_view_hashes: BTreeMap<String, String>,
+}
+
+#[derive(Clone)]
+struct DeterministicReplayModelProvider {
+    responses: Arc<AsyncMutex<VecDeque<ModelResponse>>>,
+    current_run_id: Arc<AsyncMutex<Option<RunId>>>,
+    store: Arc<dyn RuntimeStore>,
+}
+
+impl DeterministicReplayModelProvider {
+    fn new(
+        responses: Vec<ModelResponse>,
+        current_run_id: Arc<AsyncMutex<Option<RunId>>>,
+        store: Arc<dyn RuntimeStore>,
+    ) -> Self {
+        Self {
+            responses: Arc::new(AsyncMutex::new(responses.into())),
+            current_run_id,
+            store,
+        }
+    }
+
+    async fn set_current_run(&self, run_id: RunId) {
+        *self.current_run_id.lock().await = Some(run_id);
+    }
+
+    async fn next_response(&self) -> CoreResult<ModelResponse> {
+        let mut response = self
+            .responses
+            .lock()
+            .await
+            .pop_front()
+            .ok_or(CoreError::ReplayExhausted)?;
+        let run_id = self.current_run_id.lock().await.ok_or_else(|| {
+            CoreError::validation(
+                "deterministic_replay_run_missing",
+                "Replay model was called before a Query Run was scheduled",
+            )
+        })?;
+        let snapshot = self.store.load_run(&run_id).await?;
+        let state = ys_agent_runtime::QueryWorkflowState::from_snapshot(snapshot.workflow_state)?;
+        materialize_replay_sentinels(&mut response, &state)?;
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl ModelProvider for DeterministicReplayModelProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        ReplayModelProvider::from_responses(Vec::new()).capabilities()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> CoreResult<ModelResponse> {
+        let response = self.next_response().await?;
+        ReplayModelProvider::from_responses(vec![response])
+            .complete(request)
+            .await
+    }
+}
+
+fn materialize_replay_sentinels(
+    response: &mut ModelResponse,
+    state: &ys_agent_runtime::QueryWorkflowState,
+) -> CoreResult<()> {
+    match &mut response.action {
+        AgentAction::ProposeQueryPlan { plan } => {
+            let mut parsed: ys_agent_core::QueryPlan = serde_json::from_value(plan.clone())
+                .map_err(|error| {
+                    CoreError::validation("deterministic_replay_plan_invalid", error.to_string())
+                })?;
+            if let QueryExecutionPlan::AdHoc {
+                assumption_refs, ..
+            } = &mut parsed.execution
+            {
+                let evidence = state.schema_evidence.first().ok_or_else(|| {
+                    CoreError::validation(
+                        "deterministic_replay_schema_evidence_missing",
+                        "AdHoc Replay plan needs persisted schema Evidence",
+                    )
+                })?;
+                *assumption_refs = vec![evidence.id()];
+            }
+            *plan = serde_json::to_value(parsed).map_err(|error| {
+                CoreError::validation("deterministic_replay_plan_serialize", error.to_string())
+            })?;
+        }
+        AgentAction::CallTool { call } if call.name == "query_data" => {
+            let arguments = call.arguments.as_object_mut().ok_or_else(|| {
+                CoreError::validation(
+                    "deterministic_replay_arguments_invalid",
+                    "query_data Replay arguments must be an object",
+                )
+            })?;
+            let plan = state.execution_plan.as_ref().ok_or_else(|| {
+                CoreError::validation(
+                    "deterministic_replay_plan_missing",
+                    "query_data Replay needs a persisted QueryPlan",
+                )
+            })?;
+            replace_replay_string(arguments, "plan_artifact_id", plan.id().to_string());
+            replace_replay_string(arguments, "plan_hash", plan.metadata.content_hash.clone());
+            if arguments.get("action").and_then(serde_json::Value::as_str) == Some("execute") {
+                let preflight = state.preflight.as_ref().ok_or_else(|| {
+                    CoreError::validation(
+                        "deterministic_replay_preflight_missing",
+                        "execute Replay needs persisted preflight Evidence",
+                    )
+                })?;
+                replace_replay_string(
+                    arguments,
+                    "preflight_artifact_id",
+                    preflight.id().to_string(),
+                );
+                replace_replay_string(
+                    arguments,
+                    "preflight_hash",
+                    preflight.metadata.content_hash.clone(),
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn replace_replay_string(
+    arguments: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    replacement: String,
+) {
+    if arguments.contains_key(key) {
+        arguments.insert(key.to_owned(), serde_json::Value::String(replacement));
+    }
+}
+
+struct DeterministicRunScheduler {
+    driver: Arc<LoopDriver>,
+    model: DeterministicReplayModelProvider,
+}
+
+#[async_trait]
+impl RunScheduler for DeterministicRunScheduler {
+    async fn schedule(&self, run_id: RunId) -> CoreResult<()> {
+        self.model.set_current_run(run_id).await;
+        self.driver.run(&run_id).await.map(|_| ())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -525,6 +702,7 @@ async fn assemble_scheduler(
     for tool in tools {
         catalog.register_arc(tool)?;
     }
+    let telemetry = Arc::new(TelemetryDispatcher::new(Arc::new(TracingTelemetrySink)));
     let harness = Arc::new(Harness::new(
         HarnessDependencies {
             store: runtime_store,
@@ -533,7 +711,7 @@ async fn assemble_scheduler(
             catalog: Arc::new(catalog),
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler: Arc::new(ContextAssembler::new(metrics, dbt_context, run_context)),
-            telemetry: Arc::new(TelemetryDispatcher::default()),
+            telemetry,
         },
         PromptBuilder::new(config.llm_model.clone()),
         HarnessConfig {
@@ -584,6 +762,185 @@ async fn assemble_scheduler(
         ))),
         readiness,
     ))
+}
+
+/// Assemble the same governed Query runtime used in production, with only deterministic
+/// composition substitutions: local paths, a fixed SQLite source, replayed model responses, and
+/// a no-op telemetry sink.
+pub async fn assemble_deterministic_query_runtime(
+    config: DeterministicRuntimeConfig,
+) -> CoreResult<DeterministicRuntimeAssembly> {
+    let _fixture_timezone = config.timezone.as_deref();
+    if config.secret_canary.trim().is_empty() {
+        return Err(CoreError::validation(
+            "deterministic_eval_secret_missing",
+            "deterministic Eval requires a non-empty secret canary",
+        ));
+    }
+    let workspace_id = WorkspaceId::new();
+    let principal = ys_agent_core::Principal::local_operator("deterministic-eval");
+    let source_id = SourceId::new("sqlite_demo");
+    let query_budget = QueryBudget::default();
+    let runtime = Arc::new(ys_agent_store::SqliteRuntimeStore::open(&config.runtime_path).await?);
+    let artifacts = Arc::new(ys_agent_store::LocalArtifactStore::new(
+        &config.artifact_path,
+    )?);
+    let runtime_store: Arc<dyn RuntimeStore> = runtime;
+    let artifact_store: Arc<dyn ArtifactStore> = artifacts;
+    let policy_bytes = tokio::fs::read(&config.query_policy_path)
+        .await
+        .map_err(|error| CoreError::validation("query_policy_read_failed", error.to_string()))?;
+    let result_policy = ResultPolicy::from_json_bytes(&policy_bytes)?;
+    let data_scope = result_policy.allowed_scope(workspace_id, &source_id)?;
+    let metrics: Arc<dyn MetricProvider> = Arc::new(
+        FileMetricRegistry::load(&config.metric_registry_path)
+            .await
+            .map_err(|error| {
+                CoreError::validation("metric_registry_load_failed", error.to_string())
+            })?,
+    );
+    let dbt_context: Arc<dyn QueryContextProvider> = Arc::new(
+        DbtManifestAdapter::load(&config.dbt_manifest_path)
+            .await
+            .map_err(|error| {
+                CoreError::validation("dbt_manifest_load_failed", error.to_string())
+            })?,
+    );
+    let run_context: Arc<dyn QueryContextProvider> = Arc::new(InMemoryQueryContextProvider::new());
+    let connector = Arc::new(SqliteConnector::new(
+        SqliteConnectorConfig {
+            source_id: source_id.clone(),
+            database_path: config.sqlite_path,
+            max_concurrency: query_budget.max_concurrency,
+            freshness_columns: BTreeMap::new(),
+        },
+        SqlReadOnlyPolicy::new(SupportedDialect::SQLite, query_budget.max_sql_bytes),
+        result_policy,
+    ));
+    let mut connectors = ConnectorRegistry::new();
+    connectors.register(source_id, MetricSqlDialect::Sqlite, connector)?;
+    let artifact_lookup = Arc::new(RuntimeArtifactLookup::new(
+        runtime_store.clone(),
+        artifact_store.clone(),
+    ));
+    let tools: Vec<Arc<dyn ys_agent_core::Tool>> = vec![
+        Arc::new(ResolveMetricTool::new(metrics.clone())),
+        Arc::new(InspectSchemaTool::new(
+            connectors.clone(),
+            artifact_store.clone(),
+            20,
+            200,
+            32_768,
+        )),
+        Arc::new(ReadFreshnessTool::new(connectors.clone(), metrics.clone())),
+        Arc::new(QueryDataTool::new(
+            connectors,
+            metrics.clone(),
+            artifact_lookup,
+            artifact_store.clone(),
+        )),
+    ];
+    let tool_policy = WorkspaceToolPolicy::default();
+    let mut catalog = ToolCatalog::with_policy(tool_policy.clone());
+    for tool in tools {
+        catalog.register_arc(tool)?;
+    }
+    let catalog = Arc::new(catalog);
+    let connector_tools = ConnectorToolAvailability::all_query_tools();
+    let phase_tool_view_hashes =
+        query_phase_tool_view_hashes(catalog.as_ref(), &principal, connector_tools.clone())?;
+    let current_run_id = Arc::new(AsyncMutex::new(None));
+    let model = DeterministicReplayModelProvider::new(
+        config.replay,
+        current_run_id.clone(),
+        runtime_store.clone(),
+    );
+    let telemetry = Arc::new(TelemetryDispatcher::default());
+    let harness = Arc::new(Harness::new(
+        HarnessDependencies {
+            store: runtime_store.clone(),
+            artifacts: artifact_store.clone(),
+            model: Arc::new(model.clone()),
+            catalog,
+            tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
+            context_assembler: Arc::new(ContextAssembler::new(metrics, dbt_context, run_context)),
+            telemetry,
+        },
+        PromptBuilder::new("deterministic-query-eval"),
+        HarnessConfig {
+            workspace_id,
+            principal: principal.clone(),
+            query_budget,
+            data_scope,
+            connector_tools,
+            tool_policy,
+            context_token_budget: 8_000,
+            schema_ttl: Duration::from_secs(300),
+        },
+    ));
+    let scheduler: Arc<dyn RunScheduler> = Arc::new(DeterministicRunScheduler {
+        driver: Arc::new(LoopDriver::with_defaults(harness)),
+        model,
+    });
+    let service: Arc<dyn AgentServiceApi> = Arc::new(InProcessAgentService::new(
+        workspace_id,
+        runtime_store,
+        artifact_store,
+        scheduler,
+    ));
+    Ok(DeterministicRuntimeAssembly {
+        service,
+        workspace_id,
+        principal,
+        phase_tool_view_hashes,
+    })
+}
+
+fn query_phase_tool_view_hashes(
+    catalog: &ToolCatalog,
+    principal: &ys_agent_core::Principal,
+    connector_tools: ConnectorToolAvailability,
+) -> CoreResult<BTreeMap<String, String>> {
+    [
+        QueryPhase::Clarify,
+        QueryPhase::ClassifyIntent,
+        QueryPhase::ResolveContext,
+        QueryPhase::Plan,
+        QueryPhase::ValidateAndPreflight,
+        QueryPhase::Execute,
+        QueryPhase::Verify,
+        QueryPhase::Package,
+        QueryPhase::ReadyToComplete,
+    ]
+    .into_iter()
+    .map(|phase| {
+        let view = ToolViewBuilder::new(catalog)
+            .for_workflow(ys_agent_core::WorkflowKind::Query)
+            .for_query_phase(phase)
+            .for_principal(principal)
+            .with_connector_tools(connector_tools.clone())
+            .for_run_status(ys_agent_core::RunStatus::Running)
+            .build()?;
+        Ok((
+            query_phase_name(phase).to_owned(),
+            view.content_hash().to_owned(),
+        ))
+    })
+    .collect()
+}
+
+fn query_phase_name(phase: QueryPhase) -> &'static str {
+    match phase {
+        QueryPhase::Clarify => "clarify",
+        QueryPhase::ClassifyIntent => "classify_intent",
+        QueryPhase::ResolveContext => "resolve_context",
+        QueryPhase::Plan => "plan",
+        QueryPhase::ValidateAndPreflight => "validate_and_preflight",
+        QueryPhase::Execute => "execute",
+        QueryPhase::Verify => "verify",
+        QueryPhase::Package => "package",
+        QueryPhase::ReadyToComplete => "ready_to_complete",
+    }
 }
 
 fn resolve_env_reference(reference: &CredentialReference) -> CoreResult<String> {

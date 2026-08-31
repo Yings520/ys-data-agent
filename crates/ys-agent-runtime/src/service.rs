@@ -7,11 +7,11 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use ys_agent_core::{
-    ArtifactAccessContext, ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore,
-    CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult, EventActor, EventEnvelope,
-    ExportFormat, PendingRunEvent, Principal, PutArtifact, RetentionPolicy, Run, RunEventKind,
-    RunId, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, Sensitivity, Session,
-    SessionId, Task, TaskId, WorkflowKind, WorkspaceId,
+    ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, ArtifactKind, ArtifactMetadata,
+    ArtifactRef, ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CoreError,
+    CoreResult, EventActor, EventEnvelope, ExportFormat, PendingRunEvent, Principal, PutArtifact,
+    RetentionPolicy, Run, RunEventKind, RunId, RunSnapshot, RunStatus, RuntimeCommandBatch,
+    RuntimeStore, Sensitivity, Session, SessionId, Task, TaskId, WorkflowKind, WorkspaceId,
 };
 
 use crate::{
@@ -1009,8 +1009,17 @@ impl AgentServiceApi for InProcessAgentService {
             .artifacts
             .get(&ArtifactRef::new(metadata.clone()), &access)
             .await?;
-        let truncated = bytes.len() > ARTIFACT_PREVIEW_LIMIT;
-        let preview = bytes.into_iter().take(ARTIFACT_PREVIEW_LIMIT).collect();
+        let full_safe_query = access.purpose == ArtifactAccessPurpose::RuntimeVerification
+            && access.max_sensitivity <= Sensitivity::Internal
+            && metadata.kind == ArtifactKind::Query
+            && metadata.sensitivity <= Sensitivity::Internal;
+        let preview_limit = if full_safe_query {
+            bytes.len()
+        } else {
+            ARTIFACT_PREVIEW_LIMIT
+        };
+        let truncated = bytes.len() > preview_limit;
+        let preview = bytes.into_iter().take(preview_limit).collect();
         Ok(ArtifactView {
             metadata,
             preview,

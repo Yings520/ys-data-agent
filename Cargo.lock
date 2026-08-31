@@ -3597,11 +3597,13 @@ name = "ysda"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "clap",
  "crossterm",
  "futures",
  "ratatui",
  "ratatui-textarea",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
