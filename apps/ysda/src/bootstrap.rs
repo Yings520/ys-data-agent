@@ -1004,7 +1004,7 @@ impl MetricProvider for EmptyMetricProvider {
 
 struct BackgroundScheduler {
     driver: Arc<LoopDriver>,
-    scheduled: Mutex<HashSet<RunId>>,
+    scheduled: Arc<Mutex<HashSet<RunId>>>,
     publisher: Mutex<Option<ServiceEventPublisher>>,
 }
 
@@ -1012,7 +1012,7 @@ impl BackgroundScheduler {
     fn new(driver: Arc<LoopDriver>) -> Self {
         Self {
             driver,
-            scheduled: Mutex::new(HashSet::new()),
+            scheduled: Arc::new(Mutex::new(HashSet::new())),
             publisher: Mutex::new(None),
         }
     }
@@ -1034,13 +1034,19 @@ impl RunScheduler for BackgroundScheduler {
             return Ok(());
         }
         let driver = self.driver.clone();
+        let scheduled = self.scheduled.clone();
         let publisher = self
             .publisher
             .lock()
             .expect("scheduler publisher mutex")
             .clone();
         tokio::spawn(async move {
-            match driver.run(&run_id).await {
+            let result = driver.run(&run_id).await;
+            scheduled
+                .lock()
+                .expect("scheduler run mutex")
+                .remove(&run_id);
+            match result {
                 Ok(result) => {
                     if let Some(publisher) = publisher {
                         publisher.notify(run_id, result.snapshot.version);
@@ -1540,24 +1546,99 @@ mod tests {
     use std::{
         collections::VecDeque,
         fs,
-        sync::{Arc, Barrier, mpsc},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
         thread,
         time::Duration,
     };
 
     use async_trait::async_trait;
     use serde_json::json;
-    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::{Mutex as AsyncMutex, Notify};
 
     use super::{
-        ModelProtocolProbe, acquire_workspace_id_lock, artifact_retention_days_from_lookup,
-        create_private_directory, query_budget_from_lookup, required_config_keys,
-        resolve_workspace_id,
+        BackgroundScheduler, ModelProtocolProbe, acquire_workspace_id_lock,
+        artifact_retention_days_from_lookup, create_private_directory, query_budget_from_lookup,
+        required_config_keys, resolve_workspace_id,
     };
     use ys_agent_core::{
         AgentAction, CoreError, CoreResult, ModelCapabilities, ModelProvider, ModelRequest,
-        ModelResponse, ToolCall, ToolCallId, WorkspaceId,
+        ModelResponse, RunId, RunSnapshot, RunStatus, TaskId, ToolCall, ToolCallId, WorkflowKind,
+        WorkspaceId,
     };
+    use ys_agent_runtime::{
+        HarnessStep, LoopDriver, RunScheduler, StepAccounting, StepOutcome,
+    };
+
+    struct WaitingHarness {
+        calls: Arc<AtomicUsize>,
+        called: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl HarnessStep for WaitingHarness {
+        async fn step(&self, run_id: &RunId) -> CoreResult<StepOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.called.notify_one();
+            Ok(StepOutcome::Wait {
+                snapshot: RunSnapshot {
+                    run_id: *run_id,
+                    task_id: TaskId::new(),
+                    workflow: WorkflowKind::Query,
+                    status: RunStatus::WaitingForInput,
+                    attempt: 1,
+                    retry_of_run_id: None,
+                    version: 1,
+                    workflow_state: serde_json::json!({}),
+                    pending_wait_metadata: None,
+                    primary_artifact_id: None,
+                    last_completed_step_id: None,
+                },
+                accounting: StepAccounting::default(),
+            })
+        }
+
+        async fn fail_terminal(
+            &self,
+            _run_id: &RunId,
+            _code: &'static str,
+            _message: String,
+        ) -> CoreResult<RunSnapshot> {
+            unreachable!("waiting harness never fails")
+        }
+    }
+
+    async fn wait_for_calls(harness: &WaitingHarness, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.calls.load(Ordering::SeqCst) < expected {
+                harness.called.notified().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("scheduler did not reach {expected} calls"));
+    }
+
+    #[tokio::test]
+    async fn background_scheduler_releases_a_waiting_run_for_resumption() {
+        let harness = Arc::new(WaitingHarness {
+            calls: Arc::new(AtomicUsize::new(0)),
+            called: Arc::new(Notify::new()),
+        });
+        let scheduler = BackgroundScheduler::new(Arc::new(LoopDriver::with_defaults(
+            harness.clone(),
+        )));
+        let run_id = RunId::new();
+
+        scheduler.schedule(run_id).await.expect("first schedule");
+        wait_for_calls(&harness, 1).await;
+        scheduler.schedule(run_id).await.expect("resume schedule");
+        wait_for_calls(&harness, 2).await;
+
+        assert_eq!(harness.calls.load(Ordering::SeqCst), 2);
+    }
 
     #[derive(Clone)]
     struct ScriptedDoctorModel {
