@@ -106,21 +106,29 @@ Review 实际 diff
 
 下面以 `provider-management` 为例。
 
-### 5.1 必要时更新项目总纲
+### 5.1 先判断是否需要更新项目总纲（通常跳过）
 
-在 Codex 对话中输入：
+不要因为“这是一个 Feature”就默认运行 BMAD：
+
+- **普通 Feature 默认跳过 BMAD：** Feature 的 Requirements 直接进入 cc-sdd。只要它不改变项目方向、稳定架构、发布边界或演进顺序，就直接执行 §5.2/§5.3。
+- **只有项目级事实变化才运行 `$bmad-prd`：** 例如改变目标用户或产品定位、把原本排除的能力放进当前版本、改变跨 Feature 的稳定架构，或者调整版本演进顺序。
+
+BMAD 只维护 `docs/PRD.md`。Feature 的用户行为、FR/NFR、验收标准、接口、数据结构和任务继续写在 `.kiro/specs/<feature>/`，不要复制进项目总纲，也不要为 Feature 创建第二份 PRD。
+
+#### 当前 `provider-management` 为什么需要更新
+
+当前 `docs/PRD.md` §26.5 明确把“多种非 OpenAI 协议 Provider”排除在 v0.2 之外，而 `provider-management` 希望在当前版本支持 9 个 Provider。这改变了项目发布边界，因此需要先在 Codex 对话中输入：
 
 ```text
 $bmad-prd
+
+更新 docs/PRD.md，使 provider-management 可以进入当前版本范围。
+只修改项目级 Provider 架构、v0.2 发布边界和演进计划。
+不要把 Provider Feature 的 FR、NFR、AC、TUI 字段或实现细节写入 docs/PRD.md；
+这些内容继续由 .kiro/specs/provider-management/requirements.md 管理。
 ```
 
-BMAD 只能修改：
-
-```text
-docs/PRD.md
-```
-
-检查项目方向、稳定架构、发布边界和演进顺序后明确批准。不要把 Feature 的详细需求写入项目总纲，也不要为 Feature 创建第二份 PRD。
+Agent 修改完成后检查实际 Diff；确认项目级边界准确时，回复“我批准这次 `docs/PRD.md` 更新”。这只是批准同一份项目总纲的修改，不会创建新的 PRD。然后继续 §5.3。
 
 ### 5.2 初始化 Feature
 

@@ -105,6 +105,26 @@ test("BMAD produces one PRD artifact without a parallel document system", async 
   assert.doesNotMatch(projectDesign, /^## 32\./m);
 });
 
+test("ordinary Features skip BMAD while project-boundary changes update the PRD", async () => {
+  const bmad = await readFile(
+    path.join(skillsRoot, "bmad-prd/SKILL.md"),
+    "utf8",
+  );
+  const guide = await readFile(
+    path.join(projectRoot, "docs/BMAD-CC-SDD-RALPH-USAGE.md"),
+    "utf8",
+  );
+
+  for (const document of [bmad, guide]) {
+    assert.match(document, /普通 Feature[^\n]*(?:跳过|不要调用).*BMAD/i);
+    assert.match(document, /项目方向[^\n]*稳定架构[^\n]*发布边界[^\n]*演进顺序/);
+    assert.match(document, /Feature[^\n]*(?:Requirements|requirements\.md)[^\n]*(?:cc-sdd|\.kiro\/specs)/i);
+  }
+
+  assert.match(guide, /provider-management[^]*§26\.5/);
+  assert.match(guide, /只修改项目级 Provider 架构、v0\.2 发布边界和演进计划/);
+});
+
 test("a new Provider capability starts as a cc-sdd Feature input", async () => {
   const featureRoot = path.join(
     projectRoot,

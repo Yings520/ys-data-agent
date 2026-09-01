@@ -1,6 +1,6 @@
 ---
 name: bmad-prd
-description: Create, update, or validate docs/PRD.md, the single project-wide product, architecture, and evolution design for ys-data-agent. Use when product intent, stable architecture, release boundaries, or the evolution roadmap changes.
+description: Create, update, or validate docs/PRD.md, the single project-wide product, architecture, and evolution design for ys-data-agent. Use only for project-level changes; ordinary Feature requirements go directly to cc-sdd.
 ---
 
 # BMAD Project Design PRD
@@ -16,6 +16,14 @@ BMAD maintains the project's durable design thinking in one place: product inten
 - Write in the user's requested language. Keep the document coherent and navigable; preserve architecture detail that has earned project-wide authority instead of shortening it merely for brevity.
 
 ## Activation
+
+Apply this routing gate before choosing a mode:
+
+- **普通 Feature 默认跳过 BMAD：** Feature 的 Requirements 直接进入 cc-sdd；不要为了新增一个 Feature 而更新 `docs/PRD.md`。
+- **只有项目级事实变化才使用 BMAD：** 项目方向、稳定架构、发布边界或演进顺序至少有一项发生变化时，才创建或更新 `docs/PRD.md`。
+- Feature 的用户行为、FR/NFR、验收标准、接口、数据结构和任务仍属于 `.kiro/specs/<feature>/`。即使需要先更新项目总纲，也不得把这些详细内容复制进 `docs/PRD.md`。
+
+If an ordinary Feature fits the approved project design without changing those four project-level facts, stop this skill and route directly to cc-sdd. If a real conflict exists, update only the affected project-level sections before returning to the Feature specification.
 
 Infer one intent from the request:
 
@@ -66,12 +74,12 @@ For **Validate**, report `READY` or `NEEDS_REVISION` with concrete findings. Do 
 Do not send every Change through cc-sdd. Classify it after checking whether it alters `docs/PRD.md`:
 
 - **Small change:** product scope unchanged, no new user-visible capability, no public contract or persistent-state change, one responsibility boundary, and safely completable in one bounded Agent session. Route directly to a Code Agent with scoped tests, review, and fresh verification. BMAD, cc-sdd documents, and Ralph are unnecessary.
-- **Feature:** new or materially changed user behavior, public contract, persistent state, cross-boundary integration, or multiple independently verifiable tasks. Route through cc-sdd and Ralph.
+- **Feature:** new or materially changed user behavior, public contract, persistent state, cross-boundary integration, or multiple independently verifiable tasks. Route through cc-sdd and Ralph. Do not invoke BMAD unless the Feature also changes one of the four project-level facts above.
 
-For a Feature, provide the next command:
+For a new Feature that does not require a project-level update, provide the next command immediately:
 
 ```text
 $kiro-spec-init "<feature description>; project design: docs/PRD.md"
 ```
 
-The approved `docs/PRD.md` remains the project Source of Truth. cc-sdd may refine Feature engineering detail but must send project-level product or architecture conflicts back to it instead of silently redefining them.
+For an existing Feature, continue from its current cc-sdd phase instead of running initialization again. The approved `docs/PRD.md` remains the project Source of Truth. cc-sdd may refine Feature engineering detail but must send genuine project-level product or architecture conflicts back to it instead of silently redefining them.
