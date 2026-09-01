@@ -18,6 +18,8 @@
 - Modify `crates/ys-agent-runtime/tests/support/mod.rs`: test harness workspace timezone.
 - Modify `crates/ys-agent-runtime/tests/query_workflow_test.rs`: temporal-context regression assertion.
 - Modify `apps/ysda/src/bootstrap.rs`: production/deterministic timezone wiring and resumable background scheduling.
+- Modify `apps/ysda/tests/query_eval_test.rs`: deterministic replay for the Chinese “yesterday GMV” request.
+- Modify `evals/query_cases.jsonl`: production-shaped acceptance case and empty-result guardrail.
 - Update PR `#20`: explain both field regressions and record verification.
 
 ### Task 1: Keep internal timestamp formats out of clarification questions
@@ -224,9 +226,10 @@ rtk cargo test -p ys-agent-adapters allows_the_captured_daily_sales_query -- --n
 rtk cargo test -p ys-agent-runtime clarification_keeps_internal_formats_away_from_users -- --nocapture
 rtk cargo test -p ys-agent-runtime --test query_workflow_test each_live_model_phase_receives_the_runtime_identities_it_must_reuse -- --nocapture
 rtk cargo test -p ysda background_scheduler_releases_a_waiting_run_for_resumption -- --nocapture
+rtk cargo test -p ysda --test query_eval_test every_query_eval_case_passes_the_release_contract -- --nocapture
 ```
 
-Expected: four passing regressions.
+Expected: five passing regressions, including `查询昨日的 GMV` and the empty-result-not-zero guardrail.
 
 - [ ] **Step 2: Run full quality gates**
 
