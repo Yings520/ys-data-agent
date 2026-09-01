@@ -8,7 +8,7 @@ Look across all requirements as a group. Identify cases where multiple requireme
 
 - If feature A is a special case of a more general capability X, design X with an interface that naturally supports A (and potentially B, C later)
 - Keep the implementation scope to what the current requirements demand — generalize the interface, not the implementation
-- Record identified generalizations in `research.md` under Design Decisions
+- Record identified generalizations in `design.md` under Design Decisions
 
 ## 2. Build vs. Adopt
 
@@ -17,7 +17,7 @@ For each major component in the emerging design, ask: is this problem already so
 - Search for established standards (RFCs, protocols), battle-tested libraries, or platform-native capabilities that address the requirement
 - Prefer adopting existing solutions over building custom ones when they fit the requirements without significant adaptation
 - If adopting: verify the solution is actively maintained, compatible with the project's stack (check steering), and meets non-functional requirements
-- If building: document why existing solutions were rejected (capture in `research.md`)
+- If building: document in `design.md` why existing solutions were rejected
 
 ## 3. Simplification
 

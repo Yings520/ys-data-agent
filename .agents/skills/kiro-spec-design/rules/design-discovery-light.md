@@ -24,7 +24,7 @@ Quickly analyze existing system and integration requirements for feature extensi
 - Verify basic usage patterns
 - Check for known compatibility issues
 - Confirm licensing compatibility
-- Record key findings in `research.md` (technology alignment section)
+- Record key findings in the Technology Alignment section of `design.md`
 
 ### 4. Integration Risk Assessment
 **Quick Risk Check**:
@@ -42,7 +42,7 @@ Switch to full discovery if you find:
 - Unknown or poorly documented dependencies
 
 ## Output Requirements
-- Clear integration approach (note boundary impacts in `research.md`)
+- Clear integration approach with boundary impacts recorded in `design.md`
 - List of files/components to modify
 - New dependencies with versions
 - Integration risks and mitigations

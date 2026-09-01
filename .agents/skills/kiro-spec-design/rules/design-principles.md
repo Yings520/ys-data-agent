@@ -35,7 +35,7 @@
 - **Interface Segregation**: Minimal, focused interfaces
 - **Team-safe Interfaces**: Design boundaries that allow parallel implementation without merge conflicts
 - **No Hidden Shared Ownership**: If two areas appear to co-own the same behavior or data, the design is incomplete
-- **Research Traceability**: Record boundary decisions and rationale in `research.md`
+- **Decision Traceability**: Record boundary decisions and rationale in `design.md`
 
 ### 5. Data Modeling Standards
 - **Domain First**: Start with business concepts
@@ -54,7 +54,7 @@
 - **Contract First**: Define interfaces before implementation
 - **Versioning**: Plan for API evolution
 - **Idempotency**: Design for retry safety
-- **Contract Visibility**: Surface API and event contracts in design.md while linking extended details from `research.md`
+- **Contract Visibility**: Keep API and event contracts self-contained in design.md
 
 ### 8. Dependency Direction
 - **Define and enforce the dependency direction** in the architecture section of design.md (e.g., Types → Config → Repository → Service → Runtime → UI)
@@ -75,7 +75,7 @@
 - **Traceable**: Requirements to components mapping
 - **Complete**: All aspects covered for implementation
 - **Consistent**: Uniform terminology throughout
-- **Focused**: Keep design.md centered on architecture and contracts; move investigation logs and lengthy comparisons to `research.md`
+- **Focused**: Keep design.md centered on architecture, contracts, and concise decision evidence; discard raw investigation logs after synthesis
 
 ## Section Authoring Guidance
 
@@ -92,7 +92,7 @@
 
 ### Technology Stack
 - Include ONLY layers impacted by this feature (frontend, backend, data, messaging, infra).
-- For each layer specify tool/library + version + the role it plays; push extended rationale, comparisons, or benchmarks to `research.md`.
+- For each layer specify tool/library + version + the role it plays; keep only decision-relevant rationale or benchmarks in Supporting References.
 - When extending an existing system, highlight deviations from the current stack and list new dependencies.
 
 ### System Flows
@@ -114,8 +114,8 @@
 - Begin with a summary table listing Component, Domain, Intent, Requirement coverage, key dependencies, and selected contracts.
 - Table fields: Intent (one line), Requirements (`2.1, 2.3`), Owner/Reviewers (optional).
 - Dependencies table must mark each entry as Inbound/Outbound/External and assign Criticality (`P0` blocking, `P1` high-risk, `P2` informational).
-- Summaries of external dependency research stay here; detailed investigation (API signatures, rate limits, migration notes) belongs in `research.md`.
-- design.md must remain a self-contained reviewer artifact. Reference `research.md` only for background, and restate any conclusions or decisions here.
+- External dependency decisions, relevant API signatures, rate limits, and migration constraints stay here.
+- design.md must remain a self-contained reviewer artifact.
 - Contracts: tick only the relevant types (Service/API/Event/Batch/State). Unchecked types should not appear later in the component section.
 - Service interfaces must declare method signatures, inputs/outputs, and error envelopes. API/Event/Batch contracts require schema tables or bullet lists covering trigger, payload, delivery, idempotency.
 - Use **Integration & Migration Notes**, **Validation Hooks**, and **Open Questions / Risks** to document rollout strategy, observability, and unresolved decisions.
@@ -134,7 +134,7 @@
 - Domain Model covers aggregates, entities, value objects, domain events, and invariants. Add Mermaid diagrams only when relationships are non-trivial.
 - Logical Data Model should articulate structure, indexing, sharding, and storage-specific considerations (event store, KV/wide-column) relevant to the change.
 - Data Contracts & Integration section documents API payloads, event schemas, and cross-service synchronization patterns when the feature crosses boundaries.
-- Lengthy type definitions or vendor-specific option objects should be placed in the Supporting References section within design.md, linked from the relevant section. Investigation notes stay in `research.md`.
+- Lengthy type definitions or vendor-specific option objects should be placed in the Supporting References section within design.md and linked from the relevant section.
 - Supporting References usage is optional; only create it when keeping the content in the main body would reduce readability. All decisions must still appear in the main sections so design.md stands alone.
 
 ### Error/Testing/Security/Performance Sections

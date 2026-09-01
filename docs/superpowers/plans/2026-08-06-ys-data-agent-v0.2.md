@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, Tokio, Serde, async-trait, UUID, Chrono, Rusqlite, SQLx/Postgres, Reqwest, sqlparser, Ratatui, Crossterm, tracing, SHA-256, Wiremock.
 
-**Design spec:** docs/superpowers/specs/2026-08-06-ys-data-agent-architecture-design.md
+**Design spec:** docs/PRD.md
 
 **Product boundary:** v0.2 is the first technical validation slice of the long-term SME AI data team, not the long-term product itself. Requiring a Data Engineer or technical analyst for this Pilot is a temporary entry condition, not a permanent customer requirement.
 

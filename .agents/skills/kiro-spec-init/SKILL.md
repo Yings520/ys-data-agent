@@ -1,51 +1,43 @@
 ---
 name: kiro-spec-init
-description: Initialize a new specification with detailed project description
+description: Initialize one cc-sdd Feature from the approved project design in docs/PRD.md. Creates only spec control metadata and the initial requirements document; small Changes must not invoke it.
 ---
 
+# cc-sdd Feature Initialization
 
-# Spec Initialization
+Create one engineering specification under `.kiro/specs/<feature>/`.
 
-<instructions>
-## Core Task
-Generate a unique feature name from the project description ($ARGUMENTS) and initialize the specification structure.
+## Inputs
 
-## Execution Steps
-1. **Check for Brief**: If `.kiro/specs/{feature-name}/brief.md` exists (created by `$kiro-discovery`), read it. The brief contains problem, approach, scope, and constraints from the discovery session. Use this to pre-fill the project description and skip clarification questions that the brief already answers.
-2. **Clarify Intent**: The Project Description in requirements.md must contain three elements: (a) who has the problem, (b) current situation, (c) what should change. If a brief.md exists and covers these, skip to step 3. Otherwise, ask the user to clarify before proceeding. Ask as many questions as needed; do not fill in gaps with your own assumptions.
-3. **Check Uniqueness**: Verify `.kiro/specs/` for naming conflicts. If the directory already exists with only `brief.md` (no `spec.json`), use that directory (discovery created it).
-4. **Create Directory**: `.kiro/specs/[feature-name]/` (skip if already exists from discovery)
-5. **Initialize Files Using Templates**:
-   - Read `.kiro/settings/templates/specs/init.json`
-   - Read `.kiro/settings/templates/specs/requirements-init.md`
-   - Replace placeholders:
-     - `{{FEATURE_NAME}}` → generated feature name
-     - `{{TIMESTAMP}}` → current ISO 8601 timestamp
-     - `{{PROJECT_DESCRIPTION}}` → from brief.md if available, otherwise $ARGUMENTS
-     - `zh` → language code (detect from user's input language, default to `en`)
-   - Write `spec.json` and `requirements.md` to spec directory
+Accept a Feature description in `$ARGUMENTS`. It should reference the canonical project design `docs/PRD.md` and the project sections or evolution direction it implements.
 
-## Important Constraints
-- Do NOT generate requirements, design, or tasks. This skill only creates spec.json and requirements.md.
-</instructions>
+Before writing, confirm the description contains:
 
-## Output Description
-Provide output in the language specified in `spec.json` with the following structure:
+- who has the problem;
+- the current behavior or limitation;
+- the desired user-visible change;
+- the relevant `docs/PRD.md` section.
 
-1. **Generated Feature Name**: `feature-name` format with 1-2 sentence rationale
-2. **Project Summary**: Brief summary (1 sentence)
-3. **Created Files**: Bullet list with full paths
-4. **Next Step**: Command block showing `$kiro-spec-requirements <feature-name>`
+Ask only for missing information that would materially change feature scope. Do not invent product intent.
 
-**Format Requirements**:
-- Use Markdown headings (##, ###)
-- Wrap commands in code blocks
-- Keep total output concise (under 250 words)
-- Use clear, professional language per `spec.json.language`
+## Procedure
 
-## Safety & Fallback
-- **Ambiguous Feature Name**: If feature name generation is unclear, propose 2-3 options and ask user to select
-- **Template Missing**: If template files don't exist in `.kiro/settings/templates/specs/`, report error with specific missing file path and suggest checking repository setup
-- **Directory Conflict**: If feature name already exists, append numeric suffix (e.g., `feature-name-2`) and notify user of automatic conflict resolution
-- **Write Failure**: Report error with specific path and suggest checking permissions or disk space
+1. Read `docs/PRD.md` and extract only the scope relevant to this Feature.
+2. Generate a stable lowercase feature slug using `[a-z0-9._-]`.
+3. Check `.kiro/specs/` for a naming conflict. If the feature already exists, stop and ask whether to update it; do not create a silent duplicate.
+4. Read:
+   - `.kiro/settings/templates/specs/init.json`;
+   - `.kiro/settings/templates/specs/requirements-init.md`.
+5. Create `.kiro/specs/<feature>/spec.json` and `.kiro/specs/<feature>/requirements.md`.
+6. In `requirements.md`, record the source PRD path and a concise project description. Do not generate the full requirements, design, or tasks yet.
+7. Set `spec.json.language` from the requested document language and retain `spec.json` as machine-readable approval/control state.
 
+## Output
+
+Report the feature name, the two created paths, and the next command:
+
+```text
+$kiro-spec-requirements <feature>
+```
+
+The final human-maintained feature documents are `requirements.md`, `design.md`, and `tasks.md`; `spec.json` is control metadata, not a fourth planning document.

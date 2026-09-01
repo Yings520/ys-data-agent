@@ -1,92 +1,73 @@
-# Agentic SDLC and Spec-Driven Development
+# Minimal Agentic SDLC
 
-Kiro-style Spec-Driven Development on an agentic SDLC
+This repository keeps one project-level product document and routes each Change by impact.
 
-## Workflow Ownership
-
-- BMAD is limited to `$bmad-product-brief` and `$bmad-prd` for product intent. Do not invoke BMAD architecture, epic/story, sprint, build, code-review, or implementation workflows in this repository.
-- cc-sdd is the sole development workflow for requirements, design, tasks, implementation review, and validation.
-- Ralph TUI is the sole outer task-loop orchestrator. When Ralph dispatches a task, use `$run-cc-sdd-task <feature> <task-id>` and never start the unscoped all-task form of `$kiro-impl`.
-- `.kiro/specs/<feature>/tasks.md` is authoritative task state. `.ralph-tui/generated/*.json` is a disposable scheduling projection and must never redefine requirements or completion.
-
-## Project Memory
-Project memory keeps persistent guidance (steering, specs notes, component docs) so Codex honors your standards each run. Treat it as the long-lived source of truth for patterns, conventions, and decisions.
-
-- Use `.kiro/steering/` for project-wide policies: architecture principles, naming schemes, security constraints, tech stack decisions, api standards, etc.
-- Use local `AGENTS.md` files for feature or library context (e.g. `src/lib/payments/AGENTS.md`): describe domain assumptions, API contracts, or testing conventions specific to that folder. Codex auto-loads these when working in the matching path.
-- Specs notes stay with each spec (under `.kiro/specs/`) to guide specification-level workflows.
-
-## Project Context
-
-### Paths
-- Steering: `.kiro/steering/`
-- Specs: `.kiro/specs/`
-
-### Steering vs Specification
-
-**Steering** (`.kiro/steering/`) - Guide AI with project-wide rules and context
-**Specs** (`.kiro/specs/`) - Formalize development process for individual features
-
-### Active Specifications
-- Check `.kiro/specs/` for active specifications
-- Use `$kiro-spec-status [feature-name]` to check progress
-
-## Development Guidelines
-- Think in English, generate responses in Simplified Chinese. All Markdown content written to project files (e.g., requirements.md, design.md, tasks.md, research.md, validation reports) MUST be written in the target language configured for this specification (see spec.json.language).
-
-## Minimal Workflow
-- Phase 0 (optional): `$kiro-steering`, `$kiro-steering-custom`
-- Discovery: `$kiro-discovery "idea"` — determines action path, writes brief.md + roadmap.md for multi-spec projects
-- Phase 1 (Specification):
-  - Single spec: `$kiro-spec-quick {feature} [--auto]` or step by step:
-    - `$kiro-spec-init "description"`
-    - `$kiro-spec-requirements {feature}`
-    - `$kiro-validate-gap {feature}` (optional: for existing codebase)
-    - `$kiro-spec-design {feature} [-y]`
-    - `$kiro-validate-design {feature}` (optional: design review)
-    - `$kiro-spec-tasks {feature} [-y]`
-  - Multi-spec: `$kiro-spec-batch` — creates all specs from roadmap.md in parallel by dependency wave
-- Phase 2 (Implementation): `$kiro-impl {feature} [tasks]`
-  - Without task numbers: autonomous mode (subagent per task + independent review + final validation)
-  - With task numbers: manual mode (selected tasks in main context, still reviewer-gated before completion)
-  - `$kiro-validate-impl {feature}` (standalone re-validation)
-- Progress check: `$kiro-spec-status {feature}` (use anytime)
-
-## Skills Structure
-Skills are located in `.agents/skills/kiro-*/SKILL.md`
-- Each skill is a directory with a `SKILL.md` file
-- Use `/skills` to inspect currently available skills
-- Invoke a skill directly with `$kiro-<skill-name>`
-- `kiro-review` — task-local adversarial review protocol used by reviewer subagents
-- `kiro-debug` — root-cause-first debug protocol used by debugger subagents
-- `kiro-verify-completion` — fresh-evidence gate before success or completion claims
-- **If there is even a 1% chance a skill applies to the current task, invoke it.** Do not skip skills because the task seems simple.
-
-## Collaboration Modes (Optional)
-Enable collaboration modes in `~/.codex/config.toml` to let Codex choose focused execution modes for longer tasks:
-
-```toml
-[features]
-collaboration_modes = true
+```text
+docs/PRD.md
+    ↓
+Change
+  ├── small change → direct Code Agent → code + test + review + fresh verification
+  └── Feature      → cc-sdd requirements.md → design.md → tasks.md
+                                      ↓
+                                  Ralph TUI
+                                      ↓
+                              one-task Code Agent Loop
 ```
 
-## Multi-Agent (Experimental)
-If multi-agent is available, use it to parallelize independent research and validation within skills. Enable in `~/.codex/config.toml`:
+## Source-of-Truth Boundaries
 
-```toml
-[features]
-multi_agent = true
-```
+- **BMAD** owns `docs/PRD.md`: the single project-wide product, stable architecture, and evolution design for ys-data-agent. It contains durable project reasoning and boundaries, but never a Feature's detailed requirements, design, or tasks.
+- **cc-sdd** is used only for Features. Each Feature keeps exactly three human-maintained engineering documents under `.kiro/specs/<feature>/`: `requirements.md`, `design.md`, and `tasks.md`.
+- `spec.json` stores machine-readable phase and human-approval state; it is not a fourth planning document.
+- **Ralph TUI** executes approved Feature tasks only. `.ralph-tui/generated/*.json`, iteration logs, and progress files are disposable runtime state.
+- `.kiro/specs/<feature>/tasks.md` is the sole authoritative Feature task list and completion state.
 
-Skills with "Parallel Research" sections list independent work items that benefit from sub-agent spawning when this feature is active.
+Project-level product, stable architecture, or evolution conflicts return to `docs/PRD.md`. Feature conflicts return to the owning cc-sdd document. Ralph must never redefine either.
 
-## Development Rules
-- 3-phase approval workflow: Requirements → Design → Tasks → Implementation
-- Human review required each phase; use `-y` only for intentional fast-track
-- Keep steering current and verify alignment with `$kiro-spec-status`
-- Follow the user's instructions precisely, and within that scope act autonomously: gather the necessary context and complete the requested work end-to-end in this run, asking questions only when essential information is missing or the instructions are critically ambiguous.
+## Change Routing
 
-## Steering Configuration
-- Load entire `.kiro/steering/` as project memory
-- Default files: `product.md`, `tech.md`, `structure.md`
-- Custom files are supported (managed via `$kiro-steering-custom`)
+Classify before creating workflow artifacts.
+
+### Small change
+
+Use a direct, bounded Code Agent when all are true:
+
+- project scope, stable architecture, and existing approved Feature behavior remain unchanged;
+- no new user-visible capability is introduced;
+- no public contract or persistent-state shape changes;
+- the responsibility boundary is clear;
+- one Agent session can implement and verify it safely.
+
+Do not invoke BMAD, create cc-sdd documents, or start Ralph. Still require scoped implementation, risk-proportionate tests, review of the actual diff, and fresh verification evidence.
+
+### Feature
+
+Use cc-sdd when the Change adds or materially changes user behavior, a public contract, persistent state, external integration, cross-module responsibility, or requires multiple independently verifiable tasks. If it changes project scope, stable architecture, or evolution order, update and approve `docs/PRD.md` first; keep the Feature's detailed requirements in cc-sdd.
+
+Required Feature flow:
+
+1. `$kiro-spec-init "<feature description>; project design: docs/PRD.md"`
+2. `$kiro-spec-requirements <feature>` → human approval
+3. `$kiro-spec-design <feature>` → human approval
+4. `$kiro-spec-tasks <feature>` → human approval
+5. `rtk ./scripts/ralph-cc-sdd.sh <feature>`
+6. Ralph dispatches exactly one task per iteration through `$run-cc-sdd-task <feature> <task-id>`.
+7. The reserved `VALIDATE` item runs full Feature validation; a human accepts the result against `docs/PRD.md` and the approved Feature spec before merge or release.
+
+## Allowed Project Skills
+
+- `$bmad-prd` — create, update, or validate `docs/PRD.md`
+- `$kiro-spec-init`
+- `$kiro-spec-requirements`
+- `$kiro-spec-design`
+- `$kiro-spec-tasks`
+- `$run-cc-sdd-task` — Ralph-only implementation bridge
+
+Do not introduce BMAD architecture, epic/story, sprint, task, implementation, or review workflows. Do not add a second cc-sdd discovery/status/implementation layer or use Ralph's PRD/task-authoring features.
+
+## Project Memory and Language
+
+- Load `.kiro/steering/` as stable project policy. Use local `AGENTS.md` only for folder-specific domain or test contracts.
+- Respond in Simplified Chinese. Write cc-sdd documents in `spec.json.language`.
+- Preserve existing user changes and remain inside the selected Change/task boundary.
+- Never edit `.ralph-tui/generated/*.json` by hand.

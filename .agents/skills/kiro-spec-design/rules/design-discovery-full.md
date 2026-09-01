@@ -51,7 +51,7 @@ Conduct comprehensive research and analysis to ensure the technical design is ba
 - Identify domain boundaries and ownership seams required to avoid team conflicts
 - Consider scalability implications and operational concerns
 - Evaluate maintainability and team expertise
-- Document preferred pattern and rejected alternatives in `research.md`
+- Document the preferred pattern and concise rejected-alternative rationale in `design.md`
 
 ### 6. Risk Assessment
 **Identify Technical Risks**:
@@ -83,7 +83,7 @@ Conduct comprehensive research and analysis to ensure the technical design is ba
 4. Investigate similar open-source implementations
 
 ## Output Requirements
-Capture all findings that impact design decisions in `research.md` using the shared template:
+Capture every finding that changes implementation in the relevant `design.md` section:
 - Key insights affecting architecture, technology alignment, and contracts
 - Constraints discovered during research
 - Recommended approaches and selected architecture pattern with rationale

@@ -18,19 +18,19 @@ This is the only implementation entry point Ralph may invoke. The arguments are:
 1. Reject missing arguments, feature names outside `[a-z0-9._-]`, and task IDs other than a numeric cc-sdd ID or `VALIDATE`.
 2. Run `rtk node tools/workflow/cc-sdd-to-ralph.mjs <feature> --check` before reading implementation context. A failure means the Ralph projection is stale, the spec is unapproved, or the task graph is unsafe. Stop without a completion promise.
 3. Read `.kiro/specs/<feature>/spec.json` and confirm `approvals.tasks.approved` is `true`.
-4. Read `requirements.md`, `design.md`, `tasks.md`, and only the steering documents relevant to the selected boundary.
+4. Read `docs/PRD.md`, `requirements.md`, `design.md`, `tasks.md`, and only the steering documents relevant to the selected boundary.
 5. Record `git status --short` before execution. Preserve all pre-existing changes and never use a destructive reset.
 
 ## Normal Task IDs
 
 1. Locate exactly `<task-id>` in `tasks.md`. It must be incomplete and all `_Depends:_` tasks must be complete.
-2. Read `.agents/skills/kiro-impl/SKILL.md` completely and apply its **Manual Mode** to exactly `<feature> <task-id>`.
-3. Do not invoke unscoped `$kiro-impl <feature>` and do not implement, review, or mark any other executable leaf task complete.
+2. Read `references/implementation.md`, `references/review.md`, and `references/verify-completion.md` completely.
+3. Apply those protocols to exactly `<feature> <task-id>`; do not implement, review, or mark any other executable leaf task complete.
 4. The selected task is not complete until:
    - the required RED → GREEN → REFACTOR cycle has evidence when behavior changes;
    - task-relevant mechanical checks pass;
-   - `kiro-review` returns a parseable `APPROVED` verdict, using a fresh reviewer when the host supports it;
-   - `kiro-verify-completion` verifies the completion claim from fresh evidence;
+   - `references/review.md` returns a parseable `APPROVED` verdict, using a fresh reviewer when the host supports it;
+   - `references/verify-completion.md` verifies the completion claim from fresh evidence;
    - the selected checkbox is `[x]` in `tasks.md`.
 5. Re-read `tasks.md`. Confirm the selected task is checked and no other executable leaf task was newly checked by this run.
 6. Do not run the projection `--check` after marking the task complete: Ralph updates its JSON only after consuming the completion promise. The next iteration performs the consistency check.
@@ -38,9 +38,9 @@ This is the only implementation entry point Ralph may invoke. The arguments are:
 ## Reserved `VALIDATE` ID
 
 1. Confirm every executable task in `tasks.md` is complete.
-2. Read `.agents/skills/kiro-validate-impl/SKILL.md` completely and validate the entire `<feature>`.
+2. Read `references/validation.md` and `references/verify-completion.md` completely, then validate the entire `<feature>`.
 3. `NO-GO` or `MANUAL_VERIFY_REQUIRED` is not completion. Record the exact finding and stop.
-4. On `GO`, read `.agents/skills/kiro-verify-completion/SKILL.md` completely and verify the feature-level claim with fresh test, build, smoke, traceability, and boundary evidence.
+4. On `GO`, verify the feature-level claim with fresh test, build, smoke, traceability, and boundary evidence.
 
 ## Ralph Result Protocol
 

@@ -16,7 +16,8 @@ tools/workflow/            Development-workflow adapters; never product runtime
 
 ## Change Rules
 
-- A cc-sdd task must declare concrete file or component boundaries.
+- A small Change handled directly by a Code Agent must declare one concrete responsibility boundary and remain within it.
+- A Feature's cc-sdd task must declare concrete file or component boundaries.
 - Keep UI workflow-free: `apps/ysda` communicates through the existing service API rather than embedding domain workflow logic.
 - Keep external protocol/database details in adapters; keep domain policy in core; keep lifecycle coordination in runtime; keep persistence mechanics in store.
 - Do not move responsibility across crates merely to make one task easier.

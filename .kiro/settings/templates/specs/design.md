@@ -60,7 +60,7 @@ List the kinds of changes that should force dependent specs or consumers to re-c
 
 ## Architecture
 
-> Reference detailed discovery notes in `research.md` only for background; keep design.md self-contained for reviewers by capturing all decisions and contracts here.
+> Keep design.md self-contained for reviewers by capturing every decision and contract needed downstream.
 > Capture key decisions in text and let diagrams carry structural detail—avoid repeating the same information in prose.
 > Supporting sections below should remain as light as possible unless they materially clarify the responsibility boundary, dependency rules, or integration seams.
 
@@ -91,7 +91,7 @@ When modifying existing systems:
 | Messaging / Events | | | |
 | Infrastructure / Runtime | | | |
 
-> Keep rationale concise here and, when more depth is required (trade-offs, benchmarks), add a short summary plus pointer to the Supporting References section and `research.md` for raw investigation notes.
+> Keep rationale concise here and place decision-relevant trade-offs or benchmarks in Supporting References.
 
 ## File Structure Plan
 
@@ -175,7 +175,7 @@ Group detailed blocks by domain or architectural layer. For each detailed compon
 - Outbound: Component/service name — purpose (Criticality)
 - External: Service/library — purpose (Criticality)
 
-Summarize external dependency findings here; deeper investigation (API signatures, rate limits, migration notes) lives in `research.md`.
+Summarize external dependency findings here, including any API signatures, rate limits, or migration notes that constrain implementation.
 
 **Contracts**: Service [ ] / API [ ] / Event [ ] / Batch [ ] / State [ ]  ← check only the ones that apply.
 
@@ -328,4 +328,4 @@ Include a Mermaid flowchart showing migration phases when schema/data movement i
 ## Supporting References (Optional)
 - Create this section only when keeping the information in the main body would hurt readability (e.g., very long TypeScript definitions, vendor option matrices, exhaustive schema tables). Keep decision-making context in the main sections so the design stays self-contained.
 - Link to the supporting references from the main text instead of inlining large snippets.
-- Background research notes and comparisons continue to live in `research.md`, but their conclusions must be summarized in the main design.
+- Raw investigation remains temporary working context; only conclusions and evidence needed for implementation belong in this design.

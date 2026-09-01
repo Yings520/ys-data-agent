@@ -33,12 +33,12 @@ The production-like release gate is:
 rtk bash scripts/v0.2-release-gate.sh
 ```
 
-It additionally exercises Docker-backed PostgreSQL integration, query evals, model protocol behavior, doctor, export, TUI, and renderer dependency/boundary checks. If Docker or another runtime prerequisite is unavailable, report `MANUAL_VERIFY_REQUIRED`; do not claim the full release gate passed.
+It additionally exercises PostgreSQL integration, query evals, model protocol behavior, doctor, export, TUI, and renderer dependency/boundary checks.
 
 ## Workflow Toolchain
 
-- BMAD produces Product Brief / PRD only.
-- cc-sdd owns requirements, design, tasks, TDD, review, and validation.
-- Ralph TUI selects the next generated work item and starts Codex serially.
+- BMAD owns only `docs/PRD.md`, the whole-project product, stable architecture, and evolution Source of Truth.
+- Small Changes go directly to one bounded Code Agent and still require tests, diff review, and fresh verification.
+- Features use cc-sdd requirements, design, and tasks; Ralph TUI then selects the next generated work item and starts Codex serially.
 - `scripts/codex-ralph` is the compatibility command for Ralph TUI 0.12 and Codex CLI 0.151: Ralph full-auto is disabled, the wrapper supplies Codex's current `-a never` global flag, and raw JSONL bypasses RTK so Ralph can parse it. Re-run `rtk ralph-tui doctor` after either tool is upgraded.
 - Node.js ESM tooling under `tools/workflow/` compiles cc-sdd tasks into Ralph JSON without third-party packages.

@@ -22,7 +22,7 @@ Do not silently expand v0.2 into Analysis, Build/Change, Operate, ML Data Prep, 
 
 ## Product Source of Truth
 
-- BMAD Product Brief / PRD owns product intent, release scope, FR/NFR, non-goals, and success signals.
-- Steering records only stable product context needed across features.
-- Every cc-sdd `requirements.md` must reference the approved BMAD PRD by repository path, commit, and covered section IDs. Do not duplicate the full PRD here.
-- If a cc-sdd spec conflicts with the PRD, stop and reconcile the PRD or spec before implementation.
+- `docs/PRD.md` is the project's only project-wide product, stable architecture, and evolution design. It owns product intent, release scope, project-level FR/NFR, non-goals, invariants, and evolution order.
+- BMAD may create, update, or validate only that file. Do not create one PRD per Change or Feature, and do not place Feature-level requirements in it.
+- Steering records only stable context needed across Changes.
+- Every cc-sdd `requirements.md` must reference `docs/PRD.md` and the covered section IDs. If a spec conflicts with it, stop and reconcile before implementation.
