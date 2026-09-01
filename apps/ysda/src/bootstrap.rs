@@ -1569,9 +1569,7 @@ mod tests {
         ModelResponse, RunId, RunSnapshot, RunStatus, TaskId, ToolCall, ToolCallId, WorkflowKind,
         WorkspaceId,
     };
-    use ys_agent_runtime::{
-        HarnessStep, LoopDriver, RunScheduler, StepAccounting, StepOutcome,
-    };
+    use ys_agent_runtime::{HarnessStep, LoopDriver, RunScheduler, StepAccounting, StepOutcome};
 
     struct WaitingHarness {
         calls: Arc<AtomicUsize>,
@@ -1627,9 +1625,8 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             called: Arc::new(Notify::new()),
         });
-        let scheduler = BackgroundScheduler::new(Arc::new(LoopDriver::with_defaults(
-            harness.clone(),
-        )));
+        let scheduler =
+            BackgroundScheduler::new(Arc::new(LoopDriver::with_defaults(harness.clone())));
         let run_id = RunId::new();
 
         scheduler.schedule(run_id).await.expect("first schedule");
