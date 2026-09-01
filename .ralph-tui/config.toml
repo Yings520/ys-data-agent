@@ -1,0 +1,15 @@
+agent = "codex"
+tracker = "json"
+maxIterations = 10
+iterationDelay = 1000
+outputDir = ".ralph-tui/iterations"
+progressFile = ".ralph-tui/progress.md"
+autoCommit = false
+prompt_template = ".ralph-tui-prompt.hbs"
+envExclude = ["*_TOKEN", "*_PASSWORD", "DATABASE_URL", "YSDA_LLM_API_KEY", "YSDA_DATA_SOURCE_URL"]
+
+[errorHandling]
+strategy = "abort"
+maxRetries = 0
+retryDelayMs = 1000
+continueOnNonZeroExit = false

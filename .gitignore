@@ -6,3 +6,6 @@ docs/superpowers/
 .DS_Store
 /_bmad/config.user.toml
 /_bmad/custom/config.user.toml
+/.ralph-tui/generated/
+/.ralph-tui/iterations/
+/.ralph-tui/progress.md

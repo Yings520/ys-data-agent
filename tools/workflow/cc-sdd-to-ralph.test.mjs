@@ -16,27 +16,17 @@ import {
 const scriptPath = fileURLToPath(
   new URL("./cc-sdd-to-ralph.mjs", import.meta.url),
 );
-
-const validTasks = `- [ ] 1.1 Compile the projection
-  - The generated JSON contains the current task.
-  - _Requirements: 1.1_
-  - _Boundary: tools/workflow/cc-sdd-to-ralph.mjs_
-  - _Depends: none_
-- [ ] 1.2 Verify the projection
-  - Stale generated JSON is rejected.
-  - _Requirements: 1.2_
-  - _Boundary: tools/workflow/cc-sdd-to-ralph.test.mjs_
-  - _Depends: 1.1_
-`;
-
-const approvedSpec = `${JSON.stringify(
-  {
-    feature_name: "sample-feature",
-    approvals: { tasks: { generated: true, approved: true } },
-  },
-  null,
-  2,
-)}\n`;
+const fixtureDirectory = fileURLToPath(
+  new URL("./fixtures/sample-spec/", import.meta.url),
+);
+const validTasks = await readFile(
+  path.join(fixtureDirectory, "tasks.md"),
+  "utf8",
+);
+const approvedSpec = await readFile(
+  path.join(fixtureDirectory, "spec.json"),
+  "utf8",
+);
 
 function runCli(root, ...args) {
   return spawnSync(process.execPath, [scriptPath, ...args], {
