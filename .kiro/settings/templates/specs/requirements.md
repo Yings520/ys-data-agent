@@ -3,6 +3,13 @@
 ## Introduction
 {{INTRODUCTION}}
 
+## Upstream Product Source
+- **BMAD PRD**: {{BMAD_PRD_PATH}}
+- **Source commit**: {{BMAD_PRD_COMMIT}}
+- **Covered PRD sections**: {{BMAD_PRD_SECTIONS}}
+
+> Product intent changes must be reconciled in the BMAD PRD before this contract is approved. Use an explicit path, commit, and section list; do not copy the whole PRD into this document.
+
 <!-- Optional when scope could be misread or the feature touches adjacent systems/specs -->
 ## Boundary Context (Optional)
 - **In scope**: {{IN_SCOPE_BEHAVIORS}}

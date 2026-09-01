@@ -2,6 +2,13 @@
 
 Kiro-style Spec-Driven Development on an agentic SDLC
 
+## Workflow Ownership
+
+- BMAD is limited to `$bmad-product-brief` and `$bmad-prd` for product intent. Do not invoke BMAD architecture, epic/story, sprint, build, code-review, or implementation workflows in this repository.
+- cc-sdd is the sole development workflow for requirements, design, tasks, implementation review, and validation.
+- Ralph TUI is the sole outer task-loop orchestrator. When Ralph dispatches a task, use `$run-cc-sdd-task <feature> <task-id>` and never start the unscoped all-task form of `$kiro-impl`.
+- `.kiro/specs/<feature>/tasks.md` is authoritative task state. `.ralph-tui/generated/*.json` is a disposable scheduling projection and must never redefine requirements or completion.
+
 ## Project Memory
 Project memory keeps persistent guidance (steering, specs notes, component docs) so Codex honors your standards each run. Treat it as the long-lived source of truth for patterns, conventions, and decisions.
 
