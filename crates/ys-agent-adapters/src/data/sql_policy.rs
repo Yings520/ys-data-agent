@@ -513,6 +513,20 @@ mod tests {
     }
 
     #[test]
+    fn allows_the_captured_daily_sales_query() {
+        let policy = SqlReadOnlyPolicy::new(SupportedDialect::SQLite, 1_024);
+        let decision = policy.evaluate(
+            "SELECT substr(paid_at, 1, 10) AS sale_date, SUM(paid_amount) AS total_sales \
+             FROM mart_orders WHERE paid_at >= '2026-07-01' AND paid_at < '2026-08-01' \
+             GROUP BY substr(paid_at, 1, 10) ORDER BY sale_date;",
+            &scope(),
+        );
+
+        assert_eq!(decision.disposition, SqlPolicyDisposition::Allowed);
+        assert_eq!(decision.referenced_columns, vec!["paid_amount", "paid_at"]);
+    }
+
+    #[test]
     fn output_alias_cannot_mask_a_denied_source_column() {
         let policy = SqlReadOnlyPolicy::new(SupportedDialect::SQLite, 1_024);
         let decision = policy.evaluate(
