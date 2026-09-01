@@ -192,7 +192,9 @@ pub fn material_ambiguity(question: &str) -> Option<ClarificationNeed> {
     if ambiguous_time {
         return Some(ClarificationNeed {
             id: "query-time-range-v1".to_owned(),
-            question: "Which exact time range and timezone should I use?".to_owned(),
+            question:
+                "Which time period should I use—for example, yesterday, last week, or July 2026?"
+                    .to_owned(),
             reason: "material_query_ambiguity".to_owned(),
         });
     }
@@ -222,7 +224,7 @@ pub fn requires_current_freshness(question: &str) -> bool {
 mod tests {
     use ys_agent_core::QueryIntent;
 
-    use super::classify_intent;
+    use super::{classify_intent, material_ambiguity};
 
     #[test]
     fn data_requests_remain_provisional_until_the_registry_resolves_them() {
@@ -233,5 +235,16 @@ mod tests {
         ] {
             assert_eq!(classify_intent(question), QueryIntent::AdHocRead);
         }
+    }
+
+    #[test]
+    fn ambiguous_time_uses_a_natural_language_question() {
+        let clarification = material_ambiguity("Show GMV recently").expect("clarification");
+
+        assert!(clarification.question.contains("yesterday"));
+        assert!(clarification.question.contains("last week"));
+        assert!(!clarification.question.contains("RFC3339"));
+        assert!(!clarification.question.contains("UTC"));
+        assert!(!clarification.question.contains("timezone"));
     }
 }

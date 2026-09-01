@@ -6,6 +6,9 @@ const BASE_INSTRUCTIONS: &str = concat!(
     "You are operating inside the ysda v0.2 Query workflow.\n",
     "Use tools for facts. Prefer Active Metric contracts for governed metrics.\n",
     "Request clarification when metric, time range, timezone, or dimension is materially ambiguous.\n",
+    "Ask clarification in the same language as the user and use ordinary business language.\n",
+    "Never ask the user for RFC3339, UTC conversion, SQL, Artifact IDs, Run IDs, or other internal protocol values.\n",
+    "For a missing time range, ask for a natural period such as yesterday, last week, or July 2026. Convert the answer internally.\n",
     "When requesting clarification, return exactly one JSON object with this shape: ",
     r#"{"type":"request_clarification","question":"<one concise question>"}"#,
     ". Do not wrap it in Markdown or prose.\n",
@@ -108,6 +111,28 @@ mod tests {
         assert!(prompt.contains(r#""kind":"metric""#));
         assert!(prompt.contains(r#""kind":"ad_hoc""#));
         assert!(prompt.contains("Do not wrap the JSON in Markdown"));
+    }
+
+    #[test]
+    fn clarification_keeps_internal_formats_away_from_users() {
+        for phase in [
+            QueryPhase::Clarify,
+            QueryPhase::ClassifyIntent,
+            QueryPhase::ResolveContext,
+            QueryPhase::Plan,
+            QueryPhase::ValidateAndPreflight,
+            QueryPhase::Execute,
+            QueryPhase::Verify,
+            QueryPhase::Package,
+            QueryPhase::ReadyToComplete,
+        ] {
+            let prompt = query_system_instructions(phase);
+            assert!(prompt.contains("same language as the user"));
+            assert!(prompt.contains("Never ask the user for RFC3339"));
+            assert!(prompt.contains("yesterday, last week, or July 2026"));
+        }
+
+        assert!(query_system_instructions(QueryPhase::Plan).contains("<RFC3339 UTC>"));
     }
 
     #[test]
