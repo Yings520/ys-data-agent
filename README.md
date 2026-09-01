@@ -257,6 +257,7 @@ Restricted export fails closed. CSV uses the persisted result schema, Markdown u
 Fast local checks:
 
 ```bash
+rtk node --test tools/workflow/*.test.mjs
 rtk cargo fmt --all --check
 rtk cargo clippy --workspace --all-targets --all-features -- -D warnings
 rtk cargo test --workspace
@@ -271,6 +272,11 @@ rtk ./scripts/v0.2-release-gate.sh
 The gate uses Fake, Replay, or Wiremock model providers, including a focused two-stage model-protocol test. It requires no live model request and spends no model tokens.
 
 ## Agentic development workflow
+
+For the complete step-by-step operating guide—including which commands belong in
+the Codex chat versus the terminal, approval checkpoints, Ralph recovery, and a
+copyable example—see
+[BMAD + cc-sdd + Ralph TUI 使用手册](docs/BMAD-CC-SDD-RALPH-USAGE.md).
 
 This repository uses one product path, one development path, and one outer execution loop:
 
