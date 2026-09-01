@@ -7,8 +7,10 @@ use async_trait::async_trait;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use ys_agent_core::{
-    AgentAction, CommandId, CoreError, CoreResult, EventActor, ModelResponse, PendingRunEvent,
-    Principal, RunEventKind, RunId, RunStatus, RuntimeStore, StepId, TaskStatus, WorkspaceId,
+    AgentAction, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactKind, ArtifactMetadata,
+    ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult, EventActor,
+    ModelResponse, PendingRunEvent, Principal, PutArtifact, RunEventKind, RunId, RunStatus,
+    RuntimeCommandBatch, RuntimeStore, Sensitivity, StepId, TaskId, TaskStatus, WorkspaceId,
 };
 use ys_agent_runtime::{
     AgentServiceApi, CoordinationDecision, Coordinator, CreateTaskRequest, InProcessAgentService,
@@ -41,9 +43,11 @@ impl RunScheduler for CountingScheduler {
 struct ServiceFixture {
     _directory: TempDir,
     store: Arc<SqliteRuntimeStore>,
+    artifacts: Arc<LocalArtifactStore>,
     service: Arc<InProcessAgentService>,
     coordinator: RuleBasedCoordinator,
     scheduler: Arc<CountingScheduler>,
+    workspace_id: WorkspaceId,
     principal: Principal,
     session_id: ys_agent_core::SessionId,
 }
@@ -71,7 +75,7 @@ impl ServiceFixture {
         let mut service = InProcessAgentService::with_event_capacity(
             workspace_id,
             store.clone(),
-            artifacts,
+            artifacts.clone(),
             scheduler.clone(),
             2,
         );
@@ -87,9 +91,11 @@ impl ServiceFixture {
         Self {
             _directory: directory,
             store,
+            artifacts,
             service,
             coordinator: RuleBasedCoordinator,
             scheduler,
+            workspace_id,
             principal,
             session_id: session.id,
         }
@@ -106,6 +112,110 @@ impl ServiceFixture {
     async fn created_run_count(&self) -> u64 {
         self.store.run_count().await.expect("count runs")
     }
+
+    async fn persist_internal_artifact(
+        &self,
+        kind: ArtifactKind,
+        bytes: Vec<u8>,
+    ) -> ArtifactMetadata {
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let metadata = self
+            .artifacts
+            .put(PutArtifact {
+                workspace_id: self.workspace_id,
+                task_id,
+                run_id,
+                kind,
+                media_type: "application/json".to_owned(),
+                bytes,
+                sensitivity: Sensitivity::Internal,
+                owner: Some(self.principal.id),
+                retention_policy: None,
+                expires_at: None,
+                producer_step_id: None,
+            })
+            .await
+            .expect("persist Artifact bytes");
+        let command_id = CommandId::new();
+        self.store
+            .commit_command(RuntimeCommandBatch {
+                command_id,
+                command_fingerprint: format!("seed-artifact-{}", metadata.id),
+                receipt: CommandReceipt {
+                    command_id,
+                    command_fingerprint: format!("seed-artifact-{}", metadata.id),
+                    result_kind: CommandResultKind::NoopReplay,
+                    session_id: None,
+                    task_id: Some(task_id),
+                    run_id: Some(run_id),
+                    artifact_id: Some(metadata.id),
+                    message: None,
+                    capability: None,
+                },
+                new_session: None,
+                new_task: None,
+                new_run_snapshot: None,
+                new_artifact: Some(metadata.clone()),
+                pending_events: Vec::new(),
+                snapshot_update: None,
+            })
+            .await
+            .expect("index Artifact metadata");
+        metadata
+    }
+}
+
+#[tokio::test]
+async fn tui_preview_reads_complete_internal_query_artifacts_only() {
+    let fixture = ServiceFixture::new().await;
+    let query_bytes = serde_json::to_vec(&serde_json::json!({
+        "answer_summary": "2026年8月13日至15日的GMV查询已完成。",
+        "verification_padding": "x".repeat(4_096),
+    }))
+    .expect("serialize oversized Query Artifact");
+    assert!(query_bytes.len() > 4_096);
+    let query = fixture
+        .persist_internal_artifact(ArtifactKind::Query, query_bytes.clone())
+        .await;
+
+    let query_view = fixture
+        .service
+        .get_artifact(
+            &query.id,
+            ArtifactAccessContext {
+                workspace_id: fixture.workspace_id,
+                principal_id: fixture.principal.id,
+                purpose: ArtifactAccessPurpose::TuiPreview,
+                max_sensitivity: Sensitivity::Internal,
+            },
+        )
+        .await
+        .expect("read TUI Query Artifact preview");
+
+    assert!(!query_view.truncated);
+    assert_eq!(query_view.preview, query_bytes);
+
+    let result_bytes = vec![b'x'; 4_097];
+    let result = fixture
+        .persist_internal_artifact(ArtifactKind::QueryResult, result_bytes)
+        .await;
+    let result_view = fixture
+        .service
+        .get_artifact(
+            &result.id,
+            ArtifactAccessContext {
+                workspace_id: fixture.workspace_id,
+                principal_id: fixture.principal.id,
+                purpose: ArtifactAccessPurpose::TuiPreview,
+                max_sensitivity: Sensitivity::Internal,
+            },
+        )
+        .await
+        .expect("read TUI result Artifact preview");
+
+    assert!(result_view.truncated);
+    assert_eq!(result_view.preview.len(), 4_096);
 }
 
 fn front_door_model(

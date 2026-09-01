@@ -1273,8 +1273,10 @@ impl AgentServiceApi for InProcessAgentService {
             .artifacts
             .get(&ArtifactRef::new(metadata.clone()), &access)
             .await?;
-        let full_safe_query = access.purpose == ArtifactAccessPurpose::RuntimeVerification
-            && access.max_sensitivity <= Sensitivity::Internal
+        let full_safe_query = matches!(
+            access.purpose,
+            ArtifactAccessPurpose::RuntimeVerification | ArtifactAccessPurpose::TuiPreview
+        ) && access.max_sensitivity <= Sensitivity::Internal
             && metadata.kind == ArtifactKind::Query
             && metadata.sensitivity <= Sensitivity::Internal;
         let preview_limit = if full_safe_query {
