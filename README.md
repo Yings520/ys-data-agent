@@ -257,6 +257,7 @@ Restricted export fails closed. CSV uses the persisted result schema, Markdown u
 Fast local checks:
 
 ```bash
+rtk node --test tools/workflow/*.test.mjs
 rtk cargo fmt --all --check
 rtk cargo clippy --workspace --all-targets --all-features -- -D warnings
 rtk cargo test --workspace
@@ -269,6 +270,52 @@ rtk ./scripts/v0.2-release-gate.sh
 ```
 
 The gate uses Fake, Replay, or Wiremock model providers, including a focused two-stage model-protocol test. It requires no live model request and spends no model tokens.
+
+## Agentic development workflow
+
+For the complete step-by-step operating guide—including which commands belong in
+the Codex chat versus the terminal, approval checkpoints, Ralph recovery, and a
+copyable example—see
+[BMAD + cc-sdd + Ralph TUI 使用手册](docs/BMAD-CC-SDD-RALPH-USAGE.md).
+
+[`docs/PRD.md`](docs/PRD.md) is the single project-wide product, stable architecture, and evolution design for ys-data-agent. Every Change is routed by impact:
+
+```text
+docs/PRD.md
+  ↓
+Change
+  ├── small change → direct Code Agent → code + test + review + fresh verification
+  └── Feature      → cc-sdd requirements.md → design.md → tasks.md
+                                      ↓
+                                  Ralph TUI
+                                      ↓
+                              one-task Code Agent Loop
+```
+
+Use BMAD only when project-wide product intent, stable architecture, release boundaries, or evolution direction changes:
+
+```text
+$bmad-prd
+```
+
+For a Feature, create and approve the cc-sdd engineering contract:
+
+```text
+$kiro-spec-init "<feature description>; project design: docs/PRD.md"
+$kiro-spec-requirements <feature>
+$kiro-spec-design <feature>
+$kiro-spec-tasks <feature>
+```
+
+Human-review each document in order and record its approval in `spec.json`. Start Ralph only after task approval:
+
+```bash
+rtk ./scripts/ralph-cc-sdd.sh <feature>
+```
+
+`docs/PRD.md` is the project-design source of truth. A Feature keeps only `requirements.md`, `design.md`, and `tasks.md` as human-maintained engineering documents; `spec.json` stores approval state. Feature requirements never move into the project PRD. The launcher compiles authoritative `tasks.md` into `.ralph-tui/generated/<feature>.json`, which is disposable and must not be edited. Ralph invokes `$run-cc-sdd-task` for exactly one task per iteration. A task completes only after scoped implementation, tests, independent review, and fresh verification. The final `VALIDATE` item runs Feature-level validation; a human accepts the outcome against `docs/PRD.md` and the approved Feature spec before merge or release.
+
+A small change that preserves product behavior, public contracts, persistent state, and responsibility boundaries goes directly to a bounded Code Agent. It creates no BMAD or cc-sdd documents and does not start Ralph, but still closes with tests, diff review, and fresh verification.
 
 ## Recovery promise
 

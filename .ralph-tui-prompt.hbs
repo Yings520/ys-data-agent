@@ -1,0 +1,37 @@
+## Current cc-sdd Work Item
+
+- ID: {{taskId}}
+- Title: {{taskTitle}}
+
+{{#if taskDescription}}
+## Dispatch Context
+
+{{taskDescription}}
+{{/if}}
+
+{{#if acceptanceCriteria}}
+## Acceptance Criteria
+
+{{acceptanceCriteria}}
+{{/if}}
+
+{{#if dependsOn}}
+## Satisfied Dependencies
+
+{{dependsOn}}
+{{/if}}
+
+{{#if recentProgress}}
+## Non-authoritative Recent Progress
+
+{{recentProgress}}
+{{/if}}
+
+## Required Workflow
+
+1. Extract the feature name from `Dispatch Context`.
+2. Invoke `$run-cc-sdd-task <feature> {{taskId}}`.
+3. Execute no other cc-sdd task and do not edit `.ralph-tui/generated/*.json`.
+4. Treat `.kiro/specs/<feature>/tasks.md`, the approved cc-sdd spec, the actual diff, and fresh command evidence as authoritative. Recent progress is only a hint.
+5. Do not emit Ralph's completion promise yourself. Only `$run-cc-sdd-task` may emit it after its reviewer-gated fresh verification succeeds.
+6. If the skill reports a blocker, preserve its evidence, do not widen scope, and end without a completion promise.
