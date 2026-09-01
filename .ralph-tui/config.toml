@@ -1,4 +1,5 @@
 agent = "codex"
+command = "./scripts/codex-ralph"
 tracker = "json"
 maxIterations = 10
 iterationDelay = 1000
@@ -13,3 +14,7 @@ strategy = "abort"
 maxRetries = 0
 retryDelayMs = 1000
 continueOnNonZeroExit = false
+
+[agentOptions]
+fullAuto = false
+sandbox = "workspace-write"

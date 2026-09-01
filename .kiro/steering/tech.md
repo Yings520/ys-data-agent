@@ -40,4 +40,5 @@ It additionally exercises Docker-backed PostgreSQL integration, query evals, mod
 - BMAD produces Product Brief / PRD only.
 - cc-sdd owns requirements, design, tasks, TDD, review, and validation.
 - Ralph TUI selects the next generated work item and starts Codex serially.
+- `scripts/codex-ralph` is the compatibility command for Ralph TUI 0.12 and Codex CLI 0.151: Ralph full-auto is disabled, the wrapper supplies Codex's current `-a never` global flag, and raw JSONL bypasses RTK so Ralph can parse it. Re-run `rtk ralph-tui doctor` after either tool is upgraded.
 - Node.js ESM tooling under `tools/workflow/` compiles cc-sdd tasks into Ralph JSON without third-party packages.

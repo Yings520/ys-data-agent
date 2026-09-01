@@ -132,6 +132,7 @@ Ralph 每轮只传入 `<feature>` 与 `<task-id>`。项目级 `run-cc-sdd-task` 
 - 不为一次会话可完成的小修改强制创建 PRD、完整 spec 或 Ralph run；
 - 不默认并行修改同一 worktree；
 - Ralph `autoCommit=false`，避免 stage 用户已有修改；
+- Ralph 必须通过 `ralph-tui doctor` 的真实 Agent preflight；当前 Ralph TUI 0.12 通过项目 wrapper 使用 Codex CLI 的现行 approval flag，避免旧 `--full-auto` 参数导致假安装；
 - `.ralph-tui/generated/`、progress 和 iteration logs 不提交 Git。
 
 ## 9. 变更回流

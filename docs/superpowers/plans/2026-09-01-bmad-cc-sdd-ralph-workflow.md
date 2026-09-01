@@ -23,6 +23,7 @@
 - `tools/workflow/cc-sdd-to-ralph.test.mjs` — converter 单元和 CLI 行为测试。
 - `.ralph-tui/config.toml` — 串行 Codex、无 auto-commit 的 Ralph 默认配置。
 - `.ralph-tui-prompt.hbs` — 强制调用单任务 skill 的项目 prompt。
+- `scripts/codex-ralph` — 适配 Ralph TUI 0.12 与当前 Codex CLI approval flags，同时保留原始 JSONL。
 - `scripts/ralph-cc-sdd.sh` — 编译 spec task projection 并启动 Ralph。
 - `.gitignore` — 忽略派生 JSON、progress 和 iteration logs。
 
@@ -393,6 +394,7 @@ Write:
 
 ```toml
 agent = "codex"
+command = "./scripts/codex-ralph"
 tracker = "json"
 maxIterations = 50
 iterationDelay = 1000
@@ -400,9 +402,17 @@ outputDir = ".ralph-tui/iterations"
 progressFile = ".ralph-tui/progress.md"
 autoCommit = false
 prompt_template = ".ralph-tui-prompt.hbs"
+
+[agentOptions]
+fullAuto = false
+sandbox = "workspace-write"
 ```
 
-- [ ] **Step 4: Create the launcher**
+- [ ] **Step 4: Create the Codex compatibility command**
+
+Create executable `scripts/codex-ralph` that runs `codex -a never` with Ralph's remaining arguments unchanged. Do not route this command through RTK because Ralph requires Codex's raw JSONL event stream. Verify with `rtk ralph-tui doctor`; this catches the obsolete `--full-auto` incompatibility in Ralph TUI 0.12.
+
+- [ ] **Step 5: Create the launcher**
 
 Write a Bash script that validates one feature argument, runs the converter, then executes:
 
@@ -410,7 +420,7 @@ Write a Bash script that validates one feature argument, runs the converter, the
 rtk ralph-tui run --prd ".ralph-tui/generated/${feature}.json" --serial --on-error abort
 ```
 
-- [ ] **Step 5: Ignore runtime state**
+- [ ] **Step 6: Ignore runtime state**
 
 Append:
 
@@ -420,22 +430,24 @@ Append:
 /.ralph-tui/progress.md
 ```
 
-- [ ] **Step 6: Verify syntax and active Ralph template**
+- [ ] **Step 7: Verify syntax and active Ralph template**
 
 Run:
 
 ```bash
 rtk bash -n scripts/ralph-cc-sdd.sh
+rtk bash -n scripts/codex-ralph
 rtk ralph-tui config show
 rtk ralph-tui template show
+rtk ralph-tui doctor
 ```
 
-Expected: Bash syntax passes, config reports `autoCommit=false`, and template contains `$run-cc-sdd-task`.
+Expected: Bash syntax passes, config reports `autoCommit=false`, template contains `$run-cc-sdd-task`, and Ralph doctor reports Codex healthy.
 
-- [ ] **Step 7: Record an atomic commit point**
+- [ ] **Step 8: Record an atomic commit point**
 
 ```bash
-git add .agents/skills/run-cc-sdd-task .ralph-tui-prompt.hbs .ralph-tui/config.toml scripts/ralph-cc-sdd.sh .gitignore
+git add .agents/skills/run-cc-sdd-task .ralph-tui-prompt.hbs .ralph-tui/config.toml scripts/codex-ralph scripts/ralph-cc-sdd.sh .gitignore
 git commit -m "feat(workflow): add Ralph single-task execution harness"
 ```
 

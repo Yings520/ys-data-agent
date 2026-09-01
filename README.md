@@ -270,6 +270,46 @@ rtk ./scripts/v0.2-release-gate.sh
 
 The gate uses Fake, Replay, or Wiremock model providers, including a focused two-stage model-protocol test. It requires no live model request and spends no model tokens.
 
+## Agentic development workflow
+
+This repository uses one product path, one development path, and one outer execution loop:
+
+```text
+BMAD Product Brief / PRD
+        ↓
+cc-sdd requirements → design → tasks
+        ↓
+Ralph TUI dispatches one reviewer-gated cc-sdd task at a time
+        ↓
+cc-sdd integration validation → human product acceptance
+```
+
+Use BMAD only for product intent:
+
+```text
+$bmad-product-brief   # optional when the product direction is not settled
+$bmad-prd
+```
+
+After the PRD is approved, create and approve the cc-sdd feature contract:
+
+```text
+$kiro-spec-init <feature description and PRD path>
+$kiro-spec-requirements <feature>
+$kiro-spec-design <feature>
+$kiro-spec-tasks <feature>
+```
+
+Start the autonomous outer loop only after `spec.json` records task approval:
+
+```bash
+rtk ./scripts/ralph-cc-sdd.sh <feature>
+```
+
+`.kiro/specs/<feature>/tasks.md` is authoritative. The launcher compiles it into `.ralph-tui/generated/<feature>.json`; that JSON is disposable runtime state and must not be edited. Ralph invokes `$run-cc-sdd-task` for exactly one task per iteration. The task can complete only after cc-sdd TDD, task-local review, and fresh verification. The generated final `VALIDATE` item runs feature-level validation; a human still accepts the product outcome against the BMAD PRD before Merge or Release.
+
+Small, single-session fixes do not require BMAD or Ralph. Use cc-sdd discovery to decide whether a formal spec earns its cost.
+
 ## Recovery promise
 
 v0.2 resumes between durable Steps and after `WaitingForInput`. A clarification answer resumes the same Run after restart. If a process dies while SQL is in flight, the ToolCall becomes indeterminate. A low-cost read may create a new ToolCall only after explicit resume. A high-cost, cost-unknown, or remotely identifiable call waits for reconciliation, cancellation, or user confirmation.
