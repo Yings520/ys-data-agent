@@ -107,6 +107,12 @@ async fn each_live_model_phase_receives_the_runtime_identities_it_must_reuse() {
     let plan = runtime_state(request_for_phase(&requests, "Plan"));
     assert_eq!(plan["source_id"], "sqlite-demo");
     assert_eq!(plan["intent"], "governed_metric");
+    assert!(
+        plan["current_time_utc"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z'))
+    );
+    assert_eq!(plan["workspace_timezone"], "UTC");
     assert!(plan["artifacts"]["metric_evidence"]["artifact_id"].is_string());
     assert!(plan["artifacts"]["metric_evidence"]["content_hash"].is_string());
     assert!(

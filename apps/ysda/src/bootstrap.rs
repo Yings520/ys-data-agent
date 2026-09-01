@@ -1211,6 +1211,7 @@ async fn assemble_scheduler(
         HarnessConfig {
             workspace_id,
             principal,
+            workspace_timezone: config.timezone.clone(),
             query_budget: config.query_budget.clone(),
             data_scope,
             connector_tools: ConnectorToolAvailability::all_query_tools(),
@@ -1365,6 +1366,7 @@ pub async fn assemble_deterministic_query_runtime(
         HarnessConfig {
             workspace_id,
             principal: principal.clone(),
+            workspace_timezone: config.timezone.clone().unwrap_or_default(),
             query_budget,
             data_scope,
             connector_tools,

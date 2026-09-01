@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::json;
 use ys_agent_core::{
@@ -29,6 +29,7 @@ use crate::{
 pub struct HarnessConfig {
     pub workspace_id: WorkspaceId,
     pub principal: Principal,
+    pub workspace_timezone: String,
     pub query_budget: QueryBudget,
     pub data_scope: AllowedDataScope,
     pub connector_tools: ConnectorToolAvailability,
@@ -250,11 +251,14 @@ impl Harness {
     fn runtime_query_state_message(
         &self,
         state: &QueryWorkflowState,
+        now: &DateTime<Utc>,
     ) -> CoreResult<ys_agent_core::ModelMessage> {
         let content = serde_json::to_string(&json!({
             "phase": state.phase,
             "source_id": self.config.data_scope.source_id,
             "intent": state.intent,
+            "current_time_utc": now.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "workspace_timezone": self.config.workspace_timezone.as_str(),
             "artifacts": {
                 "metric_evidence": state.metric_evidence.as_ref().map(artifact_identity),
                 "schema_evidence": state.schema_evidence.iter().map(artifact_identity).collect::<Vec<_>>(),
@@ -444,6 +448,7 @@ impl Harness {
         current: RunSnapshot,
         state: QueryWorkflowState,
     ) -> CoreResult<StepOutcome> {
+        let now = Utc::now();
         let step_id = StepId::new();
         let view = ToolViewBuilder::new(self.catalog.as_ref())
             .for_workflow(current.workflow)
@@ -467,7 +472,7 @@ impl Harness {
                     ),
                     requires_freshness: state.phase == QueryPhase::Verify,
                     recent_task_summary: None,
-                    now: Utc::now(),
+                    now,
                 },
                 &view_snapshot,
             )
@@ -494,7 +499,7 @@ impl Harness {
         )?;
         request
             .messages
-            .push(self.runtime_query_state_message(&state)?);
+            .push(self.runtime_query_state_message(&state, &now)?);
         request
             .messages
             .extend(self.clarification_messages(&state).await?);

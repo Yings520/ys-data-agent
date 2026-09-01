@@ -660,6 +660,7 @@ fn build_query_dependencies(
         HarnessConfig {
             workspace_id,
             principal,
+            workspace_timezone: "UTC".to_owned(),
             query_budget: QueryBudget::default(),
             data_scope: AllowedDataScope {
                 workspace_id,
