@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 export class WorkflowInputError extends Error {
   constructor(message) {
@@ -234,6 +235,31 @@ function serializeTracker(tracker) {
   return `${JSON.stringify(tracker, null, 2)}\n`;
 }
 
+function stripRalphRuntimeState(tracker) {
+  const normalized = structuredClone(tracker);
+
+  if (
+    normalized.metadata &&
+    typeof normalized.metadata === "object" &&
+    !Array.isArray(normalized.metadata)
+  ) {
+    delete normalized.metadata.updatedAt;
+    if (Object.keys(normalized.metadata).length === 0) {
+      delete normalized.metadata;
+    }
+  }
+
+  if (Array.isArray(normalized.userStories)) {
+    for (const story of normalized.userStories) {
+      if (story && typeof story === "object" && !Array.isArray(story)) {
+        delete story.completionNotes;
+      }
+    }
+  }
+
+  return normalized;
+}
+
 function projectPath(root, feature) {
   return path.join(root, ".ralph-tui", "generated", `${feature}.json`);
 }
@@ -296,9 +322,8 @@ export async function runCli(args, root = process.cwd()) {
   const markdown = await readTasksFile(tasksPath);
   await requireApprovedTasks(specPath);
   const tasks = validateTasks(parseTasks(markdown));
-  const serialized = serializeTracker(
-    compileTracker(feature, sourcePath, tasks),
-  );
+  const tracker = compileTracker(feature, sourcePath, tasks);
+  const serialized = serializeTracker(tracker);
 
   if (options.includes("--stdout")) {
     process.stdout.write(serialized);
@@ -315,7 +340,20 @@ export async function runCli(args, root = process.cwd()) {
         `Ralph projection is stale: ${outputPath} does not exist`,
       );
     }
-    if (existing !== serialized) {
+    let existingTracker;
+    try {
+      existingTracker = JSON.parse(existing);
+    } catch (error) {
+      throw new WorkflowInputError(
+        `Ralph projection is stale: cannot parse ${outputPath}: ${error.message}`,
+      );
+    }
+    if (
+      !isDeepStrictEqual(
+        stripRalphRuntimeState(existingTracker),
+        stripRalphRuntimeState(tracker),
+      )
+    ) {
       throw new WorkflowInputError(
         `Ralph projection is stale: regenerate ${outputPath}`,
       );

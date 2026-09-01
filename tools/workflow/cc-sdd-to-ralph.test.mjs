@@ -307,6 +307,58 @@ test("CLI writes and checks a deterministic tracker projection", async () => {
   assert.match(stale.stderr, /projection is stale/i);
 });
 
+test("CLI check tolerates Ralph runtime metadata after task completion", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cc-sdd-to-ralph-"));
+  const specDirectory = path.join(root, ".kiro/specs/sample-feature");
+  await mkdir(specDirectory, { recursive: true });
+  await writeFile(path.join(specDirectory, "tasks.md"), validTasks, "utf8");
+  await writeFile(path.join(specDirectory, "spec.json"), approvedSpec, "utf8");
+
+  const generate = runCli(root, "sample-feature");
+  assert.equal(generate.status, 0, generate.stderr);
+
+  const outputPath = path.join(
+    root,
+    ".ralph-tui/generated/sample-feature.json",
+  );
+  const tracker = JSON.parse(await readFile(outputPath, "utf8"));
+  tracker.metadata = { updatedAt: "2026-09-01T12:00:00.000Z" };
+  tracker.userStories[0].passes = true;
+  tracker.userStories[0].completionNotes = "Reviewer-gated verification passed";
+  await writeFile(outputPath, JSON.stringify(tracker, null, 2), "utf8");
+  await writeFile(
+    path.join(specDirectory, "tasks.md"),
+    validTasks.replace("- [ ] 1.1", "- [x] 1.1"),
+    "utf8",
+  );
+
+  const check = runCli(root, "sample-feature", "--check");
+  assert.equal(check.status, 0, check.stderr);
+});
+
+test("CLI check still rejects unknown tracker metadata", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cc-sdd-to-ralph-"));
+  const specDirectory = path.join(root, ".kiro/specs/sample-feature");
+  await mkdir(specDirectory, { recursive: true });
+  await writeFile(path.join(specDirectory, "tasks.md"), validTasks, "utf8");
+  await writeFile(path.join(specDirectory, "spec.json"), approvedSpec, "utf8");
+
+  const generate = runCli(root, "sample-feature");
+  assert.equal(generate.status, 0, generate.stderr);
+
+  const outputPath = path.join(
+    root,
+    ".ralph-tui/generated/sample-feature.json",
+  );
+  const tracker = JSON.parse(await readFile(outputPath, "utf8"));
+  tracker.metadata = { unexpected: true };
+  await writeFile(outputPath, JSON.stringify(tracker, null, 2), "utf8");
+
+  const check = runCli(root, "sample-feature", "--check");
+  assert.equal(check.status, 1);
+  assert.match(check.stderr, /projection is stale/i);
+});
+
 test("CLI rejects a missing feature spec", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cc-sdd-to-ralph-"));
   const result = runCli(root, "missing-feature");
