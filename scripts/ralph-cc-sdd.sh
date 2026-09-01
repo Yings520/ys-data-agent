@@ -15,5 +15,4 @@ fi
 rtk node tools/workflow/cc-sdd-to-ralph.mjs "${feature}"
 rtk ralph-tui run \
   --prd ".ralph-tui/generated/${feature}.json" \
-  --serial \
-  --on-error abort
+  --serial

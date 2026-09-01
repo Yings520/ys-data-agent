@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+rtk node --test tools/workflow/*.test.mjs
+
 compose_file="fixtures/postgres/compose.yaml"
 compose_project="ysda-v02-release-gate"
 
