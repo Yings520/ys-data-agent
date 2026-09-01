@@ -695,6 +695,12 @@ fn replay_sequence(id: &str) -> Vec<ModelResponse> {
         | "metric_contract_conflict" => {
             metric_script("commerce.gmv", START, END, "Verified GMV result.")
         }
+        "metric_gmv_yesterday_zh" => metric_script(
+            "commerce.gmv",
+            "2026-08-31T00:00:00Z",
+            "2026-09-01T00:00:00Z",
+            "该时间段没有可见交易记录，不能据此得出数值结论。",
+        ),
         "metric_gmv_ambiguous_recent" | "unsupported_analysis" => Vec::new(),
         "unsafe_delete" => vec![
             model_tool(
