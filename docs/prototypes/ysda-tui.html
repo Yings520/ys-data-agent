@@ -1,0 +1,1135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YS Data Agent · TUI Prototype</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #071423;
+      --surface: #101d2e;
+      --header: #202a38;
+      --border: #224b79;
+      --text: #c5cad3;
+      --muted: #7e8999;
+      --accent: #4389e6;
+      --success: #66bad9;
+      --warning: #e0b866;
+      --error: #e06c75;
+      --terminal-shadow: 0 30px 90px rgb(0 0 0 / 42%);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    html {
+      background: #030a12;
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      min-height: 100vh;
+      overflow: hidden;
+      background: #030a12;
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    button {
+      color: inherit;
+    }
+
+    code {
+      font: inherit;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    .prototype-shell {
+      min-height: 100vh;
+      padding: 24px;
+      display: grid;
+      place-items: center;
+    }
+
+    .terminal {
+      width: min(1180px, 100%);
+      height: min(820px, calc(100vh - 48px));
+      min-height: 640px;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      background: var(--background);
+      border: 1px solid var(--border);
+      box-shadow: var(--terminal-shadow);
+    }
+
+    .terminal-header,
+    .terminal-footer {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .terminal-header {
+      min-height: 42px;
+      padding: 0 16px;
+      overflow: hidden;
+      border-bottom: 1px solid var(--border);
+      background: #0a1827;
+      font-size: 0.76rem;
+    }
+
+    .brand {
+      color: #edf5f7;
+      font-size: 0.84rem;
+      letter-spacing: 0.1em;
+    }
+
+    .brand-mark {
+      color: var(--success);
+    }
+
+    .header-divider {
+      color: #38556f;
+    }
+
+    #mode-label {
+      padding: 2px 7px;
+      color: #8fb8ce;
+      border: 1px solid #2b4e6c;
+    }
+
+    .status-push,
+    .footer-push {
+      margin-left: auto;
+    }
+
+    .status-push {
+      color: #74c69d;
+      letter-spacing: 0.04em;
+    }
+
+    .terminal-content {
+      min-height: 0;
+      overflow: auto;
+      padding: 28px clamp(18px, 5vw, 64px);
+      scrollbar-color: #244866 transparent;
+      scrollbar-width: thin;
+    }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      color: var(--muted);
+      font-size: 0.68rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 800px;
+      margin: 0 0 24px;
+      color: #edf3f6;
+      font-size: clamp(1rem, 2.2vw, 1.35rem);
+      font-weight: 500;
+      line-height: 1.5;
+    }
+
+    .run-heading {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0;
+      color: #dde7ed;
+      font-size: 0.82rem;
+    }
+
+    .run-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #74c69d;
+      box-shadow: 0 0 0 3px rgb(116 198 157 / 11%);
+    }
+
+    .run-meta {
+      color: var(--muted);
+      font-weight: 400;
+    }
+
+    .timeline-list {
+      max-width: 860px;
+      margin: 14px 0 0 4px;
+      padding: 0 0 0 22px;
+      border-left: 1px solid var(--border);
+      list-style: none;
+    }
+
+    .timeline-list > li {
+      position: relative;
+      padding: 6px 0 9px;
+      color: #91a2b1;
+    }
+
+    .timeline-list > li::before {
+      content: "";
+      position: absolute;
+      top: 12px;
+      left: -26px;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 0 4px var(--background);
+    }
+
+    .timeline-list strong {
+      color: #cfdbe3;
+      font-weight: 500;
+    }
+
+    .timeline-list code {
+      color: #73b8d2;
+    }
+
+    .tool-summary,
+    .artifact-card {
+      width: 100%;
+      text-align: left;
+      background: #0a1a29;
+      border: 1px solid #1c3b56;
+    }
+
+    .tool-summary {
+      margin: 5px 0;
+      padding: 8px 10px;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .tool-summary:hover,
+    .artifact-card:hover {
+      border-color: var(--success);
+    }
+
+    .tool-detail {
+      margin: -5px 0 8px;
+      padding: 9px 12px;
+      border: 1px solid #1c3b56;
+      border-top: 0;
+      color: var(--muted);
+      background: #081725;
+      font-size: 0.76rem;
+      line-height: 1.55;
+    }
+
+    .artifact-card {
+      display: grid;
+      gap: 6px;
+      margin-top: 12px;
+      padding: 14px;
+      border-left: 3px solid var(--success);
+      cursor: pointer;
+    }
+
+    .artifact-kicker {
+      display: flex;
+      gap: 9px;
+      color: #7fa9bd;
+      font-size: 0.67rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .artifact-verified {
+      margin-left: auto;
+      color: #74c69d;
+    }
+
+    .artifact-card strong {
+      color: #edf4f5;
+      font-size: 1rem;
+      font-weight: 600;
+    }
+
+    .artifact-card > span {
+      display: block;
+      color: var(--muted);
+    }
+
+    .artifact-card .answer-value {
+      color: var(--success);
+      font-size: 1.65rem;
+      font-weight: 650;
+    }
+
+    .artifact-open {
+      margin-top: 4px;
+      color: #67acd7 !important;
+    }
+
+    .artifact-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .artifact-header h2 {
+      margin: 0;
+      color: #e5edf2;
+      font-size: 1rem;
+      font-weight: 600;
+    }
+
+    .artifact-header button {
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: #69afd7;
+      cursor: pointer;
+    }
+
+    .verified {
+      margin-left: auto;
+      color: #74c69d;
+    }
+
+    .artifact-tabs {
+      display: flex;
+      gap: 2px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .artifact-tabs button {
+      padding: 8px 10px;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .artifact-tabs button[aria-selected="true"] {
+      border-bottom-color: var(--success);
+      background: #0b1a28;
+      color: #ccebf0;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      border: 1px solid #203c55;
+      background: #203c55;
+    }
+
+    .summary-grid section {
+      min-width: 0;
+      padding: 12px;
+      background: #0b1926;
+    }
+
+    .summary-grid span,
+    .summary-grid strong {
+      display: block;
+    }
+
+    .summary-grid span {
+      color: var(--muted);
+      font-size: 0.68rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .summary-grid strong {
+      margin-top: 5px;
+      overflow-wrap: anywhere;
+      color: #dce6ed;
+      font-weight: 500;
+    }
+
+    .warning-line {
+      padding: 9px 11px;
+      border-left: 2px solid var(--warning);
+      background: #201c16;
+      color: #c7b58c;
+    }
+
+    .result-meta,
+    .artifact-note,
+    .muted-line {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+
+    .data-grid-wrap {
+      overflow: hidden;
+      border: 1px solid #294963;
+    }
+
+    .data-grid {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .data-grid th,
+    .data-grid td {
+      padding: 9px 10px;
+      border-right: 1px solid #1d384e;
+      border-bottom: 1px solid #1d384e;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .data-grid th {
+      color: #7892a6;
+      background: #0e2030;
+      font-size: 0.68rem;
+      font-weight: 500;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .data-grid th:last-child,
+    .data-grid td:last-child {
+      border-right: 0;
+      text-align: right;
+    }
+
+    .data-grid tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .data-grid tbody tr {
+      cursor: default;
+    }
+
+    .data-grid tbody tr.selected {
+      background: #10283a;
+      box-shadow: inset 2px 0 var(--accent);
+    }
+
+    .data-grid tbody tr:focus-visible {
+      outline-offset: -2px;
+    }
+
+    .grid-help {
+      display: flex;
+      gap: 14px;
+      margin-top: 9px;
+      color: #658096;
+      font-size: 0.7rem;
+    }
+
+    .sql-view {
+      margin: 0;
+      padding: 16px;
+      overflow: auto;
+      border: 1px solid #294963;
+      background: #07111c;
+      color: #b9d8e4;
+      line-height: 1.65;
+    }
+
+    .schema-list,
+    .evidence-list {
+      border: 1px solid #294963;
+    }
+
+    .schema-list > div,
+    .evidence-list > div {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      padding: 10px 12px;
+      border-bottom: 1px solid #1d384e;
+    }
+
+    .schema-list > div:last-child,
+    .evidence-list > div:last-child {
+      border-bottom: 0;
+    }
+
+    .schema-list span,
+    .evidence-list span,
+    .evidence-list code {
+      color: var(--muted);
+    }
+
+    .evidence-list > div {
+      grid-template-columns: 0.8fr 1.5fr 0.7fr;
+    }
+
+    .evidence-list strong {
+      color: #cbd8e0;
+      font-weight: 500;
+    }
+
+    #mode-picker {
+      padding: 10px 14px 8px;
+    }
+
+    #mode-picker > label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 0.68rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    #mode-search {
+      width: 100%;
+      padding: 9px 10px;
+      border: 1px solid #315c81;
+      outline: 0;
+      background: #091725;
+      color: var(--text);
+    }
+
+    #mode-search:focus {
+      border-color: var(--success);
+    }
+
+    #mode-options {
+      margin-top: 6px;
+      border: 1px solid #274966;
+    }
+
+    #mode-options button {
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 8px 10px;
+      border: 0;
+      border-bottom: 1px solid #1c354b;
+      background: #0a1927;
+      color: var(--text);
+      text-align: left;
+    }
+
+    #mode-options button:last-child {
+      border-bottom: 0;
+    }
+
+    #mode-options button[aria-selected="true"] {
+      background: #12314a;
+      box-shadow: inset 2px 0 var(--success);
+    }
+
+    #mode-options button:disabled {
+      color: #65717d;
+    }
+
+    #mode-options button span {
+      color: var(--muted);
+    }
+
+    .query-detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1px;
+      border: 1px solid #203c55;
+      background: #203c55;
+    }
+
+    .query-detail-grid > div {
+      padding: 12px;
+      background: #0b1926;
+    }
+
+    .query-detail-grid dt {
+      color: var(--muted);
+      font-size: 0.68rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .query-detail-grid dd {
+      margin: 5px 0 0;
+      color: #dce6ed;
+    }
+
+    .terminal-bottom {
+      border-top: 1px solid var(--border);
+      background: #081522;
+    }
+
+    .composer {
+      display: flex;
+      margin: 10px 14px 6px;
+      border: 1px solid #315c81;
+      background: #091725;
+    }
+
+    .composer:focus-within {
+      border-color: var(--success);
+      box-shadow: 0 0 0 1px rgb(102 186 217 / 16%);
+    }
+
+    .composer-prompt {
+      padding: 11px 0 11px 12px;
+      color: var(--success);
+    }
+
+    .composer input {
+      flex: 1;
+      min-width: 0;
+      padding: 11px 12px 11px 8px;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: var(--text);
+    }
+
+    .composer input::placeholder {
+      color: #61788d;
+    }
+
+    .terminal-footer {
+      min-height: 27px;
+      padding: 0 14px 8px;
+      font-size: 0.68rem;
+    }
+
+    .terminal-footer button {
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: #77a8c8;
+      cursor: pointer;
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--success);
+      outline-offset: 2px;
+    }
+
+    @media (min-width: 1200px) {
+      .terminal-content {
+        padding-inline: clamp(64px, 8vw, 110px);
+      }
+    }
+
+    @media (max-width: 850px) {
+      .prototype-shell {
+        padding: 0;
+      }
+
+      .terminal {
+        width: 100%;
+        height: 100vh;
+        min-height: 100vh;
+        border: 0;
+        box-shadow: none;
+      }
+
+      .header-context {
+        display: none;
+      }
+
+      .terminal-content {
+        padding: 20px 16px;
+      }
+
+      .summary-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .data-grid-wrap {
+        overflow-x: auto;
+      }
+
+      .data-grid {
+        min-width: 660px;
+      }
+    }
+
+    @media (max-width: 620px) {
+      .terminal-header {
+        gap: 7px;
+        padding-inline: 10px;
+      }
+
+      .terminal-header .status-push {
+        font-size: 0;
+      }
+
+      .terminal-header .status-push::after {
+        content: "◆";
+        font-size: 0.75rem;
+      }
+
+      .terminal-footer > span:not(.footer-push) {
+        display: none;
+      }
+
+      .summary-grid,
+      .query-detail-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .artifact-header {
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+
+      .artifact-tabs {
+        overflow-x: auto;
+      }
+
+      .evidence-list > div {
+        grid-template-columns: 1fr;
+        gap: 4px;
+      }
+
+      .artifact-kicker {
+        flex-wrap: wrap;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="prototype-shell">
+    <section class="terminal" aria-label="YS Data Agent terminal prototype">
+      <p id="prototype-status" class="sr-only" aria-live="polite">Timeline loaded with completed fixture Query.</p>
+      <header class="terminal-header">
+        <strong class="brand" aria-label="YS Data Agent">YS<span class="brand-mark">·</span>DA</strong>
+        <span class="header-divider header-context">│</span>
+        <span class="header-context">local/demo</span>
+        <span class="header-divider header-context">│</span>
+        <span class="header-context">SQLite · demo.db</span>
+        <span id="mode-label">AUTO › QUERY</span>
+        <span class="status-push">◆ READ ONLY</span>
+      </header>
+
+      <main class="terminal-content">
+        <section id="timeline-view" aria-labelledby="timeline-heading">
+          <p class="eyebrow">You · 09:42</p>
+          <h1 id="timeline-heading">Which customers have the highest total order amount?</h1>
+
+          <p class="run-heading">
+            <span class="run-dot" aria-hidden="true"></span>
+            <strong>Ys-da</strong>
+            <span class="run-meta">completed · 1.7s</span>
+          </p>
+
+          <ol class="timeline-list">
+            <li><strong>Intent classified</strong> · <code>AdHocRead</code></li>
+            <li>
+              <button class="tool-summary" type="button" data-tool="context" aria-expanded="false">▸ 2 context steps · schema inspection, source metadata</button>
+              <div class="tool-detail" data-tool-detail="context" hidden>ObservedSchema loaded from customers and orders; no governed Metric Contract selected.</div>
+            </li>
+            <li><strong>Query plan validated</strong> · one read-only statement</li>
+            <li>
+              <button class="tool-summary" type="button" data-tool="preflight" aria-expanded="false">▸ Policy + preflight · source allowed · max 100 rows · 18ms</button>
+              <div class="tool-detail" data-tool-detail="preflight" hidden>Single Statement::Query; read-only connection; result and timeout budgets applied.</div>
+            </li>
+            <li><strong>Executed</strong> · 3 rows · 3 columns</li>
+            <li><strong>Verification passed</strong> · no hard failures</li>
+          </ol>
+
+          <button id="open-artifact" class="artifact-card" type="button">
+            <span class="artifact-kicker">
+              <span>Query Artifact</span>
+              <span>Internal</span>
+              <span class="artifact-verified">✓ verified</span>
+            </span>
+            <strong>Acme Singapore has the highest total order amount.</strong>
+            <span class="answer-value">$2,050.00</span>
+            <span>Ad hoc result · semantic status inferred · 3 rows</span>
+            <span class="artifact-open">↳ Open results · Enter</span>
+          </button>
+        </section>
+
+        <section id="artifact-view" hidden aria-labelledby="artifact-heading"></section>
+        <section id="query-detail-view" hidden aria-labelledby="query-detail-heading"></section>
+      </main>
+
+      <div class="terminal-bottom">
+        <form id="composer" class="composer">
+          <label class="sr-only" for="composer-input">Ask a governed data question</label>
+          <span class="composer-prompt" aria-hidden="true">›</span>
+          <input id="composer-input" autocomplete="off" placeholder="Ask a governed data question…">
+        </form>
+        <section id="mode-picker" hidden aria-label="Execution mode picker"></section>
+        <footer class="terminal-footer">
+          <button type="button" data-command="/mode">/mode</button>
+          <button type="button" data-command="/query">/query</button>
+          <span>Esc back</span>
+          <span class="footer-push">visual prototype · fixture data</span>
+        </footer>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    'use strict';
+
+    const FIXTURE = Object.freeze({
+      question: 'Which customers have the highest total order amount?',
+      answer: 'Acme Singapore has the highest total order amount.',
+      intent: 'AdHocRead',
+      semanticStatus: 'Inferred',
+      sourceId: 'sqlite-demo',
+      sourceRelations: Object.freeze(['customers', 'orders']),
+      sensitivity: 'Internal',
+      rows: Object.freeze([
+        Object.freeze({ rank: 1, customer: 'Acme Singapore', region: 'APAC', total: '$2,050.00' }),
+        Object.freeze({ rank: 2, customer: 'Northwind GmbH', region: 'EMEA', total: '$1,550.00' }),
+        Object.freeze({ rank: 3, customer: 'Contoso US', region: 'AMER', total: '$1,500.00' })
+      ]),
+      sql: `SELECT
+    c.name AS customer,
+    c.region,
+    SUM(o.amount) AS total_order_amount
+FROM customers AS c
+JOIN orders AS o ON o.customer_id = c.id
+GROUP BY c.id, c.name, c.region
+ORDER BY total_order_amount DESC;`,
+      resultSchema: Object.freeze([
+        Object.freeze({ name: 'customer', type: 'TEXT' }),
+        Object.freeze({ name: 'region', type: 'TEXT' }),
+        Object.freeze({ name: 'total_order_amount', type: 'REAL' })
+      ]),
+      evidence: Object.freeze([
+        Object.freeze({ kind: 'ContextEvidence', label: 'Observed schema', status: 'observed' }),
+        Object.freeze({ kind: 'QueryPlan', label: 'Read-only aggregation plan', status: 'validated' }),
+        Object.freeze({ kind: 'QueryPreflight', label: 'Policy and budget decision', status: 'allowed' }),
+        Object.freeze({ kind: 'QueryResult', label: '3-row controlled preview', status: 'complete' }),
+        Object.freeze({ kind: 'VerificationReport', label: 'Deterministic completion checks', status: 'passed' })
+      ])
+    });
+
+    const MODES = Object.freeze([
+      Object.freeze({ id: 'auto', label: 'Auto', detail: 'default', available: true }),
+      Object.freeze({ id: 'query', label: 'Query', detail: 'available', available: true }),
+      Object.freeze({ id: 'analysis', label: 'Analysis', detail: 'Unavailable in v0.2', available: false }),
+      Object.freeze({ id: 'build', label: 'Build / Change', detail: 'Unavailable in v0.2', available: false }),
+      Object.freeze({ id: 'operate', label: 'Operate', detail: 'Unavailable in v0.2', available: false })
+    ]);
+
+    const state = {
+      view: 'timeline',
+      artifactTab: 'results',
+      selectedRow: 0,
+      transient: null,
+      mode: 'auto',
+      modeIndex: 0,
+      composerDraft: ''
+    };
+
+    const artifactView = document.querySelector('#artifact-view');
+    const timelineView = document.querySelector('#timeline-view');
+    const queryDetailView = document.querySelector('#query-detail-view');
+    const composer = document.querySelector('#composer');
+    const composerInput = document.querySelector('#composer-input');
+    const modePicker = document.querySelector('#mode-picker');
+    const liveStatus = document.querySelector('#prototype-status');
+
+    function announce(message) {
+      liveStatus.textContent = message;
+    }
+
+    function artifactTabs() {
+      return `
+        <button type="button" role="tab" data-artifact-tab="summary" aria-selected="${state.artifactTab === 'summary'}">Summary</button>
+        <button type="button" role="tab" data-artifact-tab="results" aria-selected="${state.artifactTab === 'results'}">Results</button>
+        <button type="button" role="tab" data-artifact-tab="sql" aria-selected="${state.artifactTab === 'sql'}">SQL</button>
+        <button type="button" role="tab" data-artifact-tab="schema" aria-selected="${state.artifactTab === 'schema'}">Schema</button>
+        <button type="button" role="tab" data-artifact-tab="evidence" aria-selected="${state.artifactTab === 'evidence'}">Evidence</button>`;
+    }
+
+    const artifactRenderers = {
+      summary: () => `
+        <div class="summary-grid">
+          <section><span>Answer</span><strong>${FIXTURE.answer}</strong></section>
+          <section><span>Intent</span><strong>${FIXTURE.intent}</strong></section>
+          <section><span>Semantic status</span><strong>${FIXTURE.semanticStatus}</strong></section>
+          <section><span>Source</span><strong>${FIXTURE.sourceId}</strong></section>
+          <section><span>Sensitivity</span><strong>${FIXTURE.sensitivity}</strong></section>
+          <section><span>Verification</span><strong>Passed · 0 hard failures</strong></section>
+        </div>
+        <p class="warning-line">◇ Inferred semantics · no governed Metric Contract was used for this ad hoc query.</p>`,
+      results: () => `
+        <div class="result-meta">3 rows · 3 data columns · complete preview · # is a UI row ordinal</div>
+        <div class="data-grid-wrap">
+          <table class="data-grid">
+            <thead><tr><th scope="col">#</th><th scope="col">customer</th><th scope="col">region</th><th scope="col">total_order_amount</th></tr></thead>
+            <tbody>${FIXTURE.rows.map((row, index) => `
+              <tr data-result-row="${index}" tabindex="${state.selectedRow === index ? '0' : '-1'}" class="${state.selectedRow === index ? 'selected' : ''}">
+                <td>${row.rank}</td><td>${row.customer}</td><td>${row.region}</td><td>${row.total}</td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </div>
+        <div class="grid-help"><span>↑↓ rows</span><span>←→ columns</span><span>c copy</span><span>e export</span></div>`,
+      sql: () => `
+        <p class="artifact-note">Persisted executed SQL · opening this view does not rerun the query.</p>
+        <pre class="sql-view"><code>${FIXTURE.sql}</code></pre>
+        <p class="muted-line">Bound parameters · none</p>`,
+      schema: () => `
+        <p class="artifact-note">Result schema · observed source metadata remains distinct from inferred semantics.</p>
+        <div class="schema-list">${FIXTURE.resultSchema.map((column) => `
+          <div><code>${column.name}</code><span>${column.type}</span></div>`).join('')}</div>
+        <p class="muted-line">Observed source relations · ${FIXTURE.sourceRelations.join(' · ')}</p>`,
+      evidence: () => `
+        <p class="artifact-note">Policy-limited references · raw Tool payloads remain hidden.</p>
+        <div class="evidence-list">${FIXTURE.evidence.map((item) => `
+          <div><span>${item.kind}</span><strong>${item.label}</strong><code>${item.status}</code></div>`).join('')}</div>`
+    };
+
+    function renderArtifact() {
+      artifactView.innerHTML = `
+        <header class="artifact-header">
+          <button type="button" data-back-timeline>← Timeline</button>
+          <h2 id="artifact-heading">Top customers by order amount</h2>
+          <span class="verified">✓ verified</span>
+        </header>
+        <nav class="artifact-tabs" role="tablist" aria-label="Query Artifact views">${artifactTabs()}</nav>
+        <div id="artifact-content" role="tabpanel">${artifactRenderers[state.artifactTab]()}</div>`;
+    }
+
+    function showView(view) {
+      state.view = view;
+      timelineView.hidden = view !== 'timeline';
+      artifactView.hidden = view !== 'artifact';
+      queryDetailView.hidden = view !== 'query-detail';
+
+      if (view === 'artifact') {
+        renderArtifact();
+        composerInput.placeholder = 'Filter Artifact rows or type a command…';
+      } else {
+        composerInput.placeholder = 'Ask a governed data question…';
+      }
+
+      announce(view === 'timeline'
+        ? 'Execution timeline active.'
+        : view === 'artifact'
+          ? `Query Artifact ${state.artifactTab} view active.`
+          : 'Current Query details active.');
+    }
+
+    function moveResultRow(delta) {
+      if (state.view !== 'artifact' || state.artifactTab !== 'results') return false;
+
+      state.selectedRow = Math.max(0, Math.min(FIXTURE.rows.length - 1, state.selectedRow + delta));
+      renderArtifact();
+      document.querySelector(`[data-result-row="${state.selectedRow}"]`)?.focus();
+      return true;
+    }
+
+    function renderModePicker() {
+      modePicker.innerHTML = `
+        <label for="mode-search">Execution mode</label>
+        <input id="mode-search" value="/mode" aria-controls="mode-options" aria-label="Filter execution modes">
+        <div id="mode-options" role="listbox">${MODES.map((mode, index) => `
+          <button type="button" role="option" data-mode-index="${index}" aria-selected="${state.modeIndex === index}" aria-disabled="${!mode.available}" ${mode.available ? '' : 'disabled'}>
+            <strong>${mode.label}</strong><span>${mode.detail}</span>
+          </button>`).join('')}</div>`;
+    }
+
+    function openModePicker() {
+      state.composerDraft = composerInput.value;
+      state.transient = 'mode';
+      state.modeIndex = Math.max(0, MODES.findIndex((mode) => mode.id === state.mode));
+      composer.hidden = true;
+      modePicker.hidden = false;
+      renderModePicker();
+      document.querySelector('#mode-search').focus();
+      announce('Execution mode picker active. Auto and Query are available.');
+    }
+
+    function closeTransient({ restoreDraft = true } = {}) {
+      if (state.transient !== 'mode') return false;
+
+      state.transient = null;
+      modePicker.hidden = true;
+      composer.hidden = false;
+      composerInput.value = restoreDraft ? state.composerDraft : '';
+      composerInput.focus();
+      announce('Composer active.');
+      return true;
+    }
+
+    function moveModeSelection(delta) {
+      let next = state.modeIndex;
+
+      do {
+        next = (next + delta + MODES.length) % MODES.length;
+      } while (!MODES[next].available);
+
+      state.modeIndex = next;
+      renderModePicker();
+      document.querySelector('#mode-search').focus();
+    }
+
+    function confirmMode() {
+      const mode = MODES[state.modeIndex];
+      if (!mode.available) return;
+
+      setMode(mode.id);
+      closeTransient({ restoreDraft: false });
+    }
+
+    function renderQueryDetails() {
+      queryDetailView.innerHTML = `
+        <header class="artifact-header">
+          <button type="button" data-back-timeline>← Timeline</button>
+          <h2 id="query-detail-heading">Current Query</h2>
+          <span class="verified">✓ ReadyToComplete</span>
+        </header>
+        <dl class="query-detail-grid">
+          <div><dt>Intent</dt><dd>${FIXTURE.intent}</dd></div>
+          <div><dt>Semantic status</dt><dd>${FIXTURE.semanticStatus}</dd></div>
+          <div><dt>Phase</dt><dd>ReadyToComplete</dd></div>
+          <div><dt>Source</dt><dd>${FIXTURE.sourceId}</dd></div>
+          <div><dt>Scope</dt><dd>${FIXTURE.sourceRelations.join(' + ')}</dd></div>
+          <div><dt>Parameters</dt><dd>None</dd></div>
+          <div><dt>Policy</dt><dd>Allowed · read-only</dd></div>
+          <div><dt>Verification</dt><dd>Passed · 0 hard failures</dd></div>
+        </dl>`;
+      showView('query-detail');
+    }
+
+    function setMode(mode) {
+      state.mode = mode;
+      document.querySelector('#mode-label').textContent = mode === 'auto' ? 'AUTO › QUERY' : 'MODE › QUERY';
+      announce(`${mode === 'auto' ? 'Automatic' : 'Query'} execution mode selected.`);
+    }
+
+    function runCommand(command) {
+      const normalized = command.trim().toLowerCase();
+
+      if (normalized === '/mode') return openModePicker();
+      if (normalized === '/mode auto') return setMode('auto');
+      if (normalized === '/mode query') return setMode('query');
+      if (normalized === '/query') return renderQueryDetails();
+    }
+
+    document.addEventListener('click', (event) => {
+      if (!(event.target instanceof Element)) return;
+
+      const target = event.target;
+      if (target.closest('#open-artifact')) showView('artifact');
+      if (target.closest('[data-back-timeline]')) showView('timeline');
+
+      const tab = target.closest('[data-artifact-tab]')?.dataset.artifactTab;
+      if (tab && Object.hasOwn(artifactRenderers, tab)) {
+        state.artifactTab = tab;
+        renderArtifact();
+        announce(`Query Artifact ${tab} view active.`);
+      }
+
+      const row = target.closest('[data-result-row]');
+      if (row) {
+        state.selectedRow = Number(row.dataset.resultRow);
+        renderArtifact();
+        document.querySelector(`[data-result-row="${state.selectedRow}"]`)?.focus();
+      }
+
+      const toolButton = target.closest('[data-tool]');
+      if (toolButton) {
+        const name = toolButton.dataset.tool;
+        const detail = document.querySelector(`[data-tool-detail="${name}"]`);
+        const expanded = toolButton.getAttribute('aria-expanded') === 'true';
+        toolButton.setAttribute('aria-expanded', String(!expanded));
+        toolButton.textContent = `${expanded ? '▸' : '▾'} ${toolButton.textContent.slice(2)}`;
+        detail.hidden = expanded;
+      }
+
+      const command = target.closest('[data-command]')?.dataset.command;
+      if (command) runCommand(command);
+
+      const modeIndex = target.closest('[data-mode-index]')?.dataset.modeIndex;
+      if (modeIndex !== undefined) {
+        state.modeIndex = Number(modeIndex);
+        confirmMode();
+      }
+    });
+
+    composer.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const value = composerInput.value;
+
+      if (value.trim().startsWith('/')) runCommand(value);
+      composerInput.value = '';
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (state.transient === 'mode') {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          closeTransient();
+          return;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          moveModeSelection(-1);
+          return;
+        }
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          moveModeSelection(1);
+          return;
+        }
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          confirmMode();
+          return;
+        }
+      }
+
+      const editableTarget = event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement;
+      if (!editableTarget && event.key === 'ArrowUp' && moveResultRow(-1)) {
+        event.preventDefault();
+        return;
+      }
+      if (!editableTarget && event.key === 'ArrowDown' && moveResultRow(1)) {
+        event.preventDefault();
+        return;
+      }
+      if (event.key === 'Escape' && state.view !== 'timeline') {
+        event.preventDefault();
+        showView('timeline');
+      }
+    });
+  </script>
+</body>
+</html>
