@@ -121,7 +121,7 @@ pub workspace_timezone: String,
 Wire it at every constructor:
 
 - production: `workspace_timezone: config.timezone.clone()`;
-- deterministic eval: `workspace_timezone: config.timezone.clone().unwrap_or_else(|| "UTC".to_owned())` (the missing-timezone eval remains blocked by readiness before execution);
+- deterministic eval: `workspace_timezone: config.timezone.clone().unwrap_or_default()` so the missing-timezone case remains explicit and readiness can block it without guessing;
 - runtime tests: `workspace_timezone: "UTC".to_owned()`.
 
 - [ ] **Step 4: Add runtime-owned temporal fields**
