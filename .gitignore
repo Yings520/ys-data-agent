@@ -4,3 +4,5 @@
 /examples/demo.db
 docs/superpowers/
 .DS_Store
+/_bmad/config.user.toml
+/_bmad/custom/config.user.toml
