@@ -1,4 +1,0 @@
-interface:
-  display_name: "Run cc-sdd Task"
-  short_description: "Execute one approved cc-sdd task for Ralph"
-  default_prompt: "Use $run-cc-sdd-task to execute one approved feature task with review and fresh verification."

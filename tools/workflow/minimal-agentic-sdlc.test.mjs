@@ -47,15 +47,15 @@ async function readTree(root) {
 test("project exposes only the six workflow entry skills", async () => {
   assert.deepEqual(await projectSkillNames(), [
     "bmad-prd",
+    "kiro-impl",
     "kiro-spec-design",
     "kiro-spec-init",
     "kiro-spec-requirements",
     "kiro-spec-tasks",
-    "run-cc-sdd-task",
   ]);
 
-  const runner = await readFile(
-    path.join(skillsRoot, "run-cc-sdd-task/SKILL.md"),
+  const implementationSkill = await readFile(
+    path.join(skillsRoot, "kiro-impl/SKILL.md"),
     "utf8",
   );
   for (const reference of [
@@ -65,10 +65,19 @@ test("project exposes only the six workflow entry skills", async () => {
     "validation.md",
   ]) {
     await readFile(
-      path.join(skillsRoot, "run-cc-sdd-task/references", reference),
+      path.join(skillsRoot, "kiro-impl/references", reference),
       "utf8",
     );
-    assert.match(runner, new RegExp(`references/${reference}`));
+    assert.match(implementationSkill, new RegExp(`references/${reference}`));
+  }
+  for (const contract of [
+    /\$kiro-impl <feature>/,
+    /cc-sdd-task-state\.mjs <feature> --next/,
+    /one task commit/i,
+    /repeat|continue/i,
+    /VALIDATE/,
+  ]) {
+    assert.match(implementationSkill, contract);
   }
 });
 

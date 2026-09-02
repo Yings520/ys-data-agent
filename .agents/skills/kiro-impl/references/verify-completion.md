@@ -1,6 +1,7 @@
 # Fresh-Evidence Completion Gate
 
-Verify the exact claim against the current code state. Earlier output, Agent prose, and a checked box are not evidence.
+Verify the exact claim against the current code state. Earlier output, Agent
+prose, and a checked box are not evidence.
 
 ## Task Claim
 
@@ -32,4 +33,5 @@ Return exactly one result:
 - GAPS: <missing or mismatched evidence>
 ```
 
-Use `MANUAL_VERIFY_REQUIRED` when a mandatory environment or manual check is unavailable. Never widen a claim beyond its evidence.
+Use `MANUAL_VERIFY_REQUIRED` when a mandatory environment or manual check is
+unavailable. Never widen a claim beyond its evidence.

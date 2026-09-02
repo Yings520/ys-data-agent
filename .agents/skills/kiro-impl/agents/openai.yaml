@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement cc-sdd Feature"
+  short_description: "Execute approved cc-sdd task graphs directly"
+  default_prompt: "Use $kiro-impl to execute every remaining task in an approved cc-sdd Feature."
