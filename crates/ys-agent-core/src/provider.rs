@@ -841,6 +841,18 @@ impl ActiveProviderSnapshot {
     pub fn validation_id(&self) -> ValidationId {
         self.validation_id
     }
+
+    /// Non-sensitive evidence identity retained by the committed active snapshot. Doctor uses it
+    /// to prove the exact active revision was validated without reading a Provider response.
+    pub fn validation_digest(&self) -> &ValidationDigest {
+        &self.validation_digest
+    }
+
+    /// The active snapshot references this immutable generation only; it never exposes a Vault
+    /// locator or Credential material.
+    pub fn credential_generation(&self) -> CredentialGeneration {
+        self.credential_generation
+    }
 }
 
 /// A singleton active pointer. `None` is the explicit no-active management state.

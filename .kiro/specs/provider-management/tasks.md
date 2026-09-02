@@ -235,7 +235,7 @@
   - _Requirements: 2.5, 2.6, 7.4, 7.5_
   - _Boundary: TUI AsyncOperationRegistry and event-loop operation lifecycle_
   - _Depends: 1.3, 4.5_
-- [ ] 6.3 (P) 扩展 Doctor 的 Provider readiness 检查
+- [x] 6.3 (P) 扩展 Doctor 的 Provider readiness 检查
   - 检查 committed active revision、Credential 状态、validation freshness、tool/ID/multi-turn/context evidence、Vault protection 与 reconciliation 状态。
   - 无 active、阻断项和警告使用稳定分类与 remediation；Doctor 不读取秘密、不发业务 Query，需要网络复验时只建议显式 Validate。
   - 完成后，Doctor tests 对 Ready、Draft/stale、Credential missing/expired 和 reconciliation failure 给出正确非敏感结果。
