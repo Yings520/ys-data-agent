@@ -5,9 +5,11 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, pa
 use serde::{Serialize, de::DeserializeOwned};
 use ys_agent_core::{
     ActivateProfileRequest, ActiveProviderSnapshot, CredentialGeneration, CredentialKind,
-    CredentialViewStatus, PersistedCompatibilityEvidence, PersistedProfileRevision, ProfileId,
-    ProfileRevision, ProfileState, ProfileSummary, ProviderErrorCode, ProviderField, ProviderId,
-    ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
+    CredentialMutationIntent, CredentialMutationOperation, CredentialMutationPhase,
+    CredentialMutationRecord, CredentialPointerCommit, CredentialViewStatus, OperationId,
+    PersistedCompatibilityEvidence, PersistedCredentialMutationRecord, PersistedProfileRevision,
+    ProfileId, ProfileRevision, ProfileState, ProfileSummary, ProviderErrorCode, ProviderField,
+    ProviderId, ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
     ProviderResult, RevisionPrecondition, SaveProfileRevision, ValidationCommit,
 };
 
@@ -25,9 +27,20 @@ type RevisionRow = (
     Option<String>,
 );
 
-/// SQLite implementation of the profile/revision subset of the Provider persistence boundary.
-/// Credential mutation journaling and Run-binding persistence are implemented by their dedicated
-/// follow-on tasks; this repository only reads already persisted credential metadata.
+type CredentialMutationRow = (
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    String,
+    String,
+    Option<String>,
+);
+
+/// SQLite implementation of Provider revision state and the credential mutation journal.
+/// Run-binding persistence is added by its dedicated follow-on task.
 #[derive(Debug, Clone)]
 pub struct SqliteProviderRepository {
     database: PathBuf,
@@ -317,6 +330,19 @@ impl SqliteProviderRepository {
             active
                 .map(|(profile_id, revision, activation_revision)| {
                     let profile_id = parse_id(&profile_id)?;
+                    let blocked_code: Option<String> = connection
+                        .query_row(
+                            "SELECT error_code FROM credential_mutations
+                             WHERE profile_id = ?1 AND phase = 'blocked'
+                             ORDER BY updated_at DESC LIMIT 1",
+                            [profile_id.to_string()],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(provider_storage_error)?;
+                    if let Some(code) = blocked_code {
+                        return Err(persisted_block_error(parse_enum(&code)?));
+                    }
                     let revision = u64::try_from(revision).map_err(|_| internal_error())?;
                     let activation_revision =
                         u64::try_from(activation_revision).map_err(|_| internal_error())?;
@@ -328,6 +354,663 @@ impl SqliteProviderRepository {
         })
         .await
     }
+
+    pub async fn begin_credential_mutation(
+        &self,
+        intent: CredentialMutationIntent,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        self.with_connection(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(provider_storage_error)?;
+            if let Some((phase, error_code)) = transaction
+                .query_row(
+                    "SELECT phase, error_code
+                     FROM credential_mutations
+                     WHERE profile_id = ?1 AND phase NOT IN ('completed', 'rolled_back')
+                     ORDER BY created_at DESC LIMIT 1",
+                    [intent.profile_id().to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(provider_storage_error)?
+            {
+                if phase == "blocked" {
+                    let code = error_code
+                        .as_deref()
+                        .map(parse_enum)
+                        .transpose()?
+                        .ok_or_else(internal_error)?;
+                    return Err(persisted_block_error(code));
+                }
+                return Err(operation_stale_error());
+            }
+
+            let current = current_revision(&transaction, intent.profile_id())?;
+            if current != Some(intent.expected_revision()) {
+                return Err(storage_conflict_error());
+            }
+            let revision = load_revision(
+                &transaction,
+                intent.profile_id(),
+                intent.expected_revision(),
+            )?;
+            if revision.credential_generation() != intent.expected_generation() {
+                return Err(storage_conflict_error());
+            }
+            for generation in [intent.new_generation(), intent.rollback_generation()]
+                .into_iter()
+                .flatten()
+            {
+                if generation.kind() != revision.provider().required_credential_kind()
+                    || generation_metadata_exists(
+                        &transaction,
+                        intent.profile_id(),
+                        generation.number(),
+                    )?
+                    || !generation_is_newest(
+                        &transaction,
+                        intent.profile_id(),
+                        generation.number(),
+                    )?
+                {
+                    return Err(storage_conflict_error());
+                }
+            }
+
+            let record = CredentialMutationRecord::intent_recorded(intent);
+            let now = Utc::now().to_rfc3339();
+            let staged = staged_generation(&record).ok_or_else(internal_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO provider_credential_generations(
+                        profile_id, generation, kind, vault_locator, status, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'retained', ?5, ?5)",
+                    params![
+                        staged.profile_id().to_string(),
+                        to_i64(staged.number())?,
+                        enum_name(&staged.kind())?,
+                        credential_locator(staged),
+                        now,
+                    ],
+                )
+                .map_err(provider_storage_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO credential_mutations(
+                        mutation_id, profile_id, expected_revision, old_generation,
+                        new_generation, rollback_generation, operation, phase,
+                        error_code, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'intent_recorded', NULL, ?8, ?8)",
+                    params![
+                        record.operation_id().to_string(),
+                        record.profile_id().to_string(),
+                        to_i64(record.expected_revision())?,
+                        optional_generation_number(record.old_generation())?,
+                        optional_generation_number(record.new_generation())?,
+                        optional_generation_number(record.rollback_generation())?,
+                        enum_name(&record.operation())?,
+                        now,
+                    ],
+                )
+                .map_err(provider_storage_error)?;
+            transaction.commit().map_err(provider_storage_error)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn record_credential_vault_write(
+        &self,
+        mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        self.with_connection(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(provider_storage_error)?;
+            let record = load_credential_mutation(&transaction, mutation_id)?;
+            if record.phase() == CredentialMutationPhase::VaultWritten {
+                return Ok(record);
+            }
+            if record.phase() != CredentialMutationPhase::IntentRecorded {
+                return Err(operation_stale_error());
+            }
+            let generation = staged_generation(&record).ok_or_else(internal_error)?;
+            let locator = credential_locator(generation);
+            let changed = transaction
+                .execute(
+                    "UPDATE provider_credential_generations
+                     SET status = 'available', updated_at = ?1
+                     WHERE profile_id = ?2 AND generation = ?3
+                       AND kind = ?4 AND vault_locator = ?5 AND status = 'retained'",
+                    params![
+                        Utc::now().to_rfc3339(),
+                        generation.profile_id().to_string(),
+                        to_i64(generation.number())?,
+                        enum_name(&generation.kind())?,
+                        locator,
+                    ],
+                )
+                .map_err(provider_storage_error)?;
+            if changed != 1 {
+                return Err(storage_conflict_error());
+            }
+            let persisted: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT kind, vault_locator
+                     FROM provider_credential_generations
+                     WHERE profile_id = ?1 AND generation = ?2",
+                    params![
+                        generation.profile_id().to_string(),
+                        to_i64(generation.number())?
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(provider_storage_error)?;
+            if persisted
+                != Some((
+                    enum_name(&generation.kind())?,
+                    credential_locator(generation),
+                ))
+            {
+                return Err(storage_conflict_error());
+            }
+            let record = transition_credential_mutation(
+                &transaction,
+                record,
+                CredentialMutationPhase::VaultWritten,
+                None,
+            )?;
+            transaction.commit().map_err(provider_storage_error)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn commit_credential_pointer(
+        &self,
+        commit: CredentialPointerCommit,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        self.with_connection(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(provider_storage_error)?;
+            let record = load_credential_mutation(&transaction, commit.mutation_id())?;
+            let commit_matches_record = record.profile_id() == commit.profile_id()
+                && record.expected_revision() == commit.expected_revision()
+                && record.new_generation() == commit.new_generation();
+            if record.phase() == CredentialMutationPhase::PointerCommitted {
+                let persisted = load_revision(
+                    &transaction,
+                    commit.profile_id(),
+                    commit.replacement_revision().revision(),
+                )?;
+                if commit_matches_record
+                    && revision_configuration_matches(&persisted, commit.replacement_revision())
+                {
+                    return Ok(record);
+                }
+                return Err(storage_conflict_error());
+            }
+            if record.phase() != CredentialMutationPhase::VaultWritten {
+                return Err(operation_stale_error());
+            }
+            let current = current_revision(&transaction, commit.profile_id())?;
+            let configuration_matches = if current == Some(commit.expected_revision()) {
+                let prior = load_revision(
+                    &transaction,
+                    commit.profile_id(),
+                    commit.expected_revision(),
+                )?;
+                revision_profile_configuration_matches(&prior, commit.replacement_revision())
+            } else {
+                false
+            };
+            let stale = !commit_matches_record
+                || current != Some(commit.expected_revision())
+                || !configuration_matches;
+            if stale {
+                let record = transition_credential_mutation(
+                    &transaction,
+                    record,
+                    CredentialMutationPhase::CleanupPending,
+                    None,
+                )?;
+                debug_assert_eq!(record.phase(), CredentialMutationPhase::CleanupPending);
+                transaction.commit().map_err(provider_storage_error)?;
+                return Err(storage_conflict_error());
+            }
+
+            let now = Utc::now().to_rfc3339();
+            insert_revision(&transaction, commit.replacement_revision(), &now)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE provider_profiles
+                     SET current_revision = ?1, updated_at = ?2
+                     WHERE profile_id = ?3 AND current_revision = ?4",
+                    params![
+                        to_i64(commit.replacement_revision().revision())?,
+                        now,
+                        commit.profile_id().to_string(),
+                        to_i64(commit.expected_revision())?,
+                    ],
+                )
+                .map_err(provider_storage_error)?;
+            if changed != 1 {
+                return Err(storage_conflict_error());
+            }
+            if let Some(old_generation) = record.old_generation() {
+                transaction
+                    .execute(
+                        "UPDATE provider_credential_generations
+                         SET status = 'retained', updated_at = ?1
+                         WHERE profile_id = ?2 AND generation = ?3",
+                        params![
+                            Utc::now().to_rfc3339(),
+                            old_generation.profile_id().to_string(),
+                            to_i64(old_generation.number())?,
+                        ],
+                    )
+                    .map_err(provider_storage_error)?;
+            }
+            let record = transition_credential_mutation(
+                &transaction,
+                record,
+                CredentialMutationPhase::PointerCommitted,
+                None,
+            )?;
+            transaction.commit().map_err(provider_storage_error)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn complete_credential_mutation(
+        &self,
+        mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        self.with_connection(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(provider_storage_error)?;
+            let record = load_credential_mutation(&transaction, mutation_id)?;
+            if record.phase() == CredentialMutationPhase::Completed {
+                return Ok(record);
+            }
+            if record.phase() != CredentialMutationPhase::PointerCommitted {
+                return Err(operation_stale_error());
+            }
+            if let Some(old_generation) = record.old_generation() {
+                transaction
+                    .execute(
+                        "UPDATE provider_credential_generations
+                         SET status = 'retained', updated_at = ?1
+                         WHERE profile_id = ?2 AND generation = ?3",
+                        params![
+                            Utc::now().to_rfc3339(),
+                            record.profile_id().to_string(),
+                            to_i64(old_generation.number())?,
+                        ],
+                    )
+                    .map_err(provider_storage_error)?;
+            }
+            if let Some(rollback_generation) = record.rollback_generation() {
+                transaction
+                    .execute(
+                        "UPDATE provider_credential_generations
+                         SET status = 'deleted', updated_at = ?1
+                         WHERE profile_id = ?2 AND generation = ?3",
+                        params![
+                            Utc::now().to_rfc3339(),
+                            record.profile_id().to_string(),
+                            to_i64(rollback_generation.number())?,
+                        ],
+                    )
+                    .map_err(provider_storage_error)?;
+            }
+            let record = transition_credential_mutation(
+                &transaction,
+                record,
+                CredentialMutationPhase::Completed,
+                None,
+            )?;
+            transaction.commit().map_err(provider_storage_error)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn rollback_credential_mutation(
+        &self,
+        mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        self.with_connection(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(provider_storage_error)?;
+            let record = load_credential_mutation(&transaction, mutation_id)?;
+            if record.phase() == CredentialMutationPhase::RolledBack {
+                return Ok(record);
+            }
+            if !matches!(
+                record.phase(),
+                CredentialMutationPhase::IntentRecorded
+                    | CredentialMutationPhase::VaultWritten
+                    | CredentialMutationPhase::CleanupPending
+            ) {
+                return Err(operation_stale_error());
+            }
+            if let Some(generation) = staged_generation(&record) {
+                transaction
+                    .execute(
+                        "UPDATE provider_credential_generations
+                         SET status = 'deleted', updated_at = ?1
+                         WHERE profile_id = ?2 AND generation = ?3",
+                        params![
+                            Utc::now().to_rfc3339(),
+                            generation.profile_id().to_string(),
+                            to_i64(generation.number())?,
+                        ],
+                    )
+                    .map_err(provider_storage_error)?;
+            }
+            let record = transition_credential_mutation(
+                &transaction,
+                record,
+                CredentialMutationPhase::RolledBack,
+                None,
+            )?;
+            transaction.commit().map_err(provider_storage_error)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn block_credential_mutation(
+        &self,
+        mutation_id: OperationId,
+        error_code: ProviderErrorCode,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        self.with_connection(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(provider_storage_error)?;
+            let record = load_credential_mutation(&transaction, mutation_id)?;
+            if record.phase() == CredentialMutationPhase::Blocked {
+                return if record.error_code() == Some(error_code) {
+                    Ok(record)
+                } else {
+                    Err(storage_conflict_error())
+                };
+            }
+            if record.phase().is_terminal() {
+                return Err(operation_stale_error());
+            }
+            if let Some(generation) = staged_generation(&record) {
+                transaction
+                    .execute(
+                        "UPDATE provider_credential_generations
+                         SET status = 'revoked', updated_at = ?1
+                         WHERE profile_id = ?2 AND generation = ?3",
+                        params![
+                            Utc::now().to_rfc3339(),
+                            generation.profile_id().to_string(),
+                            to_i64(generation.number())?,
+                        ],
+                    )
+                    .map_err(provider_storage_error)?;
+            }
+            transaction
+                .execute(
+                    "DELETE FROM active_provider WHERE profile_id = ?1",
+                    [record.profile_id().to_string()],
+                )
+                .map_err(provider_storage_error)?;
+            let record = transition_credential_mutation(
+                &transaction,
+                record,
+                CredentialMutationPhase::Blocked,
+                Some(error_code),
+            )?;
+            transaction.commit().map_err(provider_storage_error)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn pending_credential_mutations(
+        &self,
+    ) -> ProviderResult<Vec<CredentialMutationRecord>> {
+        self.with_connection(|connection| {
+            let rows = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT mutation_id, profile_id, expected_revision, old_generation,
+                                new_generation, rollback_generation, operation, phase, error_code
+                         FROM credential_mutations
+                         WHERE phase NOT IN ('completed', 'rolled_back')
+                         ORDER BY created_at, mutation_id",
+                    )
+                    .map_err(provider_storage_error)?;
+                let mapped = statement
+                    .query_map([], credential_mutation_row)
+                    .map_err(provider_storage_error)?;
+                mapped
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(provider_storage_error)?
+            };
+            rows.into_iter()
+                .map(|row| hydrate_credential_mutation(connection, row))
+                .collect()
+        })
+        .await
+    }
+}
+
+fn credential_mutation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CredentialMutationRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn load_credential_mutation(
+    connection: &Connection,
+    mutation_id: OperationId,
+) -> ProviderResult<CredentialMutationRecord> {
+    let row = connection
+        .query_row(
+            "SELECT mutation_id, profile_id, expected_revision, old_generation,
+                    new_generation, rollback_generation, operation, phase, error_code
+             FROM credential_mutations WHERE mutation_id = ?1",
+            [mutation_id.to_string()],
+            credential_mutation_row,
+        )
+        .optional()
+        .map_err(provider_storage_error)?
+        .ok_or_else(operation_stale_error)?;
+    hydrate_credential_mutation(connection, row)
+}
+
+fn hydrate_credential_mutation(
+    connection: &Connection,
+    row: CredentialMutationRow,
+) -> ProviderResult<CredentialMutationRecord> {
+    let (
+        mutation_id,
+        profile_id,
+        expected_revision,
+        old_generation,
+        new_generation,
+        rollback_generation,
+        operation,
+        phase,
+        error_code,
+    ) = row;
+    let profile_id = parse_id(&profile_id)?;
+    let expected_revision = u64::try_from(expected_revision).map_err(|_| internal_error())?;
+    let (kind_count, kind): (i64, Option<String>) = connection
+        .query_row(
+            "SELECT COUNT(DISTINCT kind), MIN(kind)
+             FROM provider_credential_generations
+             WHERE profile_id = ?1
+               AND generation IN (?2, ?3, ?4)",
+            params![
+                profile_id.to_string(),
+                old_generation,
+                new_generation,
+                rollback_generation,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(provider_storage_error)?;
+    if kind_count != 1 {
+        return Err(internal_error());
+    }
+    let kind = parse_enum::<CredentialKind>(&kind.ok_or_else(internal_error)?)?;
+    let generation = |number: Option<i64>| -> ProviderResult<Option<CredentialGeneration>> {
+        number
+            .map(|number| {
+                CredentialGeneration::new(
+                    profile_id,
+                    u64::try_from(number).map_err(|_| internal_error())?,
+                    kind,
+                )
+                .map_err(|_| internal_error())
+            })
+            .transpose()
+    };
+    CredentialMutationRecord::hydrate(PersistedCredentialMutationRecord {
+        operation_id: mutation_id.parse().map_err(|_| internal_error())?,
+        profile_id,
+        expected_revision,
+        operation: parse_enum(&operation)?,
+        old_generation: generation(old_generation)?,
+        new_generation: generation(new_generation)?,
+        rollback_generation: generation(rollback_generation)?,
+        phase: parse_enum(&phase)?,
+        error_code: error_code.as_deref().map(parse_enum).transpose()?,
+    })
+    .map_err(|_| internal_error())
+}
+
+fn transition_credential_mutation(
+    connection: &Connection,
+    record: CredentialMutationRecord,
+    phase: CredentialMutationPhase,
+    error_code: Option<ProviderErrorCode>,
+) -> ProviderResult<CredentialMutationRecord> {
+    let previous_phase = record.phase();
+    let record = record
+        .transition(phase, error_code)
+        .map_err(|_| internal_error())?;
+    let changed = connection
+        .execute(
+            "UPDATE credential_mutations
+             SET phase = ?1, error_code = ?2, updated_at = ?3
+             WHERE mutation_id = ?4 AND phase = ?5",
+            params![
+                enum_name(&record.phase())?,
+                record.error_code().map(|code| code.as_str()),
+                Utc::now().to_rfc3339(),
+                record.operation_id().to_string(),
+                enum_name(&previous_phase)?,
+            ],
+        )
+        .map_err(provider_storage_error)?;
+    if changed != 1 {
+        return Err(storage_conflict_error());
+    }
+    Ok(record)
+}
+
+fn staged_generation(record: &CredentialMutationRecord) -> Option<CredentialGeneration> {
+    match record.operation() {
+        CredentialMutationOperation::Create
+        | CredentialMutationOperation::Replace
+        | CredentialMutationOperation::Refresh => record.new_generation(),
+        CredentialMutationOperation::Delete | CredentialMutationOperation::Revoke => {
+            record.rollback_generation()
+        }
+    }
+}
+
+fn revision_configuration_matches(left: &ProfileRevision, right: &ProfileRevision) -> bool {
+    left.profile_id() == right.profile_id()
+        && left.revision() == right.revision()
+        && left.provider() == right.provider()
+        && left.model() == right.model()
+        && left.parameters() == right.parameters()
+        && left.credential_generation() == right.credential_generation()
+}
+
+fn revision_profile_configuration_matches(left: &ProfileRevision, right: &ProfileRevision) -> bool {
+    left.profile_id() == right.profile_id()
+        && left.provider() == right.provider()
+        && left.model() == right.model()
+        && left.parameters() == right.parameters()
+}
+
+fn optional_generation_number(
+    generation: Option<CredentialGeneration>,
+) -> ProviderResult<Option<i64>> {
+    generation
+        .map(|generation| to_i64(generation.number()))
+        .transpose()
+}
+
+fn generation_metadata_exists(
+    connection: &Connection,
+    profile_id: ProfileId,
+    generation: u64,
+) -> ProviderResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM provider_credential_generations
+                WHERE profile_id = ?1 AND generation = ?2
+             )",
+            params![profile_id.to_string(), to_i64(generation)?],
+            |row| row.get(0),
+        )
+        .map_err(provider_storage_error)
+}
+
+fn generation_is_newest(
+    connection: &Connection,
+    profile_id: ProfileId,
+    generation: u64,
+) -> ProviderResult<bool> {
+    let maximum: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(generation) FROM provider_credential_generations WHERE profile_id = ?1",
+            [profile_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(provider_storage_error)?;
+    maximum
+        .map(|maximum| {
+            u64::try_from(maximum)
+                .map(|maximum| generation > maximum)
+                .map_err(|_| internal_error())
+        })
+        .unwrap_or(Ok(true))
+}
+
+fn credential_locator(generation: CredentialGeneration) -> String {
+    format!(
+        "io.ysda.provider://{}:{}",
+        generation.profile_id(),
+        generation.number()
+    )
 }
 
 fn current_revision(connection: &Connection, profile_id: ProfileId) -> ProviderResult<Option<u64>> {
@@ -588,8 +1271,13 @@ fn credential_view_status(status: Option<&str>) -> CredentialViewStatus {
 }
 
 fn provider_storage_error(error: rusqlite::Error) -> ProviderManagementError {
-    if matches!(error, rusqlite::Error::SqliteFailure(ref cause, _) if cause.code == ErrorCode::ConstraintViolation)
-    {
+    let is_profile_name_conflict = matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(cause, Some(message))
+            if cause.code == ErrorCode::ConstraintViolation
+                && message.contains("provider_profiles.name")
+    );
+    if is_profile_name_conflict {
         ProviderManagementError::new(
             ProviderErrorCode::ProfileNameConflict,
             Some(ProviderField::ProfileName),
@@ -630,6 +1318,30 @@ fn storage_conflict_error() -> ProviderManagementError {
         None,
         ProviderRemediation::Retry,
     )
+}
+
+fn operation_stale_error() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::OperationStale,
+        None,
+        ProviderRemediation::WaitForCurrentOperation,
+    )
+}
+
+fn persisted_block_error(code: ProviderErrorCode) -> ProviderManagementError {
+    let remediation = match code {
+        ProviderErrorCode::CredentialProtectionUnavailable => {
+            ProviderRemediation::ConfigureCredentialStore
+        }
+        ProviderErrorCode::OAuthNotConnected | ProviderErrorCode::RemoteRevokeFailed => {
+            ProviderRemediation::Reauthorize
+        }
+        ProviderErrorCode::StorageConflict | ProviderErrorCode::OperationStale => {
+            ProviderRemediation::Retry
+        }
+        _ => ProviderRemediation::ContactSupport,
+    };
+    ProviderManagementError::new(code, Some(ProviderField::Credential), remediation)
 }
 
 fn internal_error() -> ProviderManagementError {

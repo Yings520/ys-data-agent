@@ -1,16 +1,16 @@
 use ys_agent_core::{
     ActivateProfileRequest, ActiveProviderSnapshot, ActiveProviderView, ActiveRevisionPrecondition,
     CompatibilityEvidenceView, CredentialGeneration, CredentialLease, CredentialMutation,
-    CredentialMutationIntent, CredentialMutationRequest, CredentialPointerCommit,
-    CredentialProtectionStatus, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
-    DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, ModelDiscovery,
-    OAuthConnectionService, OAuthConnectionView, OperationId, ProfileDetail, ProfileId,
-    ProfileName, ProfileRevision, ProfileSummary, ProtectedCredentialWrite, ProviderCatalogView,
-    ProviderClientBinding, ProviderClientFactory, ProviderCredentialReference, ProviderDoctorView,
-    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi, ProviderManagementError,
-    ProviderProfileRepository, ProviderRemediation, ProviderResult, ResolvedRunProvider, RunId,
-    RunModelProviderResolver, RunProviderBindingRepository, SaveProfileRevision,
-    ValidateProfileRequest, ValidationCommit,
+    CredentialMutationIntent, CredentialMutationRecord, CredentialMutationRequest,
+    CredentialPointerCommit, CredentialProtectionStatus, CredentialVault, CredentialViewStatus,
+    DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
+    ModelDiscovery, OAuthConnectionService, OAuthConnectionView, OperationId, ProfileDetail,
+    ProfileId, ProfileName, ProfileRevision, ProfileSummary, ProtectedCredentialWrite,
+    ProviderCatalogView, ProviderClientBinding, ProviderClientFactory, ProviderCredentialReference,
+    ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi,
+    ProviderManagementError, ProviderProfileRepository, ProviderRemediation, ProviderResult,
+    ResolvedRunProvider, RunId, RunModelProviderResolver, RunProviderBindingRepository,
+    SaveProfileRevision, ValidateProfileRequest, ValidationCommit,
 };
 
 struct FakeProviderManagementApi;
@@ -192,18 +192,47 @@ impl ProviderProfileRepository for FakeProviderProfileRepository {
     async fn begin_credential_mutation(
         &self,
         _intent: CredentialMutationIntent,
-    ) -> ProviderResult<OperationId> {
+    ) -> ProviderResult<CredentialMutationRecord> {
+        unavailable()
+    }
+
+    async fn record_credential_vault_write(
+        &self,
+        _mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord> {
         unavailable()
     }
 
     async fn commit_credential_pointer(
         &self,
         _commit: CredentialPointerCommit,
-    ) -> ProviderResult<()> {
+    ) -> ProviderResult<CredentialMutationRecord> {
         unavailable()
     }
 
-    async fn pending_credential_mutations(&self) -> ProviderResult<Vec<CredentialMutationIntent>> {
+    async fn complete_credential_mutation(
+        &self,
+        _mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        unavailable()
+    }
+
+    async fn rollback_credential_mutation(
+        &self,
+        _mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        unavailable()
+    }
+
+    async fn block_credential_mutation(
+        &self,
+        _mutation_id: OperationId,
+        _error_code: ProviderErrorCode,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        unavailable()
+    }
+
+    async fn pending_credential_mutations(&self) -> ProviderResult<Vec<CredentialMutationRecord>> {
         Ok(Vec::new())
     }
 
@@ -401,13 +430,20 @@ fn repository_and_masked_views_expose_complete_cas_state_without_secrets() {
     let _ = assert_edit_snapshot;
 
     let profile_id = ProfileId::new();
-    let pointer = CredentialPointerCommit {
-        mutation_id: OperationId::new(),
+    let credential_free_revision = ProfileRevision::draft(
         profile_id,
-        expected_revision: 3,
-        new_generation: None,
-    };
-    assert!(pointer.new_generation.is_none());
+        4,
+        ProviderId::DeepSeek,
+        ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model")
+            .expect("valid model"),
+        ys_agent_core::ProviderParameters::default(),
+        None,
+    )
+    .expect("valid deletion revision");
+    let pointer =
+        CredentialPointerCommit::new(OperationId::new(), profile_id, 3, credential_free_revision)
+            .expect("valid credential deletion pointer");
+    assert!(pointer.new_generation().is_none());
 
     let delete = DeleteProfileRequest {
         operation_id: OperationId::new(),

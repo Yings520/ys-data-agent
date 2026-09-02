@@ -12,6 +12,7 @@ use ys_agent_core::{
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_runtime.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_provider_management.sql");
+const MIGRATION_0003: &str = include_str!("../migrations/0003_credential_journal_recovery.sql");
 
 #[derive(Debug, Clone)]
 pub struct SqliteRuntimeStore {
@@ -104,6 +105,12 @@ fn apply_migrations(connection: &mut Connection) -> CoreResult<()> {
             .execute_batch(MIGRATION_0002)
             .map_err(storage_error)?;
         record_migration(&transaction, 2)?;
+    }
+    if !migration_is_applied(&transaction, 3)? {
+        transaction
+            .execute_batch(MIGRATION_0003)
+            .map_err(storage_error)?;
+        record_migration(&transaction, 3)?;
     }
     transaction.commit().map_err(storage_error)
 }

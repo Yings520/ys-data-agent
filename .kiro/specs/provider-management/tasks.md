@@ -50,13 +50,13 @@
   - _Requirements: 2.1, 2.2, 2.3, 2.6, 2.7, 2.8, 5.6, 6.1, 6.2, 6.3, 6.6_
   - _Boundary: Validated core Provider persistence hydration contracts and SqliteProviderRepository profile, validation, and active state_
   - _Depends: 1.3, 2.1_
-- [ ] 2.3 实现 Credential mutation journal 与启动恢复
+- [x] 2.3 实现 Credential mutation journal 与启动恢复
   - 持久化 intent、old/new/rollback generation、phase 和稳定错误，不保存 secret；实现 pointer commit、cleanup pending、rollback 与 fail-closed reconciliation 状态机。
   - 只在没有 active revision 或非终态 Run 引用时退休旧 generation，并为无法确认的恢复状态阻止新调用。
   - 用故障注入覆盖 Vault write、SQLite compare-and-swap、cleanup 和重启各断点，验证不存在悬空可见指针或明文降级。
   - 完成后，每个故障点都可恢复到上一逻辑状态或明确 Invalid/blocked 状态。
   - _Requirements: 3.3, 3.5, 3.7, 3.8, 3.9, 8.4, 8.5, 8.6, 11.2_
-  - _Boundary: Credential mutation journal and reconciliation repository_
+  - _Boundary: Validated core credential journal contracts and Credential mutation journal and reconciliation repository_
   - _Depends: 1.3, 2.1, 2.2_
 - [ ] 2.4 实现不可变 Run binding repository 与原子写入
   - 在同一 SQLite transaction 中验证 expected active snapshot，并写入 Run、Run provider binding 与首批 lifecycle events。

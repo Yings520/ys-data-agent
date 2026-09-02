@@ -5,8 +5,9 @@ use tempfile::TempDir;
 use ys_agent_core::{
     ActivateProfileRequest, ActivationPrecondition, ActiveProviderSnapshot, ArtifactKind,
     ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CompatibilityEvidence, CoreError,
-    CreateRunCommand, CredentialGeneration, CredentialKind, OperationId, PendingRunEvent,
-    ProfileId, ProfileName, ProfileRevision, ProfileState, ProviderId, ProviderModelId,
+    CreateRunCommand, CredentialGeneration, CredentialKind, CredentialMutationIntent,
+    CredentialMutationPhase, CredentialPointerCommit, OperationId, PendingRunEvent, ProfileId,
+    ProfileName, ProfileRevision, ProfileState, ProviderErrorCode, ProviderId, ProviderModelId,
     ProviderParameters, PutArtifact, RevisionPrecondition, Run, RunEventKind, RunProviderBinding,
     RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, SaveProfileRevision, Sensitivity,
     Task, ValidationCommit, ValidationCommitPrecondition, ValidationVersions, WorkflowKind,
@@ -15,6 +16,7 @@ use ys_agent_core::{
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
 const RUNTIME_MIGRATION: &str = include_str!("../migrations/0001_runtime.sql");
+const PROVIDER_MIGRATION_V2: &str = include_str!("../migrations/0002_provider_management.sql");
 
 #[tokio::test]
 async fn provider_repository_keeps_active_ready_revision_when_a_new_draft_is_saved() {
@@ -153,6 +155,546 @@ async fn provider_repository_keeps_active_ready_revision_when_a_new_draft_is_sav
         .expect("one profile");
     assert_eq!(summary.state, ProfileState::Draft);
     assert!(summary.is_active);
+
+    let replacement_generation = CredentialGeneration::new(profile_id, 2, CredentialKind::ApiKey)
+        .expect("replacement generation");
+    let mutation_id = OperationId::new();
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::replace(
+                mutation_id,
+                profile_id,
+                3,
+                credential,
+                replacement_generation,
+            )
+            .expect("replacement intent"),
+        )
+        .await
+        .expect("persist replacement intent");
+    repository
+        .record_credential_vault_write(mutation_id)
+        .await
+        .expect("record protected replacement generation");
+    let replacement = ProfileRevision::draft(
+        profile_id,
+        4,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-b").expect("valid model"),
+        ProviderParameters::default(),
+        Some(replacement_generation),
+    )
+    .expect("replacement draft");
+    repository
+        .commit_credential_pointer(
+            CredentialPointerCommit::new(mutation_id, profile_id, 3, replacement)
+                .expect("valid replacement pointer"),
+        )
+        .await
+        .expect("commit new credential revision");
+    repository
+        .complete_credential_mutation(mutation_id)
+        .await
+        .expect("complete retained-generation check");
+
+    assert_eq!(
+        repository
+            .active()
+            .await
+            .expect("read active after credential replacement")
+            .expect("active snapshot remains")
+            .profile_revision(),
+        2
+    );
+    let old_status: String = Connection::open(&database)
+        .expect("open database to inspect retirement status")
+        .query_row(
+            "SELECT status FROM provider_credential_generations
+             WHERE profile_id = ?1 AND generation = ?2",
+            [profile_id.to_string(), credential.number().to_string()],
+            |row| row.get(0),
+        )
+        .expect("old generation metadata");
+    assert_eq!(old_status, "retained");
+
+    let blocked_generation = CredentialGeneration::new(profile_id, 3, CredentialKind::ApiKey)
+        .expect("blocked generation");
+    let blocked_id = OperationId::new();
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::replace(
+                blocked_id,
+                profile_id,
+                4,
+                replacement_generation,
+                blocked_generation,
+            )
+            .expect("blocked intent"),
+        )
+        .await
+        .expect("start mutation before protection becomes uncertain");
+    repository
+        .record_credential_vault_write(blocked_id)
+        .await
+        .expect("record staged generation");
+    repository
+        .block_credential_mutation(
+            blocked_id,
+            ProviderErrorCode::CredentialProtectionUnavailable,
+        )
+        .await
+        .expect("fail closed");
+    assert!(
+        repository
+            .active()
+            .await
+            .expect("read active after fail-closed transition")
+            .is_none(),
+        "an uncertain credential state removes its active snapshot"
+    );
+}
+
+#[tokio::test]
+async fn credential_journal_recovers_all_failure_boundaries() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    let store = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("open migrated runtime store");
+    let repository = store.provider_repository();
+    let profile_id = ProfileId::new();
+    let initial = ProfileRevision::draft(
+        profile_id,
+        1,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-a").expect("valid model"),
+        ProviderParameters::default(),
+        None,
+    )
+    .expect("initial draft");
+    repository
+        .save_revision(SaveProfileRevision {
+            precondition: RevisionPrecondition {
+                profile_id,
+                expected_current_revision: None,
+            },
+            name: ProfileName::new("Primary").expect("valid profile name"),
+            revision: initial,
+        })
+        .await
+        .expect("save initial profile");
+
+    let first_generation =
+        CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey).expect("first generation");
+    let create_id = OperationId::new();
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::create(create_id, profile_id, 1, first_generation)
+                .expect("create intent"),
+        )
+        .await
+        .expect("persist intent before Vault write");
+
+    drop(repository);
+    drop(store);
+    let reopened = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("reopen after intent crash point");
+    let repository = reopened.provider_repository();
+    let pending = repository
+        .pending_credential_mutations()
+        .await
+        .expect("restore pending journal");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].operation_id(), create_id);
+    assert_eq!(pending[0].phase(), CredentialMutationPhase::IntentRecorded);
+    repository
+        .rollback_credential_mutation(create_id)
+        .await
+        .expect("a failed Vault write restores the prior logical state");
+    assert_eq!(
+        repository
+            .load_revision(profile_id, 1)
+            .await
+            .expect("initial revision remains current")
+            .credential_generation(),
+        None
+    );
+
+    let retry_create_id = OperationId::new();
+    let committed_generation = CredentialGeneration::new(profile_id, 2, CredentialKind::ApiKey)
+        .expect("generation numbers are never reused after rollback");
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::create(retry_create_id, profile_id, 1, committed_generation)
+                .expect("retry create intent"),
+        )
+        .await
+        .expect("retry after the failed Vault write");
+    repository
+        .record_credential_vault_write(retry_create_id)
+        .await
+        .expect("record protected Vault generation");
+    drop(repository);
+    drop(reopened);
+    let reopened = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("reopen after Vault-written crash point");
+    let repository = reopened.provider_repository();
+    assert_eq!(
+        repository
+            .pending_credential_mutations()
+            .await
+            .expect("restore Vault-written journal")[0]
+            .phase(),
+        CredentialMutationPhase::VaultWritten
+    );
+
+    let credential_revision = ProfileRevision::draft(
+        profile_id,
+        2,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-a").expect("valid model"),
+        ProviderParameters::default(),
+        Some(committed_generation),
+    )
+    .expect("credential-backed revision");
+    let committed = repository
+        .commit_credential_pointer(
+            CredentialPointerCommit::new(retry_create_id, profile_id, 1, credential_revision)
+                .expect("valid pointer commit"),
+        )
+        .await
+        .expect("atomically append revision and commit pointer");
+    assert_eq!(committed.phase(), CredentialMutationPhase::PointerCommitted);
+    drop(repository);
+    drop(reopened);
+    let reopened = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("reopen after pointer-committed crash point");
+    let repository = reopened.provider_repository();
+    assert_eq!(
+        repository
+            .pending_credential_mutations()
+            .await
+            .expect("restore pointer-committed journal")[0]
+            .phase(),
+        CredentialMutationPhase::PointerCommitted
+    );
+    repository
+        .complete_credential_mutation(retry_create_id)
+        .await
+        .expect("complete successful creation");
+    assert!(
+        repository
+            .pending_credential_mutations()
+            .await
+            .expect("no pending successful mutation")
+            .is_empty()
+    );
+
+    let second_generation = CredentialGeneration::new(profile_id, 3, CredentialKind::ApiKey)
+        .expect("second generation");
+    let replace_id = OperationId::new();
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::replace(
+                replace_id,
+                profile_id,
+                2,
+                committed_generation,
+                second_generation,
+            )
+            .expect("replace intent"),
+        )
+        .await
+        .expect("persist replacement intent");
+    repository
+        .record_credential_vault_write(replace_id)
+        .await
+        .expect("record staged replacement");
+
+    let concurrent_edit = ProfileRevision::draft(
+        profile_id,
+        3,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-b").expect("valid model"),
+        ProviderParameters::default(),
+        Some(committed_generation),
+    )
+    .expect("concurrent profile edit");
+    repository
+        .save_revision(SaveProfileRevision {
+            precondition: RevisionPrecondition {
+                profile_id,
+                expected_current_revision: Some(2),
+            },
+            name: ProfileName::new("Primary").expect("valid profile name"),
+            revision: concurrent_edit,
+        })
+        .await
+        .expect("advance Profile before the late pointer commit");
+    let late_revision = ProfileRevision::draft(
+        profile_id,
+        3,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-a").expect("valid model"),
+        ProviderParameters::default(),
+        Some(second_generation),
+    )
+    .expect("late replacement revision");
+    let error = repository
+        .commit_credential_pointer(
+            CredentialPointerCommit::new(replace_id, profile_id, 2, late_revision)
+                .expect("structurally valid late commit"),
+        )
+        .await
+        .expect_err("a stale SQLite compare-and-swap cannot move the visible pointer");
+    assert_eq!(error.code(), "provider.storage.conflict");
+    drop(repository);
+    drop(reopened);
+    let reopened = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("reopen after cleanup-pending crash point");
+    let repository = reopened.provider_repository();
+    assert_eq!(
+        repository
+            .pending_credential_mutations()
+            .await
+            .expect("load cleanup state")[0]
+            .phase(),
+        CredentialMutationPhase::CleanupPending
+    );
+    assert_eq!(
+        repository
+            .load_revision(profile_id, 3)
+            .await
+            .expect("current revision remains the concurrent edit")
+            .model()
+            .as_str(),
+        "deepseek/model-b"
+    );
+    repository
+        .rollback_credential_mutation(replace_id)
+        .await
+        .expect("record staged generation cleanup");
+
+    let third_generation =
+        CredentialGeneration::new(profile_id, 4, CredentialKind::ApiKey).expect("third generation");
+    let blocked_id = OperationId::new();
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::replace(
+                blocked_id,
+                profile_id,
+                3,
+                committed_generation,
+                third_generation,
+            )
+            .expect("blocked replacement intent"),
+        )
+        .await
+        .expect("start another replacement");
+    repository
+        .record_credential_vault_write(blocked_id)
+        .await
+        .expect("stage another generation");
+    let later_edit = ProfileRevision::draft(
+        profile_id,
+        4,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-c").expect("valid model"),
+        ProviderParameters::default(),
+        Some(committed_generation),
+    )
+    .expect("later concurrent edit");
+    repository
+        .save_revision(SaveProfileRevision {
+            precondition: RevisionPrecondition {
+                profile_id,
+                expected_current_revision: Some(3),
+            },
+            name: ProfileName::new("Primary").expect("valid profile name"),
+            revision: later_edit,
+        })
+        .await
+        .expect("advance Profile before another late pointer commit");
+    let blocked_revision = ProfileRevision::draft(
+        profile_id,
+        4,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-b").expect("valid model"),
+        ProviderParameters::default(),
+        Some(third_generation),
+    )
+    .expect("stale blocked revision");
+    repository
+        .commit_credential_pointer(
+            CredentialPointerCommit::new(blocked_id, profile_id, 3, blocked_revision)
+                .expect("structurally valid blocked commit"),
+        )
+        .await
+        .expect_err("the second stale commit also enters cleanup pending");
+    let blocked = repository
+        .block_credential_mutation(
+            blocked_id,
+            ProviderErrorCode::CredentialProtectionUnavailable,
+        )
+        .await
+        .expect("persist stable fail-closed state");
+    assert!(blocked.blocks_profile_use());
+    drop(repository);
+    drop(reopened);
+    let reopened = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("reopen after blocked recovery state");
+    let repository = reopened.provider_repository();
+    let retry = repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::replace(
+                OperationId::new(),
+                profile_id,
+                4,
+                committed_generation,
+                CredentialGeneration::new(profile_id, 5, CredentialKind::ApiKey)
+                    .expect("fourth generation"),
+            )
+            .expect("retry intent"),
+        )
+        .await
+        .expect_err("a blocked Profile rejects new credential calls");
+    assert_eq!(retry.code(), "provider.credential.protection_unavailable");
+}
+
+#[tokio::test]
+async fn credential_delete_commits_a_credential_free_revision_and_cleans_rollback_generation() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    let store = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("open migrated runtime store");
+    let repository = store.provider_repository();
+    let profile_id = ProfileId::new();
+    let model =
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-a").expect("valid model");
+    repository
+        .save_revision(SaveProfileRevision {
+            precondition: RevisionPrecondition {
+                profile_id,
+                expected_current_revision: None,
+            },
+            name: ProfileName::new("Primary").expect("valid profile name"),
+            revision: ProfileRevision::draft(
+                profile_id,
+                1,
+                ProviderId::DeepSeek,
+                model.clone(),
+                ProviderParameters::default(),
+                None,
+            )
+            .expect("initial draft"),
+        })
+        .await
+        .expect("save initial profile");
+
+    let credential = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+        .expect("credential generation");
+    let create_id = OperationId::new();
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::create(create_id, profile_id, 1, credential)
+                .expect("create intent"),
+        )
+        .await
+        .expect("begin credential creation");
+    repository
+        .record_credential_vault_write(create_id)
+        .await
+        .expect("record created Vault generation");
+    repository
+        .commit_credential_pointer(
+            CredentialPointerCommit::new(
+                create_id,
+                profile_id,
+                1,
+                ProfileRevision::draft(
+                    profile_id,
+                    2,
+                    ProviderId::DeepSeek,
+                    model.clone(),
+                    ProviderParameters::default(),
+                    Some(credential),
+                )
+                .expect("credential revision"),
+            )
+            .expect("create pointer"),
+        )
+        .await
+        .expect("commit credential creation");
+    repository
+        .complete_credential_mutation(create_id)
+        .await
+        .expect("complete credential creation");
+
+    let rollback = CredentialGeneration::new(profile_id, 2, CredentialKind::ApiKey)
+        .expect("protected rollback generation");
+    let delete_id = OperationId::new();
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::delete(delete_id, profile_id, 2, credential, rollback)
+                .expect("delete intent"),
+        )
+        .await
+        .expect("begin credential deletion");
+    repository
+        .record_credential_vault_write(delete_id)
+        .await
+        .expect("record protected rollback copy");
+    repository
+        .commit_credential_pointer(
+            CredentialPointerCommit::new(
+                delete_id,
+                profile_id,
+                2,
+                ProfileRevision::draft(
+                    profile_id,
+                    3,
+                    ProviderId::DeepSeek,
+                    model,
+                    ProviderParameters::default(),
+                    None,
+                )
+                .expect("credential-free revision"),
+            )
+            .expect("delete pointer"),
+        )
+        .await
+        .expect("commit credential-free revision");
+    repository
+        .complete_credential_mutation(delete_id)
+        .await
+        .expect("complete rollback cleanup");
+
+    assert_eq!(
+        repository
+            .load_revision(profile_id, 3)
+            .await
+            .expect("load credential-free revision")
+            .credential_generation(),
+        None
+    );
+    let connection = Connection::open(&database).expect("inspect generation metadata");
+    let statuses: (String, String) = connection
+        .query_row(
+            "SELECT
+                MAX(CASE WHEN generation = 1 THEN status END),
+                MAX(CASE WHEN generation = 2 THEN status END)
+             FROM provider_credential_generations WHERE profile_id = ?1",
+            [profile_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("generation statuses");
+    assert_eq!(statuses, ("retained".to_owned(), "deleted".to_owned()));
 }
 
 fn legacy_runtime_database(path: &Path) {
@@ -174,6 +716,96 @@ fn legacy_runtime_database(path: &Path) {
             [],
         )
         .expect("record runtime migration");
+}
+
+#[tokio::test]
+async fn credential_journal_migration_blocks_unverifiable_pre_contract_recovery_state() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    let mut connection = Connection::open(&database).expect("open v2 database");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );",
+        )
+        .expect("create migration ledger");
+    connection
+        .execute_batch(RUNTIME_MIGRATION)
+        .expect("apply runtime migration");
+    connection
+        .execute_batch(PROVIDER_MIGRATION_V2)
+        .expect("apply pre-contract Provider migration");
+    connection
+        .execute_batch(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'legacy');
+             INSERT INTO schema_migrations(version, applied_at) VALUES (2, 'legacy');",
+        )
+        .expect("record legacy migrations");
+
+    let profile_id = ProfileId::new();
+    let mutation_id = OperationId::new();
+    let transaction = connection.transaction().expect("legacy seed transaction");
+    transaction
+        .execute(
+            "INSERT INTO provider_profiles(
+                profile_id, name, current_revision, created_at, updated_at
+             ) VALUES (?1, 'Primary', 1, 'legacy', 'legacy')",
+            [profile_id.to_string()],
+        )
+        .expect("legacy profile");
+    transaction
+        .execute(
+            "INSERT INTO provider_credential_generations(
+                profile_id, generation, kind, vault_locator, status, created_at, updated_at
+             ) VALUES
+                (?1, 1, 'api_key', 'io.ysda.provider://legacy:1', 'available', 'legacy', 'legacy'),
+                (?1, 2, 'api_key', 'io.ysda.provider://legacy:2', 'available', 'legacy', 'legacy')",
+            [profile_id.to_string()],
+        )
+        .expect("legacy generations");
+    transaction
+        .execute(
+            "INSERT INTO provider_profile_revisions(
+                profile_id, revision, provider, model_id, parameters_json,
+                credential_generation, state, validation_id, created_at
+             ) VALUES (
+                ?1, 1, 'deep_seek', 'deepseek/model-a',
+                '{\"schema_version\":1,\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0,\"provider_specific\":{}}',
+                1, 'draft', NULL, 'legacy'
+             )",
+            [profile_id.to_string()],
+        )
+        .expect("legacy revision");
+    transaction
+        .execute(
+            "INSERT INTO credential_mutations(
+                mutation_id, profile_id, old_generation, new_generation, rollback_generation,
+                operation, phase, error_code, created_at, updated_at
+             ) VALUES (?1, ?2, 1, 2, NULL, 'replace', 'vault_written', NULL, 'legacy', 'legacy')",
+            [mutation_id.to_string(), profile_id.to_string()],
+        )
+        .expect("legacy pending mutation");
+    transaction.commit().expect("commit legacy state");
+    drop(connection);
+
+    let store = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("upgrade journal recovery contract");
+    let pending = store
+        .provider_repository()
+        .pending_credential_mutations()
+        .await
+        .expect("load upgraded recovery record");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].operation_id(), mutation_id);
+    assert_eq!(pending[0].expected_revision(), 1);
+    assert_eq!(pending[0].phase(), CredentialMutationPhase::Blocked);
+    assert_eq!(
+        pending[0].error_code(),
+        Some(ProviderErrorCode::StorageConflict)
+    );
 }
 
 #[tokio::test]

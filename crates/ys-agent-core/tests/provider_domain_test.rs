@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 
 use ys_agent_core::{
     ActiveProviderSlot, CompatibilityEvidence, CredentialGeneration, CredentialKind,
-    ParameterApplicability, PersistedCompatibilityEvidence, PersistedProfileRevision,
-    ProfileHistory, ProfileId, ProfileName, ProfileRevision, ProfileState, ProviderFingerprint,
-    ProviderId, ProviderModelId, ProviderParameterKey, ProviderParameters, RunId,
-    RunProviderBinding, ValidationVersions,
+    CredentialMutationIntent, CredentialMutationOperation, CredentialMutationPhase,
+    CredentialMutationRecord, CredentialPointerCommit, OperationId, ParameterApplicability,
+    PersistedCompatibilityEvidence, PersistedCredentialMutationRecord, PersistedProfileRevision,
+    ProfileHistory, ProfileId, ProfileName, ProfileRevision, ProfileState, ProviderErrorCode,
+    ProviderFingerprint, ProviderId, ProviderModelId, ProviderParameterKey, ProviderParameters,
+    RunId, RunProviderBinding, ValidationVersions,
 };
 
 fn profile_name(value: &str) -> ProfileName {
@@ -72,6 +74,89 @@ fn persisted_ready_revision_hydrates_only_matching_passing_evidence() {
 
     assert_eq!(restored.state(), ProfileState::Ready);
     assert_eq!(restored.validation(), Some(&evidence));
+}
+
+#[test]
+fn credential_journal_contract_preserves_only_valid_non_secret_recovery_state() {
+    let profile_id = ProfileId::new();
+    let old_generation =
+        CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey).expect("old generation");
+    let new_generation =
+        CredentialGeneration::new(profile_id, 2, CredentialKind::ApiKey).expect("new generation");
+    let intent = CredentialMutationIntent::replace(
+        OperationId::new(),
+        profile_id,
+        3,
+        old_generation,
+        new_generation,
+    )
+    .expect("a replacement records both profile-scoped generations");
+    let wrong_kind = CredentialGeneration::new(profile_id, 3, CredentialKind::OAuthConnection)
+        .expect("different credential kind");
+    let error = CredentialMutationIntent::replace(
+        OperationId::new(),
+        profile_id,
+        3,
+        old_generation,
+        wrong_kind,
+    )
+    .expect_err("one mutation cannot cross authentication kinds");
+    assert_eq!(error.code(), "credential_kind_mismatch");
+    let error = CredentialMutationIntent::replace(
+        OperationId::new(),
+        profile_id,
+        3,
+        new_generation,
+        old_generation,
+    )
+    .expect_err("generation numbers never move backwards");
+    assert_eq!(error.code(), "invalid_credential_mutation_shape");
+
+    let record = CredentialMutationRecord::intent_recorded(intent);
+    assert_eq!(record.operation(), CredentialMutationOperation::Replace);
+    assert_eq!(record.phase(), CredentialMutationPhase::IntentRecorded);
+    assert_eq!(record.old_generation(), Some(old_generation));
+    assert_eq!(record.new_generation(), Some(new_generation));
+    assert_eq!(record.error_code(), None);
+
+    let record = record
+        .transition(CredentialMutationPhase::VaultWritten, None)
+        .expect("a staged protected generation can be recorded");
+    let error = record
+        .transition(CredentialMutationPhase::Completed, None)
+        .expect_err("the pointer and cleanup phases cannot be skipped");
+    assert_eq!(error.code(), "invalid_credential_mutation_transition");
+
+    let restored = CredentialMutationRecord::hydrate(PersistedCredentialMutationRecord {
+        operation_id: OperationId::new(),
+        profile_id,
+        expected_revision: 3,
+        operation: CredentialMutationOperation::Replace,
+        old_generation: Some(old_generation),
+        new_generation: Some(new_generation),
+        rollback_generation: None,
+        phase: CredentialMutationPhase::Blocked,
+        error_code: Some(ProviderErrorCode::StorageConflict),
+    })
+    .expect("a persisted fail-closed record restores without inventing state");
+    assert!(restored.blocks_profile_use());
+    assert_eq!(
+        restored.error_code(),
+        Some(ProviderErrorCode::StorageConflict)
+    );
+
+    let replacement = ProfileRevision::draft(
+        profile_id,
+        4,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-a").expect("valid model"),
+        ProviderParameters::default(),
+        Some(new_generation),
+    )
+    .expect("replacement revision");
+    let pointer = CredentialPointerCommit::new(restored.operation_id(), profile_id, 3, replacement)
+        .expect("pointer commit appends the next Draft revision");
+    assert_eq!(pointer.new_generation(), Some(new_generation));
 }
 
 #[test]

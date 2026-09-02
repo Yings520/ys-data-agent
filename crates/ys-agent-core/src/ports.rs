@@ -7,17 +7,18 @@ use crate::{
     ActivateProfileRequest, ActiveProviderSnapshot, ActiveProviderView, AllowedDataScope,
     ArtifactAccessContext, ArtifactMetadata, ArtifactRef, CommandId, CommandReceipt,
     CompatibilityEvidenceView, ContextEvidence, CoreError, CoreResult, CredentialLease,
-    CredentialMutationIntent, CredentialMutationRequest, CredentialPointerCommit,
-    CredentialProtectionStatus, CredentialViewStatus, DeleteProfileRequest,
-    DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, EventEnvelope,
-    FreshnessObservation, MetricDefinition, ModelCapabilities, ModelRequest, ModelResponse,
-    OAuthConnectionView, ObservedSchema, OperationId, PendingRunEvent, Principal, ProfileDetail,
-    ProfileId, ProfileRevision, ProfileSummary, ProtectedCredentialWrite, ProviderCatalogView,
-    ProviderClientBinding, ProviderCredentialReference, ProviderDoctorView, ProviderResult,
-    PutArtifact, QueryBudget, QueryPreflight, QueryRequest, QueryResult, RemoteRevocationOutcome,
-    ResolvedRunProvider, RunId, RunProviderBinding, RunSnapshot, SaveProfileRequest,
-    SaveProfileRevision, Session, SessionId, SourceId, Task, TaskId, ToolCallId, ToolOutcome,
-    ToolSpec, ValidateProfileRequest, ValidationCommit, WorkspaceId,
+    CredentialMutationIntent, CredentialMutationRecord, CredentialMutationRequest,
+    CredentialPointerCommit, CredentialProtectionStatus, CredentialViewStatus,
+    DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
+    EventEnvelope, FreshnessObservation, MetricDefinition, ModelCapabilities, ModelRequest,
+    ModelResponse, OAuthConnectionView, ObservedSchema, OperationId, PendingRunEvent, Principal,
+    ProfileDetail, ProfileId, ProfileRevision, ProfileSummary, ProtectedCredentialWrite,
+    ProviderCatalogView, ProviderClientBinding, ProviderCredentialReference, ProviderDoctorView,
+    ProviderErrorCode, ProviderResult, PutArtifact, QueryBudget, QueryPreflight, QueryRequest,
+    QueryResult, RemoteRevocationOutcome, ResolvedRunProvider, RunId, RunProviderBinding,
+    RunSnapshot, SaveProfileRequest, SaveProfileRevision, Session, SessionId, SourceId, Task,
+    TaskId, ToolCallId, ToolOutcome, ToolSpec, ValidateProfileRequest, ValidationCommit,
+    WorkspaceId,
 };
 
 /// A production Run is only created from this complete, immutable Provider snapshot. The Store
@@ -245,14 +246,35 @@ pub trait ProviderProfileRepository: Send + Sync {
     async fn begin_credential_mutation(
         &self,
         intent: CredentialMutationIntent,
-    ) -> ProviderResult<OperationId>;
+    ) -> ProviderResult<CredentialMutationRecord>;
+
+    async fn record_credential_vault_write(
+        &self,
+        mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord>;
 
     async fn commit_credential_pointer(
         &self,
         commit: CredentialPointerCommit,
-    ) -> ProviderResult<()>;
+    ) -> ProviderResult<CredentialMutationRecord>;
 
-    async fn pending_credential_mutations(&self) -> ProviderResult<Vec<CredentialMutationIntent>>;
+    async fn complete_credential_mutation(
+        &self,
+        mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord>;
+
+    async fn rollback_credential_mutation(
+        &self,
+        mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord>;
+
+    async fn block_credential_mutation(
+        &self,
+        mutation_id: OperationId,
+        error_code: ProviderErrorCode,
+    ) -> ProviderResult<CredentialMutationRecord>;
+
+    async fn pending_credential_mutations(&self) -> ProviderResult<Vec<CredentialMutationRecord>>;
 
     async fn delete_profile(&self, request: DeleteProfileRequest) -> ProviderResult<()>;
 }

@@ -1415,18 +1415,477 @@ pub struct ActivationPrecondition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialMutationIntent {
+    operation_id: OperationId,
+    profile_id: ProfileId,
+    expected_revision: u64,
+    expected_generation: Option<CredentialGeneration>,
+    operation: CredentialMutationOperation,
+    old_generation: Option<CredentialGeneration>,
+    new_generation: Option<CredentialGeneration>,
+    rollback_generation: Option<CredentialGeneration>,
+}
+
+impl CredentialMutationIntent {
+    pub fn create(
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        expected_revision: u64,
+        new_generation: CredentialGeneration,
+    ) -> CoreResult<Self> {
+        Self::new(
+            operation_id,
+            profile_id,
+            expected_revision,
+            CredentialMutationOperation::Create,
+            None,
+            Some(new_generation),
+            None,
+        )
+    }
+
+    pub fn replace(
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        expected_revision: u64,
+        old_generation: CredentialGeneration,
+        new_generation: CredentialGeneration,
+    ) -> CoreResult<Self> {
+        Self::new(
+            operation_id,
+            profile_id,
+            expected_revision,
+            CredentialMutationOperation::Replace,
+            Some(old_generation),
+            Some(new_generation),
+            None,
+        )
+    }
+
+    pub fn refresh(
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        expected_revision: u64,
+        old_generation: CredentialGeneration,
+        new_generation: CredentialGeneration,
+    ) -> CoreResult<Self> {
+        Self::new(
+            operation_id,
+            profile_id,
+            expected_revision,
+            CredentialMutationOperation::Refresh,
+            Some(old_generation),
+            Some(new_generation),
+            None,
+        )
+    }
+
+    pub fn delete(
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        expected_revision: u64,
+        old_generation: CredentialGeneration,
+        rollback_generation: CredentialGeneration,
+    ) -> CoreResult<Self> {
+        Self::new(
+            operation_id,
+            profile_id,
+            expected_revision,
+            CredentialMutationOperation::Delete,
+            Some(old_generation),
+            None,
+            Some(rollback_generation),
+        )
+    }
+
+    pub fn revoke(
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        expected_revision: u64,
+        old_generation: CredentialGeneration,
+        rollback_generation: CredentialGeneration,
+    ) -> CoreResult<Self> {
+        Self::new(
+            operation_id,
+            profile_id,
+            expected_revision,
+            CredentialMutationOperation::Revoke,
+            Some(old_generation),
+            None,
+            Some(rollback_generation),
+        )
+    }
+
+    fn new(
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        expected_revision: u64,
+        operation: CredentialMutationOperation,
+        old_generation: Option<CredentialGeneration>,
+        new_generation: Option<CredentialGeneration>,
+        rollback_generation: Option<CredentialGeneration>,
+    ) -> CoreResult<Self> {
+        if expected_revision == 0 {
+            return Err(CoreError::validation(
+                "invalid_credential_mutation_revision",
+                "credential mutations require a persisted Profile revision",
+            ));
+        }
+        for generation in [old_generation, new_generation, rollback_generation]
+            .into_iter()
+            .flatten()
+        {
+            if generation.profile_id() != profile_id {
+                return Err(CoreError::validation(
+                    "credential_profile_mismatch",
+                    "credential journal generations belong to the mutation Profile",
+                ));
+            }
+        }
+        let expected_kind = old_generation
+            .or(new_generation)
+            .or(rollback_generation)
+            .map(CredentialGeneration::kind);
+        if [old_generation, new_generation, rollback_generation]
+            .into_iter()
+            .flatten()
+            .any(|generation| Some(generation.kind()) != expected_kind)
+        {
+            return Err(CoreError::validation(
+                "credential_kind_mismatch",
+                "credential journal generations use one authentication kind",
+            ));
+        }
+        let shape_is_valid = match operation {
+            CredentialMutationOperation::Create => {
+                old_generation.is_none()
+                    && new_generation.is_some()
+                    && rollback_generation.is_none()
+            }
+            CredentialMutationOperation::Replace | CredentialMutationOperation::Refresh => {
+                matches!(
+                    (old_generation, new_generation),
+                    (Some(old), Some(new)) if new.number() > old.number()
+                ) && rollback_generation.is_none()
+            }
+            CredentialMutationOperation::Delete | CredentialMutationOperation::Revoke => {
+                matches!(
+                    (old_generation, rollback_generation),
+                    (Some(old), Some(rollback)) if rollback.number() > old.number()
+                ) && new_generation.is_none()
+            }
+        };
+        if !shape_is_valid {
+            return Err(CoreError::validation(
+                "invalid_credential_mutation_shape",
+                "credential journal operation and generation references must agree",
+            ));
+        }
+        Ok(Self {
+            operation_id,
+            profile_id,
+            expected_revision,
+            expected_generation: old_generation,
+            operation,
+            old_generation,
+            new_generation,
+            rollback_generation,
+        })
+    }
+
+    pub fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub fn profile_id(&self) -> ProfileId {
+        self.profile_id
+    }
+
+    pub fn expected_revision(&self) -> u64 {
+        self.expected_revision
+    }
+
+    pub fn expected_generation(&self) -> Option<CredentialGeneration> {
+        self.expected_generation
+    }
+
+    pub fn operation(&self) -> CredentialMutationOperation {
+        self.operation
+    }
+
+    pub fn old_generation(&self) -> Option<CredentialGeneration> {
+        self.old_generation
+    }
+
+    pub fn new_generation(&self) -> Option<CredentialGeneration> {
+        self.new_generation
+    }
+
+    pub fn rollback_generation(&self) -> Option<CredentialGeneration> {
+        self.rollback_generation
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialMutationOperation {
+    Create,
+    Replace,
+    Refresh,
+    Delete,
+    Revoke,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialMutationPhase {
+    IntentRecorded,
+    VaultWritten,
+    PointerCommitted,
+    CleanupPending,
+    RolledBack,
+    Completed,
+    Blocked,
+}
+
+impl CredentialMutationPhase {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::RolledBack | Self::Completed | Self::Blocked)
+    }
+}
+
+/// Durable non-sensitive input for credential recovery. It names only immutable generation
+/// references and stable errors; a Vault locator or secret can never enter this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedCredentialMutationRecord {
     pub operation_id: OperationId,
     pub profile_id: ProfileId,
     pub expected_revision: u64,
-    pub expected_generation: Option<CredentialGeneration>,
+    pub operation: CredentialMutationOperation,
+    pub old_generation: Option<CredentialGeneration>,
+    pub new_generation: Option<CredentialGeneration>,
+    pub rollback_generation: Option<CredentialGeneration>,
+    pub phase: CredentialMutationPhase,
+    pub error_code: Option<ProviderErrorCode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialMutationRecord {
+    intent: CredentialMutationIntent,
+    phase: CredentialMutationPhase,
+    error_code: Option<ProviderErrorCode>,
+}
+
+impl CredentialMutationRecord {
+    pub fn intent_recorded(intent: CredentialMutationIntent) -> Self {
+        Self {
+            intent,
+            phase: CredentialMutationPhase::IntentRecorded,
+            error_code: None,
+        }
+    }
+
+    pub fn hydrate(persisted: PersistedCredentialMutationRecord) -> CoreResult<Self> {
+        validate_credential_mutation_error(persisted.phase, persisted.error_code)?;
+        let intent = CredentialMutationIntent::new(
+            persisted.operation_id,
+            persisted.profile_id,
+            persisted.expected_revision,
+            persisted.operation,
+            persisted.old_generation,
+            persisted.new_generation,
+            persisted.rollback_generation,
+        )?;
+        Ok(Self {
+            intent,
+            phase: persisted.phase,
+            error_code: persisted.error_code,
+        })
+    }
+
+    pub fn persisted(&self) -> PersistedCredentialMutationRecord {
+        PersistedCredentialMutationRecord {
+            operation_id: self.operation_id(),
+            profile_id: self.profile_id(),
+            expected_revision: self.expected_revision(),
+            operation: self.operation(),
+            old_generation: self.old_generation(),
+            new_generation: self.new_generation(),
+            rollback_generation: self.rollback_generation(),
+            phase: self.phase(),
+            error_code: self.error_code(),
+        }
+    }
+
+    pub fn transition(
+        mut self,
+        phase: CredentialMutationPhase,
+        error_code: Option<ProviderErrorCode>,
+    ) -> CoreResult<Self> {
+        validate_credential_mutation_error(phase, error_code)?;
+        if !credential_mutation_transition_is_valid(self.phase, phase) {
+            return Err(CoreError::validation(
+                "invalid_credential_mutation_transition",
+                "credential journal phases must advance through the recovery state machine",
+            ));
+        }
+        self.phase = phase;
+        self.error_code = error_code;
+        Ok(self)
+    }
+
+    pub fn operation_id(&self) -> OperationId {
+        self.intent.operation_id()
+    }
+
+    pub fn profile_id(&self) -> ProfileId {
+        self.intent.profile_id()
+    }
+
+    pub fn expected_revision(&self) -> u64 {
+        self.intent.expected_revision()
+    }
+
+    pub fn expected_generation(&self) -> Option<CredentialGeneration> {
+        self.intent.expected_generation()
+    }
+
+    pub fn operation(&self) -> CredentialMutationOperation {
+        self.intent.operation()
+    }
+
+    pub fn old_generation(&self) -> Option<CredentialGeneration> {
+        self.intent.old_generation()
+    }
+
+    pub fn new_generation(&self) -> Option<CredentialGeneration> {
+        self.intent.new_generation()
+    }
+
+    pub fn rollback_generation(&self) -> Option<CredentialGeneration> {
+        self.intent.rollback_generation()
+    }
+
+    pub fn phase(&self) -> CredentialMutationPhase {
+        self.phase
+    }
+
+    pub fn error_code(&self) -> Option<ProviderErrorCode> {
+        self.error_code
+    }
+
+    pub fn requires_reconciliation(&self) -> bool {
+        !self.phase.is_terminal()
+    }
+
+    pub fn blocks_profile_use(&self) -> bool {
+        self.phase == CredentialMutationPhase::Blocked
+    }
+}
+
+fn validate_credential_mutation_error(
+    phase: CredentialMutationPhase,
+    error_code: Option<ProviderErrorCode>,
+) -> CoreResult<()> {
+    if phase == CredentialMutationPhase::Blocked && error_code.is_none() {
+        return Err(CoreError::validation(
+            "credential_mutation_block_reason_required",
+            "a blocked credential mutation requires a stable error code",
+        ));
+    }
+    if phase != CredentialMutationPhase::Blocked && error_code.is_some() {
+        return Err(CoreError::validation(
+            "credential_mutation_unexpected_error_code",
+            "only blocked credential mutations persist an error code",
+        ));
+    }
+    Ok(())
+}
+
+fn credential_mutation_transition_is_valid(
+    current: CredentialMutationPhase,
+    next: CredentialMutationPhase,
+) -> bool {
+    matches!(
+        (current, next),
+        (
+            CredentialMutationPhase::IntentRecorded,
+            CredentialMutationPhase::VaultWritten
+                | CredentialMutationPhase::RolledBack
+                | CredentialMutationPhase::Blocked
+        ) | (
+            CredentialMutationPhase::VaultWritten,
+            CredentialMutationPhase::PointerCommitted
+                | CredentialMutationPhase::CleanupPending
+                | CredentialMutationPhase::RolledBack
+                | CredentialMutationPhase::Blocked
+        ) | (
+            CredentialMutationPhase::PointerCommitted,
+            CredentialMutationPhase::CleanupPending
+                | CredentialMutationPhase::Completed
+                | CredentialMutationPhase::Blocked
+        ) | (
+            CredentialMutationPhase::CleanupPending,
+            CredentialMutationPhase::RolledBack
+                | CredentialMutationPhase::Completed
+                | CredentialMutationPhase::Blocked
+        )
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CredentialPointerCommit {
-    pub mutation_id: OperationId,
-    pub profile_id: ProfileId,
-    pub expected_revision: u64,
-    pub new_generation: Option<CredentialGeneration>,
+    mutation_id: OperationId,
+    profile_id: ProfileId,
+    expected_revision: u64,
+    replacement_revision: ProfileRevision,
+}
+
+impl CredentialPointerCommit {
+    pub fn new(
+        mutation_id: OperationId,
+        profile_id: ProfileId,
+        expected_revision: u64,
+        replacement_revision: ProfileRevision,
+    ) -> CoreResult<Self> {
+        let next_revision = expected_revision.checked_add(1);
+        if expected_revision == 0
+            || replacement_revision.profile_id() != profile_id
+            || Some(replacement_revision.revision()) != next_revision
+            || replacement_revision.state() != ProfileState::Draft
+            || replacement_revision.validation().is_some()
+        {
+            return Err(CoreError::validation(
+                "invalid_credential_pointer_commit",
+                "credential pointer commits append the next unvalidated revision for the same Profile",
+            ));
+        }
+        Ok(Self {
+            mutation_id,
+            profile_id,
+            expected_revision,
+            replacement_revision,
+        })
+    }
+
+    pub fn mutation_id(&self) -> OperationId {
+        self.mutation_id
+    }
+
+    pub fn profile_id(&self) -> ProfileId {
+        self.profile_id
+    }
+
+    pub fn expected_revision(&self) -> u64 {
+        self.expected_revision
+    }
+
+    pub fn replacement_revision(&self) -> &ProfileRevision {
+        &self.replacement_revision
+    }
+
+    pub fn new_generation(&self) -> Option<CredentialGeneration> {
+        self.replacement_revision.credential_generation()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
