@@ -15,6 +15,7 @@ const MIGRATION_0002: &str = include_str!("../migrations/0002_provider_managemen
 const MIGRATION_0003: &str = include_str!("../migrations/0003_credential_journal_recovery.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_run_binding_activation_revision.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_invalid_validation_state.sql");
+const MIGRATION_0006: &str = include_str!("../migrations/0006_profile_tombstone.sql");
 
 #[derive(Debug, Clone)]
 pub struct SqliteRuntimeStore {
@@ -131,22 +132,21 @@ fn apply_migrations(connection: &mut Connection) -> CoreResult<()> {
             |row| row.get(0),
         )
         .map_err(storage_error)?;
-    if migration_five_applied {
-        return Ok(());
+    if !migration_five_applied {
+        // SQLite cannot change a CHECK constraint in place. The v5 rebuild keeps the table name
+        // and all rows stable; foreign keys are verified again immediately after the rebuild.
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .map_err(storage_error)?;
+        let migration_result = apply_invalid_validation_migration(connection);
+        let foreign_key_result = connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(storage_error);
+        migration_result?;
+        foreign_key_result?;
+        verify_foreign_keys(connection)?;
     }
-
-    // SQLite cannot change a CHECK constraint in place. The v5 rebuild keeps the table name and
-    // all rows stable; foreign keys are verified again immediately after the atomic rebuild.
-    connection
-        .pragma_update(None, "foreign_keys", "OFF")
-        .map_err(storage_error)?;
-    let migration_result = apply_invalid_validation_migration(connection);
-    let foreign_key_result = connection
-        .pragma_update(None, "foreign_keys", "ON")
-        .map_err(storage_error);
-    migration_result?;
-    foreign_key_result?;
-    verify_foreign_keys(connection)
+    apply_profile_tombstone_migration(connection)
 }
 
 fn apply_invalid_validation_migration(connection: &mut Connection) -> CoreResult<()> {
@@ -171,6 +171,19 @@ fn verify_foreign_keys(connection: &Connection) -> CoreResult<()> {
         });
     }
     Ok(())
+}
+
+fn apply_profile_tombstone_migration(connection: &mut Connection) -> CoreResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+    if !migration_is_applied(&transaction, 6)? {
+        transaction
+            .execute_batch(MIGRATION_0006)
+            .map_err(storage_error)?;
+        record_migration(&transaction, 6)?;
+    }
+    transaction.commit().map_err(storage_error)
 }
 
 fn migration_is_applied(transaction: &Transaction<'_>, version: i64) -> CoreResult<bool> {

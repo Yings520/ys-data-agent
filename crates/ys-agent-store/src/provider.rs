@@ -8,12 +8,13 @@ use ys_agent_core::{
     ActivateProfileRequest, ActiveProviderSnapshot, CredentialGeneration, CredentialKind,
     CredentialMutationIntent, CredentialMutationOperation, CredentialMutationPhase,
     CredentialMutationRecord, CredentialMutationRepository, CredentialPointerCommit,
-    CredentialViewStatus, OperationId, PersistedCompatibilityEvidence,
+    CredentialViewStatus, DeleteProfileRequest, OperationId, PersistedCompatibilityEvidence,
     PersistedCredentialMutationRecord, PersistedProfileRevision, ProfileId, ProfileRevision,
     ProfileRevisionRepository, ProfileState, ProfileSummary, ProviderErrorCode, ProviderField,
-    ProviderId, ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
-    ProviderResult, RevisionPrecondition, RunId, RunProviderBinding, RunProviderBindingRepository,
-    SaveProfileRevision, ValidationActivationRepository, ValidationCommit,
+    ProviderId, ProviderManagementError, ProviderModelId, ProviderParameters,
+    ProviderProfileRepository, ProviderRemediation, ProviderResult, RevisionPrecondition, RunId,
+    RunProviderBinding, RunProviderBindingRepository, SaveProfileRevision,
+    ValidationActivationRepository, ValidationCommit,
 };
 
 use crate::{SqliteRuntimeStore, sqlite::open_connection};
@@ -173,6 +174,7 @@ impl SqliteProviderRepository {
                      LEFT JOIN provider_credential_generations AS credential
                        ON credential.profile_id = revision.profile_id
                       AND credential.generation = revision.credential_generation
+                     WHERE profile.deleted_at IS NULL
                      ORDER BY profile.name COLLATE NOCASE",
                 )
                 .map_err(provider_storage_error)?;
@@ -458,6 +460,94 @@ impl SqliteProviderRepository {
                         .map_err(|_| internal_error())
                 })
                 .transpose()
+        })
+        .await
+    }
+
+    pub async fn delete_profile(&self, request: DeleteProfileRequest) -> ProviderResult<()> {
+        self.with_connection(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(provider_storage_error)?;
+            if current_revision(&transaction, request.profile_id)?
+                != Some(request.expected_revision)
+            {
+                return Err(operation_stale_error());
+            }
+            let has_nonterminal_run: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM run_provider_bindings AS binding
+                        JOIN runs AS run ON run.run_id = binding.run_id
+                        WHERE binding.profile_id = ?1
+                          AND run.status NOT IN ('Succeeded', 'Failed', 'Cancelled')
+                     )",
+                    [request.profile_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(provider_storage_error)?;
+            if has_nonterminal_run {
+                return Err(operation_stale_error());
+            }
+
+            let active: Option<(String, i64, i64)> = transaction
+                .query_row(
+                    "SELECT profile_id, revision, activation_revision
+                     FROM active_provider WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(provider_storage_error)?;
+            let active_matches_request = active.as_ref().zip(request.expected_active).is_some_and(
+                |((profile_id, revision, activation_revision), expected)| {
+                    profile_id == &expected.profile_id.to_string()
+                        && *revision == i64::try_from(expected.revision).ok().unwrap_or_default()
+                        && *activation_revision
+                            == i64::try_from(expected.activation_revision)
+                                .ok()
+                                .unwrap_or_default()
+                },
+            );
+            if active.is_some() != request.expected_active.is_some() || !active_matches_request {
+                return Err(activation_error());
+            }
+            if active
+                .as_ref()
+                .is_some_and(|(profile_id, _, _)| profile_id == &request.profile_id.to_string())
+            {
+                if !request.enter_no_active_provider {
+                    return Err(ProviderManagementError::new(
+                        ProviderErrorCode::ActivationPreconditionFailed,
+                        Some(ProviderField::Activation),
+                        ProviderRemediation::EnterNoActiveProvider,
+                    ));
+                }
+                transaction
+                    .execute("DELETE FROM active_provider WHERE singleton = 1", [])
+                    .map_err(provider_storage_error)?;
+            }
+            transaction
+                .execute(
+                    "UPDATE provider_credential_generations
+                     SET status = 'deleted', updated_at = ?1
+                     WHERE profile_id = ?2 AND status != 'deleted'",
+                    params![Utc::now().to_rfc3339(), request.profile_id.to_string()],
+                )
+                .map_err(provider_storage_error)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE provider_profiles
+                     SET deleted_at = ?1, updated_at = ?1
+                     WHERE profile_id = ?2 AND deleted_at IS NULL",
+                    params![Utc::now().to_rfc3339(), request.profile_id.to_string()],
+                )
+                .map_err(provider_storage_error)?;
+            if changed != 1 {
+                return Err(operation_stale_error());
+            }
+            transaction.commit().map_err(provider_storage_error)
         })
         .await
     }
@@ -1077,6 +1167,13 @@ impl CredentialMutationRepository for SqliteProviderRepository {
     }
 }
 
+#[async_trait]
+impl ProviderProfileRepository for SqliteProviderRepository {
+    async fn delete_profile(&self, request: DeleteProfileRequest) -> ProviderResult<()> {
+        SqliteProviderRepository::delete_profile(self, request).await
+    }
+}
+
 fn credential_mutation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CredentialMutationRow> {
     Ok((
         row.get(0)?,
@@ -1285,7 +1382,8 @@ fn credential_locator(generation: CredentialGeneration) -> String {
 fn current_revision(connection: &Connection, profile_id: ProfileId) -> ProviderResult<Option<u64>> {
     connection
         .query_row(
-            "SELECT current_revision FROM provider_profiles WHERE profile_id = ?1",
+            "SELECT current_revision FROM provider_profiles
+             WHERE profile_id = ?1 AND deleted_at IS NULL",
             [profile_id.to_string()],
             |row| row.get::<_, i64>(0),
         )

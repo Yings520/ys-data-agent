@@ -1,8 +1,7 @@
 //! Provider Profile lifecycle orchestration.
 //!
-//! This module owns non-sensitive Profile browsing, Draft revision persistence, and copying. It
-//! deliberately has no Vault, OAuth, model client, probe, Query, or deletion authority; those
-//! flows arrive in their dedicated tasks.
+//! This module owns Profile lifecycle transitions while keeping credential material behind the
+//! Vault port and Query bindings behind their dedicated repository.
 
 use std::{
     collections::HashSet,
@@ -13,12 +12,12 @@ use ys_agent_core::{
     ActivateProfileRequest, ActivationConfirmation, ActiveProviderSnapshot, ActiveProviderView,
     CredentialGeneration, CredentialKind, CredentialMutation, CredentialMutationIntent,
     CredentialMutationOperation, CredentialMutationRepository, CredentialMutationRequest,
-    CredentialProtectionStatus, CredentialVault, CredentialViewStatus, OperationId, ProfileDetail,
-    ProfileId, ProfileName, ProfileRevision, ProfileSummary, ProtectedCredentialWrite,
-    ProviderCredentialReference, ProviderErrorCode, ProviderField, ProviderManagementError,
-    ProviderRemediation, ProviderResult, RevisionPrecondition, RunProviderBindingRepository,
-    SaveProfileRequest, SaveProfileRevision, SecretValue, ValidationActivationRepository,
-    ValidationCommit,
+    CredentialProtectionStatus, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
+    OperationId, ProfileDetail, ProfileId, ProfileName, ProfileRevision, ProfileSummary,
+    ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode, ProviderField,
+    ProviderManagementError, ProviderProfileRepository, ProviderRemediation, ProviderResult,
+    RevisionPrecondition, RunProviderBindingRepository, SaveProfileRequest, SaveProfileRevision,
+    SecretValue, ValidationCommit,
 };
 use zeroize::Zeroizing;
 
@@ -26,10 +25,10 @@ use super::validation::{LocalProfileValidationRequest, LocalProfileValidator};
 
 /// Profile lifecycle, validation, and activation orchestration.
 ///
-/// It depends on the validation/activation port so it can append Drafts, submit evidence, and
-/// switch the active singleton without acquiring credential mutation or deletion authority.
+/// It acquires the full Profile port only because delete needs the same atomic CAS that owns the
+/// active singleton; secrets remain accessible solely through the Vault parameter of that flow.
 pub struct ProviderManagementService {
-    profiles: Arc<dyn ValidationActivationRepository>,
+    profiles: Arc<dyn ProviderProfileRepository>,
     local_validator: LocalProfileValidator,
     cancelled_operations: Mutex<HashSet<OperationId>>,
 }
@@ -285,7 +284,7 @@ impl CredentialService {
 }
 
 impl ProviderManagementService {
-    pub fn new(profiles: Arc<dyn ValidationActivationRepository>) -> Self {
+    pub fn new(profiles: Arc<dyn ProviderProfileRepository>) -> Self {
         Self {
             profiles,
             local_validator: LocalProfileValidator::default(),
@@ -346,6 +345,49 @@ impl ProviderManagementService {
         self.activation_confirmation(&request).await?;
         let active = self.profiles.activate(request).await?;
         Ok(ActiveProviderView::from(&active))
+    }
+
+    /// Deletes a Profile only after its current credential is removed from the Vault. The store
+    /// then atomically validates Run/active CAS conditions, tombstones the Profile for historical
+    /// bindings, and enters no-active only after explicit confirmation.
+    pub async fn delete_profile(
+        &self,
+        request: DeleteProfileRequest,
+        vault: &dyn CredentialVault,
+        run_bindings: &dyn RunProviderBindingRepository,
+    ) -> ProviderResult<()> {
+        self.require_not_cancelled(request.operation_id)?;
+        let detail = self.load_profile(request.profile_id).await?;
+        if detail.revision != request.expected_revision
+            || run_bindings
+                .has_nonterminal_profile_references(request.profile_id)
+                .await?
+        {
+            return Err(ProviderManagementError::new(
+                ProviderErrorCode::OperationStale,
+                Some(ProviderField::Provider),
+                ProviderRemediation::WaitForCurrentOperation,
+            ));
+        }
+        let rollback_write = if let Some(generation) = detail.credential_generation {
+            let reference = credential_reference(generation);
+            let lease = vault.read_generation(reference.clone()).await?;
+            let secret = lease.with_secret(|secret| {
+                let mut copied = Zeroizing::new(secret.with_exposed(str::to_owned));
+                SecretValue::from_utf8(std::mem::take(&mut *copied))
+            });
+            vault.delete_generation(reference.clone()).await?;
+            Some(ProtectedCredentialWrite { reference, secret })
+        } else {
+            None
+        };
+        if let Err(error) = self.profiles.delete_profile(request).await {
+            if let Some(write) = rollback_write {
+                let _ = vault.write_generation(write).await;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Cancellation is idempotent and only prevents an operation that has not crossed a durable

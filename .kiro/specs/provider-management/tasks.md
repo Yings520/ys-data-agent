@@ -175,7 +175,7 @@
   - _Requirements: 2.6, 5.6, 6.1, 6.2, 6.3, 6.4, 7.5, 7.6_
   - _Boundary: ProviderManagementService validation and activation orchestration_
   - _Depends: 2.2, 4.2, 4.3, 4.4_
-- [ ] 4.6 实现 Profile 删除、no-active 与 Credential retirement
+- [x] 4.6 实现 Profile 删除、no-active 与 Credential retirement
   - 删除非活动 Profile 前确认并清理其专属 Credential；存在非终态 Run 引用时拒绝删除并保留历史 binding。
   - 删除活动 Profile 必须先激活另一 Ready revision，或显式进入 no-active；远端撤销失败返回已清理本地状态、残留风险和 remediation。
   - no-active 是可浏览的管理状态，但新 Query 必须得到稳定 `provider.no_active_profile`，不得选择其他 Profile。
