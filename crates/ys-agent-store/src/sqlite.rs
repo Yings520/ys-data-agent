@@ -339,8 +339,21 @@ fn insert_run_provider_binding(
                 i64::try_from(binding.activation_revision()).map_err(storage_error)?,
             ],
         )
-        .map_err(storage_error)?;
+        .map_err(run_binding_error)?;
     Ok(())
+}
+
+fn run_binding_error(error: rusqlite::Error) -> CoreError {
+    if error
+        .to_string()
+        .contains("Run Provider binding requires the current active snapshot")
+    {
+        return CoreError::validation(
+            "active_provider_snapshot_changed",
+            "the active Provider changed before the new Run could be committed",
+        );
+    }
+    storage_error(error)
 }
 
 fn insert_artifact(transaction: &Transaction<'_>, metada: &ArtifactMetadata) -> CoreResult<()> {

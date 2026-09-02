@@ -25,9 +25,10 @@ pub use loop_driver::{
 };
 pub use recovery::{RecoveryDecision, RecoveryManager, RecoveryRequest};
 pub use service::{
-    AgentServiceApi, ArtifactView, CreateTaskRequest, EventSubscription, InProcessAgentService,
-    NoopRunScheduler, RunScheduler, SendMessageRequest, ServiceEvent, ServiceEventPublisher,
-    ServiceReply, StaticRunProviderBindingSource, UnavailableRunProviderBindingSource,
+    ActiveRunProviderBindingSource, AgentServiceApi, ArtifactView, CreateTaskRequest,
+    EventSubscription, InProcessAgentService, NoopRunScheduler, RunScheduler, SendMessageRequest,
+    ServiceEvent, ServiceEventPublisher, ServiceReply, StaticRunProviderBindingSource,
+    UnavailableRunProviderBindingSource,
 };
 pub use workflow::query::{
     ClarificationNeed, FreshnessState, MetricReference, ParameterKind, QUERY_SYSTEM_PROMPT_VERSION,

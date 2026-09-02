@@ -10,12 +10,13 @@ use ys_agent_core::{
     ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, ArtifactKind, ArtifactMetadata,
     ArtifactRef, ArtifactStore, CommandId, CommandReceipt, CommandResultKind,
     CompatibilityEvidence, ContextManifest, CoreError, CoreResult, CredentialGeneration,
-    CredentialKind, EventActor, EventEnvelope, ExportFormat, ModelMessage, ModelProvider,
-    ModelRequest, ModelRole, PendingRunEvent, Principal, ProfileId, ProfileRevision,
-    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError, ProviderModelId,
-    ProviderParameters, ProviderRemediation, ProviderResult, PutArtifact, RetentionPolicy, Run,
-    RunEventKind, RunId, RunProviderBinding, RunProviderBindingSource, RunSnapshot, RunStatus,
-    RuntimeCommandBatch, RuntimeStore, Sensitivity, Session, SessionId, Task, TaskId,
+    CredentialKind, CredentialVault, CredentialViewStatus, EventActor, EventEnvelope, ExportFormat,
+    ModelMessage, ModelProvider, ModelRequest, ModelRole, PendingRunEvent, Principal, ProfileId,
+    ProfileRevision, ProfileRevisionRepository, ProviderCredentialReference, ProviderErrorCode,
+    ProviderField, ProviderId, ProviderManagementError, ProviderModelId, ProviderParameters,
+    ProviderRemediation, ProviderResult, PutArtifact, RetentionPolicy, Run, RunEventKind, RunId,
+    RunProviderBinding, RunProviderBindingRepository, RunProviderBindingSource, RunSnapshot,
+    RunStatus, RuntimeCommandBatch, RuntimeStore, Sensitivity, Session, SessionId, Task, TaskId,
     ValidationVersions, WorkflowKind, WorkspaceId,
 };
 
@@ -28,6 +29,7 @@ use crate::{
 const DEFAULT_EVENT_CAPACITY: usize = 64;
 const ARTIFACT_PREVIEW_LIMIT: usize = 4_096;
 const DEFAULT_ARTIFACT_RETENTION_DAYS: u32 = 7;
+const ACTIVE_SNAPSHOT_RETRY_LIMIT: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateTaskRequest {
@@ -280,11 +282,61 @@ pub struct UnavailableRunProviderBindingSource;
 #[async_trait]
 impl RunProviderBindingSource for UnavailableRunProviderBindingSource {
     async fn bind_new_run(&self, _run_id: RunId) -> ProviderResult<RunProviderBinding> {
-        Err(ProviderManagementError::new(
-            ProviderErrorCode::NoActiveProfile,
-            Some(ProviderField::Activation),
-            ProviderRemediation::EnterNoActiveProvider,
-        ))
+        Err(no_active_profile_error())
+    }
+}
+
+/// Production binding source. It reads the durable active Ready snapshot for every new Run and
+/// verifies the exact credential generation in both durable metadata and the protected vault.
+/// SQLite rejects a snapshot changed after this read; `InProcessAgentService` then retries the
+/// complete read-and-create operation rather than mixing snapshots.
+#[derive(Clone)]
+pub struct ActiveRunProviderBindingSource {
+    profiles: Arc<dyn ProfileRevisionRepository>,
+    bindings: Arc<dyn RunProviderBindingRepository>,
+    vault: Arc<dyn CredentialVault>,
+}
+
+impl ActiveRunProviderBindingSource {
+    pub fn new(
+        profiles: Arc<dyn ProfileRevisionRepository>,
+        bindings: Arc<dyn RunProviderBindingRepository>,
+        vault: Arc<dyn CredentialVault>,
+    ) -> Self {
+        Self {
+            profiles,
+            bindings,
+            vault,
+        }
+    }
+}
+
+#[async_trait]
+impl RunProviderBindingSource for ActiveRunProviderBindingSource {
+    async fn bind_new_run(&self, run_id: RunId) -> ProviderResult<RunProviderBinding> {
+        let active = self
+            .profiles
+            .active()
+            .await?
+            .ok_or_else(no_active_profile_error)?;
+        let binding = RunProviderBinding::from_active(run_id, active).map_err(|_| {
+            ProviderManagementError::new(
+                ProviderErrorCode::ActivationPreconditionFailed,
+                Some(ProviderField::Activation),
+                ProviderRemediation::WaitForCurrentOperation,
+            )
+        })?;
+        let reference = ProviderCredentialReference {
+            profile_id: binding.profile_id(),
+            generation: binding.credential_generation(),
+        };
+        ensure_usable_credential(
+            self.bindings
+                .credential_status(reference.generation)
+                .await?,
+        )?;
+        ensure_usable_credential(self.vault.credential_status(reference).await?)?;
+        Ok(binding)
     }
 }
 
@@ -712,26 +764,75 @@ impl InProcessAgentService {
             message: None,
             capability: None,
         };
-        let binding = self
-            .run_provider_bindings
-            .bind_new_run(snapshot.run_id)
-            .await
-            .map_err(|error| CoreError::validation(error.code(), error.to_string()))?;
-        let create_run = ys_agent_core::CreateRunCommand::new(snapshot, binding, events)?;
-        self.store
-            .commit_command(RuntimeCommandBatch {
-                command_id,
-                command_fingerprint: fingerprint,
-                receipt,
-                new_session: None,
-                new_task: task,
-                create_run: Some(create_run),
-                new_artifact: None,
-                pending_events: Vec::new(),
-                snapshot_update: None,
-            })
-            .await
+        for attempt in 0..=ACTIVE_SNAPSHOT_RETRY_LIMIT {
+            let binding = self
+                .run_provider_bindings
+                .bind_new_run(snapshot.run_id)
+                .await
+                .map_err(|error| CoreError::validation(error.code(), error.to_string()))?;
+            let create_run =
+                ys_agent_core::CreateRunCommand::new(snapshot.clone(), binding, events.clone())?;
+            let result = self
+                .store
+                .commit_command(RuntimeCommandBatch {
+                    command_id,
+                    command_fingerprint: fingerprint.clone(),
+                    receipt: receipt.clone(),
+                    new_session: None,
+                    new_task: task.clone(),
+                    create_run: Some(create_run),
+                    new_artifact: None,
+                    pending_events: Vec::new(),
+                    snapshot_update: None,
+                })
+                .await;
+            match result {
+                Err(error)
+                    if attempt < ACTIVE_SNAPSHOT_RETRY_LIMIT && active_snapshot_changed(&error) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the bounded active snapshot retry loop always returns")
     }
+}
+
+fn no_active_profile_error() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::NoActiveProfile,
+        Some(ProviderField::Activation),
+        ProviderRemediation::EnterNoActiveProvider,
+    )
+}
+
+fn ensure_usable_credential(status: CredentialViewStatus) -> ProviderResult<()> {
+    match status {
+        CredentialViewStatus::Saved => Ok(()),
+        CredentialViewStatus::Missing => Err(ProviderManagementError::new(
+            ProviderErrorCode::CredentialMissing,
+            Some(ProviderField::Credential),
+            ProviderRemediation::ConfigureCredentialStore,
+        )),
+        CredentialViewStatus::Expired | CredentialViewStatus::Revoked => {
+            Err(ProviderManagementError::new(
+                ProviderErrorCode::AuthenticationInvalid,
+                Some(ProviderField::Credential),
+                ProviderRemediation::Reauthorize,
+            ))
+        }
+        CredentialViewStatus::ProtectionUnavailable
+        | CredentialViewStatus::ReconciliationRequired => Err(ProviderManagementError::new(
+            ProviderErrorCode::CredentialProtectionUnavailable,
+            Some(ProviderField::Credential),
+            ProviderRemediation::ConfigureCredentialStore,
+        )),
+    }
+}
+
+fn active_snapshot_changed(error: &CoreError) -> bool {
+    error.code() == "active_provider_snapshot_changed"
 }
 
 #[async_trait]

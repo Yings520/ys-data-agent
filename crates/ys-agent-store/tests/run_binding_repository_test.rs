@@ -321,10 +321,11 @@ async fn active_snapshot_race_rolls_back_run_binding_events_and_receipt() {
         Some(1),
     )
     .await;
-    store
+    let error = store
         .commit_command(batch.clone())
         .await
         .expect_err("active snapshot changed before the transaction commits");
+    assert_eq!(error.code(), "active_provider_snapshot_changed");
 
     let connection = Connection::open(&database).expect("inspect rolled-back transaction");
     for (table, key) in [

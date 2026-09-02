@@ -201,7 +201,7 @@
   - _Requirements: 3.6, 6.5, 6.7, 9.5, 9.6, 9.7, 9.8, 11.2_
   - _Boundary: RunBoundProviderResolver_
   - _Depends: 2.4, 3.2, 3.7, 3.8_
-- [ ] 5.2 集成 Active snapshot 与原子 Run 创建
+- [x] 5.2 集成 Active snapshot 与原子 Run 创建
   - Agent service 在 Run 创建事务中读取并验证 committed Ready active snapshot，把同一 revision/generation/validation/fingerprint 作为 command batch 输入。
   - active activation revision 竞争时重试完整创建；没有 active、binding 写入失败或 generation 不可解析时不创建 Run 或首批事件。
   - 用 store/runtime 集成测试证明切换发生在事务前后时，新 Run 只能绑定一个完整快照。
