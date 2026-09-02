@@ -16,7 +16,7 @@ updated: YYYY-MM-DD
 ### Change Routing
 
 - **Small change:** <criteria for direct bounded Code Agent execution>
-- **Feature:** <criteria requiring cc-sdd requirements/design/tasks and Ralph execution>
+- **Feature:** <criteria requiring cc-sdd requirements/design/tasks and direct `$kiro-impl` execution>
 
 ## 2. Product Context
 

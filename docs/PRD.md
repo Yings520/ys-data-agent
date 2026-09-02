@@ -24,14 +24,14 @@ Change
   ├── 小改动 → 直接 Code Agent → Code + Test + Review + Fresh Verification
   └── Feature  → cc-sdd requirements.md → design.md → tasks.md
                                       ↓
-                                  Ralph TUI
+                              $kiro-impl <feature>
                                       ↓
-                              Code Agent Loop
+                       依赖有序的 Code Agent Loop
 ~~~
 
-小改动必须保持本文的产品行为、公共契约、持久状态形状和稳定架构边界不变，并能由一个有界 Agent 会话安全完成。它不创建 BMAD 或 cc-sdd 文档，也不启动 Ralph，但仍需与风险相称的测试、实际 Diff Review 和新鲜验证。
+小改动必须保持本文的产品行为、公共契约、持久状态形状和稳定架构边界不变，并能由一个有界 Agent 会话安全完成。它不创建 BMAD 或 cc-sdd 文档，也不调用 `$kiro-impl`，但仍需与风险相称的测试、实际 Diff Review 和新鲜验证。
 
-Feature 包括新增或显著改变用户行为、公共契约、持久状态、外部集成、跨模块责任或需要多个可独立验收任务的 Change。只有当 Feature 同时改变项目方向、稳定架构、发布边界或演进顺序时才先更新本文；Feature 自身始终进入 cc-sdd 三文档，Tasks 人工批准后才交给 Ralph。
+Feature 包括新增或显著改变用户行为、公共契约、持久状态、外部集成、跨模块责任或需要多个可独立验收任务的 Change。只有当 Feature 同时改变项目方向、稳定架构、发布边界或演进顺序时才先更新本文；Feature 自身始终进入 cc-sdd 三文档，Tasks 人工批准后才可调用 `$kiro-impl` 直接执行。
 
 ## 2. 产品定位
 

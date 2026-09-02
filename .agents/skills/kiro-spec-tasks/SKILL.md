@@ -1,13 +1,13 @@
 ---
 name: kiro-spec-tasks
-description: Decompose approved cc-sdd requirements and design into the sole authoritative executable task list consumed by Ralph TUI.
+description: Decompose approved cc-sdd requirements and design into the sole authoritative executable task list consumed directly by kiro-impl.
 metadata:
   shared-rules: "tasks-generation.md, tasks-parallel-analysis.md"
 ---
 
 # cc-sdd Task Decomposition
 
-Create `.kiro/specs/$1/tasks.md`, the only authoritative implementation task state. Ralph receives a disposable projection of this file and must never redefine it.
+Create `.kiro/specs/$1/tasks.md`, the only authoritative implementation graph and completion state. `$kiro-impl` consumes this file directly and must never redefine it.
 
 ## Inputs and Approval Gate
 
@@ -43,15 +43,15 @@ Requirements and design must be human-approved in `spec.json`. An explicit `-y` 
    - refresh `updated_at`.
 10. Present the task summary and ask the user to approve `tasks.md`. On explicit approval, set `approvals.tasks.approved: true`.
 
-## Ralph Handoff
+## Direct Implementation Handoff
 
-After task approval, generate the disposable Ralph projection and start the loop through the repository launcher:
+After task approval, report this exact next invocation:
 
-```bash
-rtk ./scripts/ralph-cc-sdd.sh $1
+```text
+$kiro-impl $1
 ```
 
-Never instruct the user or an Agent to bypass Ralph with an unscoped implementation command. During execution, completion state is written back only to `tasks.md`; `.ralph-tui/generated/*.json` remains temporary scheduler state.
+Never instruct the user or an Agent to bypass the approved task graph with an unscoped implementation command. During execution, `$kiro-impl` selects tasks by `_Depends:_`, writes completion state only to `tasks.md`, and resumes from that authoritative state.
 
 ## Output
 

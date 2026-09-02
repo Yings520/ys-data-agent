@@ -15,7 +15,7 @@
 - Preserve typed domain boundaries and explicit failure states.
 - Do not add credentials, business rows, prompts, SQL results, or other sensitive values to source, tests, logs, telemetry, or committed fixtures.
 - Prefer focused tests during a task and the canonical full gates before feature completion.
-- Never claim success from Agent prose or Ralph's completion token alone; use fresh command evidence.
+- Never claim success from Agent prose or a checked task alone; use fresh command evidence.
 
 ## Canonical Quality Commands
 
@@ -39,6 +39,6 @@ It additionally exercises PostgreSQL integration, query evals, model protocol be
 
 - BMAD owns only `docs/PRD.md`, the whole-project product, stable architecture, and evolution Source of Truth.
 - Small Changes go directly to one bounded Code Agent and still require tests, diff review, and fresh verification.
-- Features use cc-sdd requirements, design, and tasks; Ralph TUI then selects the next generated work item and starts Codex serially.
-- `scripts/codex-ralph` is the compatibility command for Ralph TUI 0.12 and Codex CLI 0.151: Ralph full-auto is disabled, the wrapper supplies Codex's current `-a never` global flag, and raw JSONL bypasses RTK so Ralph can parse it. Re-run `rtk ralph-tui doctor` after either tool is upgraded.
-- Node.js ESM tooling under `tools/workflow/` compiles cc-sdd tasks into Ralph JSON without third-party packages.
+- Features use cc-sdd requirements, design, and tasks; `$kiro-impl` reads the approved `tasks.md` graph directly and executes dependency-ready tasks serially.
+- Node.js ESM tooling under `tools/workflow/` validates authoritative cc-sdd task state and enforces atomic task publication without third-party packages.
+- Each successful task produces one commit and one ordinary push on `feat/<feature>` and reuses the shared Draft Feature PR. Final validation may mark it Ready but never merges it.

@@ -22,7 +22,7 @@ tools/workflow/            Development-workflow adapters; never product runtime
 - Keep external protocol/database details in adapters; keep domain policy in core; keep lifecycle coordination in runtime; keep persistence mechanics in store.
 - Do not move responsibility across crates merely to make one task easier.
 - Do not perform unrelated refactors, formatting sweeps, dependency upgrades, or generated-file rewrites.
-- New toolchain integration belongs under `tools/workflow/`, `.agents/skills/`, `.kiro/`, or `.ralph-tui/`, not product crates.
+- New toolchain integration belongs under `tools/workflow/`, `.agents/skills/`, or `.kiro/`, not product crates.
 
 ## Revalidation
 

@@ -1,6 +1,7 @@
 interface:
   display_name: "Spec Tasks"
   short_description: "Generate implementation tasks for a specification"
+  default_prompt: "Use $kiro-spec-tasks to generate the approved task graph and hand it to $kiro-impl."
 
 policy:
   allow_implicit_invocation: false
