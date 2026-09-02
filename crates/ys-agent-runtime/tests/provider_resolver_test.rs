@@ -7,16 +7,31 @@ use std::{
     time::Duration,
 };
 
+use tempfile::TempDir;
+use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
 use ys_agent_core::{
-    ActiveProviderSnapshot, CompatibilityEvidence, CoreError, CoreResult, CredentialGeneration,
-    CredentialLease, CredentialProtectionStatus, CredentialVault, CredentialViewStatus,
-    ModelCapabilities, ModelProvider, ModelRequest, ModelResponse, ProfileId, ProfileRevision,
+    ActivateProfileRequest, ActivationPrecondition, ActiveProviderSnapshot, CompatibilityEvidence,
+    ContextManifest, CoreError, CoreResult, CredentialGeneration, CredentialKind, CredentialLease,
+    CredentialMutation, CredentialMutationIntent, CredentialMutationRequest,
+    CredentialProtectionStatus, CredentialVault, CredentialViewStatus, ModelCapabilities,
+    ModelProvider, ModelRequest, ModelResponse, OperationId, ProfileId, ProfileRevision,
     ProtectedCredentialWrite, ProviderClientBinding, ProviderClientFactory,
     ProviderCredentialReference, ProviderErrorCode, ProviderField, ProviderId,
     ProviderManagementError, ProviderRemediation, ProviderResult, RunId, RunModelProviderResolver,
-    RunProviderBinding, RunProviderBindingRepository, SecretValue, ValidationVersions,
+    RunProviderBinding, RunProviderBindingRepository, RunProviderBindingSource, SecretValue,
+    ValidationCommit, ValidationCommitPrecondition, ValidationVersions,
 };
-use ys_agent_runtime::provider::resolver::RunBoundProviderResolver;
+use ys_agent_runtime::{
+    ActiveRunProviderBindingSource,
+    provider::{
+        resolver::RunBoundProviderResolver,
+        service::{CredentialService, ProviderManagementService},
+    },
+};
+use ys_agent_store::SqliteRuntimeStore;
+
+#[path = "support/provider_fixture.rs"]
+mod provider_fixture;
 
 struct Bindings {
     values: HashMap<RunId, RunProviderBinding>,
@@ -294,4 +309,194 @@ async fn resolver_uses_only_each_binding_generation_and_fails_before_factory_whe
         &[first.credential_generation()]
     );
     assert_eq!(vault.reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn active_rotation_never_redirects_concurrent_run_bindings() {
+    exercise_rotated_run_bindings().await;
+}
+
+async fn exercise_rotated_run_bindings() {
+    let directory = TempDir::new().expect("temporary database directory");
+    let store = SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+        .await
+        .expect("open durable Provider store");
+    let repository = store.provider_repository();
+    let original = provider_fixture::persisted_test_active_provider(&store).await;
+    let profile_id = original.profile_id();
+    let first_generation = original.credential_generation();
+    let vault = Arc::new(InMemoryCredentialVault::new());
+    vault
+        .write_generation(ProtectedCredentialWrite {
+            reference: ProviderCredentialReference {
+                profile_id,
+                generation: first_generation,
+            },
+            secret: SecretValue::from_utf8("run-a-fixture-credential".to_owned()),
+        })
+        .await
+        .expect("seed only the protected first generation");
+
+    let source = ActiveRunProviderBindingSource::new(
+        Arc::new(repository.clone()),
+        Arc::new(store.run_binding_repository()),
+        vault.clone(),
+    );
+    let run_a = RunId::new();
+    let binding_a = source
+        .bind_new_run(run_a)
+        .await
+        .expect("Run A binds the initial active snapshot");
+    assert_eq!(binding_a.profile_revision(), original.profile_revision());
+    assert_eq!(binding_a.credential_generation(), first_generation);
+
+    let second_generation = CredentialGeneration::new(profile_id, 2, CredentialKind::ApiKey)
+        .expect("second API-key generation");
+    let credentials = CredentialService::new(
+        Arc::new(repository.clone()),
+        Arc::new(store.run_binding_repository()),
+        vault.clone(),
+    );
+    let rotated = credentials
+        .mutate(CredentialMutationRequest {
+            intent: CredentialMutationIntent::replace(
+                OperationId::new(),
+                profile_id,
+                binding_a.profile_revision(),
+                first_generation,
+                second_generation,
+            )
+            .expect("rotation follows Run A's original revision"),
+            mutation: CredentialMutation::Replace(ProtectedCredentialWrite {
+                reference: ProviderCredentialReference {
+                    profile_id,
+                    generation: second_generation,
+                },
+                secret: SecretValue::from_utf8("run-b-fixture-credential".to_owned()),
+            }),
+        })
+        .await
+        .expect("rotation appends an unvalidated revision without moving Run A");
+    assert_eq!(rotated.revision, binding_a.profile_revision() + 1);
+    assert_eq!(rotated.credential_generation, Some(second_generation));
+
+    let candidate = repository
+        .load_current_revision(profile_id)
+        .await
+        .expect("rotated Draft is current");
+    let versions =
+        ValidationVersions::new("race-catalog", "race-probe", "race-liter", "race-codec");
+    let evidence = CompatibilityEvidence::passing(candidate.validation_inputs(versions.clone()));
+    let validation_id = evidence.id();
+    let validation_digest = evidence.digest();
+    let profiles = ProviderManagementService::new(Arc::new(repository.clone()));
+    profiles
+        .commit_validation(ValidationCommit {
+            precondition: ValidationCommitPrecondition {
+                operation_id: OperationId::new(),
+                profile_id,
+                revision: candidate.revision(),
+                credential_generation: second_generation,
+                validation_digest: validation_digest.clone(),
+            },
+            evidence,
+            versions,
+        })
+        .await
+        .expect("the rotated generation receives its own validation evidence");
+    let active_b = profiles
+        .activate(ActivateProfileRequest {
+            operation_id: OperationId::new(),
+            precondition: ActivationPrecondition {
+                profile_id,
+                revision: candidate.revision(),
+                validation_id,
+                validation_digest,
+                expected_activation_revision: Some(binding_a.activation_revision()),
+            },
+        })
+        .await
+        .expect("activate revision two only for future Runs");
+
+    let run_b = RunId::new();
+    let binding_b = source
+        .bind_new_run(run_b)
+        .await
+        .expect("Run B reads the newly active snapshot");
+    assert_eq!(binding_b.profile_revision(), active_b.profile_revision);
+    assert_eq!(binding_b.credential_generation(), second_generation);
+    assert_ne!(binding_a.fingerprint(), binding_b.fingerprint());
+
+    let factory = Arc::new(Factory::default());
+    let resolver = Arc::new(RunBoundProviderResolver::new(
+        Arc::new(Bindings {
+            values: HashMap::from([(run_a, binding_a.clone()), (run_b, binding_b.clone())]),
+            statuses: HashMap::from([
+                (first_generation, CredentialViewStatus::Saved),
+                (second_generation, CredentialViewStatus::Saved),
+            ]),
+        }),
+        vault,
+        factory.clone(),
+    ));
+
+    let (a_probe, a_retry, b_probe) = tokio::join!(
+        resolver.resolve(run_a),
+        resolver.resolve(run_a),
+        resolver.resolve(run_b),
+    );
+    let a_probe = a_probe.expect("Run A concurrent probe resolves its exact original binding");
+    let a_retry = a_retry.expect("Run A retry single-flights without rebinding");
+    let b_probe = b_probe.expect("Run B concurrent probe resolves its rotated binding");
+    assert_eq!(a_probe.binding, binding_a);
+    assert_eq!(a_retry.binding, binding_a);
+    assert_eq!(b_probe.binding, binding_b);
+    assert_eq!(factory.builds.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        factory
+            .generations
+            .lock()
+            .expect("Factory test state")
+            .iter()
+            .filter(|generation| **generation == second_generation)
+            .count(),
+        1,
+        "Run B constructs only its own rotated credential generation"
+    );
+
+    let failed_call = a_probe
+        .provider
+        .complete(ModelRequest {
+            model: "deepseek/fixture".to_owned(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            context_manifest: ContextManifest::empty(1),
+            temperature: None,
+        })
+        .await
+        .expect_err("a Provider failure must remain visible rather than route Run A elsewhere");
+    assert_eq!(failed_call.code(), "unexpected_model_call");
+
+    resolver.release_run(run_a).await;
+    let after_failure = resolver
+        .resolve(run_a)
+        .await
+        .expect("a released Run A cache reloads only its persisted binding");
+    assert_eq!(after_failure.binding, binding_a);
+    assert_eq!(
+        after_failure.binding.credential_generation(),
+        first_generation
+    );
+    assert_eq!(factory.builds.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        factory
+            .generations
+            .lock()
+            .expect("Factory test state")
+            .iter()
+            .filter(|generation| **generation == first_generation)
+            .count(),
+        2,
+        "Run A never reads the newer Run B credential after activation, retry, or failure"
+    );
 }

@@ -282,7 +282,7 @@
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 3.3, 3.7, 3.8, 3.9, 5.6, 6.1, 6.2, 6.3, 7.7, 8.4, 8.5, 8.6, 8.7_
   - _Boundary: Provider management store and service end-to-end tests_
   - _Depends: 4.7, 6.5_
-- [ ] 7.3 (P) 验证并发 Run 的 immutable binding 与 Credential 隔离
+- [x] 7.3 (P) 验证并发 Run 的 immutable binding 与 Credential 隔离
   - 构造 Run A 绑定 revision/generation 1 后编辑、轮换并激活 revision/generation 2，再启动 Run B。
   - 并发执行 probe、retry、失败和 Profile 切换，证明 Run A 始终解析 generation 1、Run B 始终解析 generation 2，fingerprint 全程不变。
   - 断言 Provider 调用失败不会自动路由、降低门禁或读取其他 Profile Credential。
