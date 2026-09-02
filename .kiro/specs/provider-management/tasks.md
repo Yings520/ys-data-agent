@@ -77,7 +77,7 @@
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 4.6, 4.7, 5.4, 5.8, 11.4, 11.5, 11.6_
   - _Boundary: GovernedProviderCatalog, EvidenceRegistry, and Runtime Fake/Replay active-binding test fixture reconciliation_
   - _Depends: 1.2, 2.4_
-- [ ] 3.2 (P) 实现 OS 原生 Credential Vault
+- [x] 3.2 (P) 实现 OS 原生 Credential Vault
   - 使用固定 service 和不可猜测 profile UUID/generation locator，把 API key 或 OAuth bundle 作为版本化 envelope 仅写入原生 Credential Store。
   - 启动时执行不回显秘密的 create/read/delete protection probe；无法确认 native protection 时拒绝写入，不提供文件、env 或明文 fallback。
   - 把阻塞平台调用隔离到可安全忽略迟到结果的 worker，并提供显式 in-memory fake 供测试使用。
