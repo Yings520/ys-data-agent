@@ -7,12 +7,13 @@ use serde::{Serialize, de::DeserializeOwned};
 use ys_agent_core::{
     ActivateProfileRequest, ActiveProviderSnapshot, CredentialGeneration, CredentialKind,
     CredentialMutationIntent, CredentialMutationOperation, CredentialMutationPhase,
-    CredentialMutationRecord, CredentialPointerCommit, CredentialViewStatus, OperationId,
-    PersistedCompatibilityEvidence, PersistedCredentialMutationRecord, PersistedProfileRevision,
-    ProfileId, ProfileRevision, ProfileRevisionRepository, ProfileState, ProfileSummary,
-    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError, ProviderModelId,
-    ProviderParameters, ProviderRemediation, ProviderResult, RevisionPrecondition, RunId,
-    RunProviderBinding, RunProviderBindingRepository, SaveProfileRevision, ValidationCommit,
+    CredentialMutationRecord, CredentialMutationRepository, CredentialPointerCommit,
+    CredentialViewStatus, OperationId, PersistedCompatibilityEvidence,
+    PersistedCredentialMutationRecord, PersistedProfileRevision, ProfileId, ProfileRevision,
+    ProfileRevisionRepository, ProfileState, ProfileSummary, ProviderErrorCode, ProviderField,
+    ProviderId, ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
+    ProviderResult, RevisionPrecondition, RunId, RunProviderBinding, RunProviderBindingRepository,
+    SaveProfileRevision, ValidationCommit,
 };
 
 use crate::{SqliteRuntimeStore, sqlite::open_connection};
@@ -703,7 +704,7 @@ impl SqliteProviderRepository {
                     .execute(
                         "UPDATE provider_credential_generations
                          SET status = 'retained', updated_at = ?1
-                         WHERE profile_id = ?2 AND generation = ?3",
+                         WHERE profile_id = ?2 AND generation = ?3 AND status != 'deleted'",
                         params![
                             Utc::now().to_rfc3339(),
                             old_generation.profile_id().to_string(),
@@ -904,6 +905,67 @@ impl SqliteProviderRepository {
         })
         .await
     }
+
+    pub async fn retire_credential_generation(
+        &self,
+        generation: CredentialGeneration,
+    ) -> ProviderResult<()> {
+        self.with_connection(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(provider_storage_error)?;
+            let active_reference: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM active_provider
+                        WHERE profile_id = ?1 AND credential_generation = ?2
+                     )",
+                    params![
+                        generation.profile_id().to_string(),
+                        to_i64(generation.number())?
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(provider_storage_error)?;
+            let run_reference: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM run_provider_bindings AS binding
+                        JOIN runs AS run ON run.run_id = binding.run_id
+                        WHERE binding.profile_id = ?1
+                          AND binding.credential_generation = ?2
+                          AND run.status NOT IN ('Succeeded', 'Failed', 'Cancelled')
+                     )",
+                    params![
+                        generation.profile_id().to_string(),
+                        to_i64(generation.number())?
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(provider_storage_error)?;
+            if active_reference || run_reference {
+                return Err(operation_stale_error());
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE provider_credential_generations
+                     SET status = 'deleted', updated_at = ?1
+                     WHERE profile_id = ?2 AND generation = ?3 AND status = 'retained'",
+                    params![
+                        Utc::now().to_rfc3339(),
+                        generation.profile_id().to_string(),
+                        to_i64(generation.number())?,
+                    ],
+                )
+                .map_err(provider_storage_error)?;
+            if changed != 1 {
+                return Err(storage_conflict_error());
+            }
+            transaction.commit().map_err(provider_storage_error)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -933,6 +995,63 @@ impl ProfileRevisionRepository for SqliteProviderRepository {
 
     async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>> {
         SqliteProviderRepository::active(self).await
+    }
+}
+
+#[async_trait]
+impl CredentialMutationRepository for SqliteProviderRepository {
+    async fn begin_credential_mutation(
+        &self,
+        intent: CredentialMutationIntent,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        SqliteProviderRepository::begin_credential_mutation(self, intent).await
+    }
+
+    async fn record_credential_vault_write(
+        &self,
+        mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        SqliteProviderRepository::record_credential_vault_write(self, mutation_id).await
+    }
+
+    async fn commit_credential_pointer(
+        &self,
+        commit: CredentialPointerCommit,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        SqliteProviderRepository::commit_credential_pointer(self, commit).await
+    }
+
+    async fn complete_credential_mutation(
+        &self,
+        mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        SqliteProviderRepository::complete_credential_mutation(self, mutation_id).await
+    }
+
+    async fn rollback_credential_mutation(
+        &self,
+        mutation_id: OperationId,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        SqliteProviderRepository::rollback_credential_mutation(self, mutation_id).await
+    }
+
+    async fn block_credential_mutation(
+        &self,
+        mutation_id: OperationId,
+        error_code: ProviderErrorCode,
+    ) -> ProviderResult<CredentialMutationRecord> {
+        SqliteProviderRepository::block_credential_mutation(self, mutation_id, error_code).await
+    }
+
+    async fn pending_credential_mutations(&self) -> ProviderResult<Vec<CredentialMutationRecord>> {
+        SqliteProviderRepository::pending_credential_mutations(self).await
+    }
+
+    async fn retire_credential_generation(
+        &self,
+        generation: CredentialGeneration,
+    ) -> ProviderResult<()> {
+        SqliteProviderRepository::retire_credential_generation(self, generation).await
     }
 }
 

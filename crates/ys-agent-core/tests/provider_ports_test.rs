@@ -1,16 +1,17 @@
 use ys_agent_core::{
     ActivateProfileRequest, ActiveProviderSnapshot, ActiveProviderView, ActiveRevisionPrecondition,
     CompatibilityEvidenceView, CredentialGeneration, CredentialLease, CredentialMutation,
-    CredentialMutationIntent, CredentialMutationRecord, CredentialMutationRequest,
-    CredentialPointerCommit, CredentialProtectionStatus, CredentialVault, CredentialViewStatus,
-    DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
-    ModelDiscovery, OAuthConnectionService, OAuthConnectionView, OperationId, ProfileDetail,
-    ProfileId, ProfileName, ProfileRevision, ProfileRevisionRepository, ProfileSummary,
-    ProtectedCredentialWrite, ProviderCatalogView, ProviderClientBinding, ProviderClientFactory,
-    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId,
-    ProviderManagementApi, ProviderManagementError, ProviderProfileRepository, ProviderRemediation,
-    ProviderResult, ResolvedRunProvider, RunId, RunModelProviderResolver,
-    RunProviderBindingRepository, SaveProfileRevision, ValidateProfileRequest, ValidationCommit,
+    CredentialMutationIntent, CredentialMutationRecord, CredentialMutationRepository,
+    CredentialMutationRequest, CredentialPointerCommit, CredentialProtectionStatus,
+    CredentialVault, CredentialViewStatus, DeleteProfileRequest, DeviceAuthorizationView,
+    DiscoverModelsRequest, DiscoveredModel, ModelDiscovery, OAuthConnectionService,
+    OAuthConnectionView, OperationId, ProfileDetail, ProfileId, ProfileName, ProfileRevision,
+    ProfileRevisionRepository, ProfileSummary, ProtectedCredentialWrite, ProviderCatalogView,
+    ProviderClientBinding, ProviderClientFactory, ProviderCredentialReference, ProviderDoctorView,
+    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi, ProviderManagementError,
+    ProviderProfileRepository, ProviderRemediation, ProviderResult, ResolvedRunProvider, RunId,
+    RunModelProviderResolver, RunProviderBindingRepository, SaveProfileRevision,
+    ValidateProfileRequest, ValidationCommit,
 };
 
 struct FakeProviderManagementApi;
@@ -187,18 +188,7 @@ impl ProfileRevisionRepository for FakeProviderProfileRepository {
 }
 
 #[async_trait::async_trait]
-impl ProviderProfileRepository for FakeProviderProfileRepository {
-    async fn save_validation(&self, _commit: ValidationCommit) -> ProviderResult<ProfileRevision> {
-        unavailable()
-    }
-
-    async fn activate(
-        &self,
-        _request: ActivateProfileRequest,
-    ) -> ProviderResult<ActiveProviderSnapshot> {
-        unavailable()
-    }
-
+impl CredentialMutationRepository for FakeProviderProfileRepository {
     async fn begin_credential_mutation(
         &self,
         _intent: CredentialMutationIntent,
@@ -244,6 +234,27 @@ impl ProviderProfileRepository for FakeProviderProfileRepository {
 
     async fn pending_credential_mutations(&self) -> ProviderResult<Vec<CredentialMutationRecord>> {
         Ok(Vec::new())
+    }
+
+    async fn retire_credential_generation(
+        &self,
+        _generation: CredentialGeneration,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderProfileRepository for FakeProviderProfileRepository {
+    async fn save_validation(&self, _commit: ValidationCommit) -> ProviderResult<ProfileRevision> {
+        unavailable()
+    }
+
+    async fn activate(
+        &self,
+        _request: ActivateProfileRequest,
+    ) -> ProviderResult<ActiveProviderSnapshot> {
+        unavailable()
     }
 
     async fn delete_profile(&self, _request: DeleteProfileRequest) -> ProviderResult<()> {

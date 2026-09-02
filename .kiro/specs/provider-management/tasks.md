@@ -159,7 +159,7 @@
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.6, 4.2, 4.8, 7.7_
   - _Boundary: ProviderManagementService profile revision lifecycle, current-revision ProfileRevisionRepository contract, and SqliteProviderRepository port implementation_
   - _Depends: 2.2, 4.1_
-- [ ] 4.4 编排 Credential generation 创建、替换与删除
+- [x] 4.4 编排 Credential generation 创建、替换与删除
   - 按 journal 顺序先记录 intent、写不可变 Vault generation、再 compare-and-swap Profile pointer；旧 generation 按 active/Run 引用进入 Retained 或 cleanup。
   - 为 API key 输入、替换、删除和失败恢复提供只含 Credential 状态的结果，绝不共享或隐式读取其他 Profile generation。
   - 取消或迟到结果不得覆盖较新的 revision；无法证明 native protection/reconciliation 时将 Profile 明确阻断。

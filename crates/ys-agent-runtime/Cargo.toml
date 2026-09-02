@@ -15,6 +15,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ys-agent-core = { path = "../ys-agent-core" }
+zeroize.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true

@@ -6,8 +6,8 @@ use serde_json::Value;
 use crate::{
     ActivateProfileRequest, ActiveProviderSnapshot, ActiveProviderView, AllowedDataScope,
     ArtifactAccessContext, ArtifactMetadata, ArtifactRef, CommandId, CommandReceipt,
-    CompatibilityEvidenceView, ContextEvidence, CoreError, CoreResult, CredentialLease,
-    CredentialMutationIntent, CredentialMutationRecord, CredentialMutationRequest,
+    CompatibilityEvidenceView, ContextEvidence, CoreError, CoreResult, CredentialGeneration,
+    CredentialLease, CredentialMutationIntent, CredentialMutationRecord, CredentialMutationRequest,
     CredentialPointerCommit, CredentialProtectionStatus, CredentialViewStatus,
     DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
     EventEnvelope, FreshnessObservation, MetricDefinition, ModelCapabilities, ModelRequest,
@@ -244,17 +244,11 @@ pub trait ProfileRevisionRepository: Send + Sync {
     async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>>;
 }
 
-/// Durable Provider profile state. Every mutation includes an explicit compare-and-swap
-/// precondition so a late operation cannot replace a newer revision or active selection.
+/// Durable credential-mutation journal state. This is deliberately narrower than the full
+/// Provider lifecycle port so credential orchestration can be wired to persistence without
+/// acquiring validation, activation, or Profile-deletion authority.
 #[async_trait]
-pub trait ProviderProfileRepository: ProfileRevisionRepository {
-    async fn save_validation(&self, commit: ValidationCommit) -> ProviderResult<ProfileRevision>;
-
-    async fn activate(
-        &self,
-        request: ActivateProfileRequest,
-    ) -> ProviderResult<ActiveProviderSnapshot>;
-
+pub trait CredentialMutationRepository: ProfileRevisionRepository {
     async fn begin_credential_mutation(
         &self,
         intent: CredentialMutationIntent,
@@ -287,6 +281,26 @@ pub trait ProviderProfileRepository: ProfileRevisionRepository {
     ) -> ProviderResult<CredentialMutationRecord>;
 
     async fn pending_credential_mutations(&self) -> ProviderResult<Vec<CredentialMutationRecord>>;
+
+    /// Marks a Vault generation retired only after the caller has removed it from the protected
+    /// store. Implementations re-check active and nonterminal Run references atomically so a
+    /// late cleanup can fail closed rather than removing a live credential.
+    async fn retire_credential_generation(
+        &self,
+        generation: CredentialGeneration,
+    ) -> ProviderResult<()>;
+}
+
+/// Durable Provider profile state. Every mutation includes an explicit compare-and-swap
+/// precondition so a late operation cannot replace a newer revision or active selection.
+#[async_trait]
+pub trait ProviderProfileRepository: CredentialMutationRepository {
+    async fn save_validation(&self, commit: ValidationCommit) -> ProviderResult<ProfileRevision>;
+
+    async fn activate(
+        &self,
+        request: ActivateProfileRequest,
+    ) -> ProviderResult<ActiveProviderSnapshot>;
 
     async fn delete_profile(&self, request: DeleteProfileRequest) -> ProviderResult<()>;
 }
