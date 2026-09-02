@@ -369,28 +369,25 @@ struct PromptEvidenceBlock<'a> {
     text: &'a str,
 }
 
-#[derive(Debug, Clone)]
-pub struct PromptBuilder {
-    model: String,
-}
+#[derive(Debug, Clone, Default)]
+pub struct PromptBuilder;
 
 impl PromptBuilder {
     pub const VERSION: &'static str = QUERY_SYSTEM_PROMPT_VERSION;
 
-    pub fn new(model: impl Into<String>) -> Self {
-        Self {
-            model: model.into(),
-        }
+    pub const fn new() -> Self {
+        Self
     }
 
     pub fn build(
         &self,
+        model: &str,
         task_goal: &str,
         phase: QueryPhase,
         manifest: &ContextManifest,
         tool_view: &ToolViewSnapshot,
     ) -> CoreResult<ModelRequest> {
-        if self.model.trim().is_empty() {
+        if model.trim().is_empty() {
             return Err(CoreError::validation(
                 "model_name_missing",
                 "PromptBuilder needs a model name",
@@ -467,7 +464,7 @@ impl PromptBuilder {
         }
 
         Ok(ModelRequest {
-            model: self.model.clone(),
+            model: model.to_owned(),
             messages,
             tools: tool_view.tools().to_vec(),
             context_manifest: manifest.clone(),

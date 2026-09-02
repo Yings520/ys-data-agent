@@ -25,6 +25,23 @@ pub struct RunBoundProviderResolver {
     cache: Mutex<HashMap<RunId, CachedProvider>>,
 }
 
+/// Explicit composition adapter for deterministic or transitional assemblies. It still loads the
+/// exact persisted Run binding, so the Harness never reads the active Profile or selects a model
+/// name from bootstrap state.
+pub struct FixedRunModelProviderResolver {
+    bindings: Arc<dyn RunProviderBindingRepository>,
+    provider: Arc<dyn ModelProvider>,
+}
+
+impl FixedRunModelProviderResolver {
+    pub fn new(
+        bindings: Arc<dyn RunProviderBindingRepository>,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Self {
+        Self { bindings, provider }
+    }
+}
+
 struct CachedProvider {
     binding_digest: String,
     provider: Arc<OnceCell<Arc<dyn ModelProvider>>>,
@@ -103,6 +120,20 @@ impl RunBoundProviderResolver {
 impl RunModelProviderResolver for RunBoundProviderResolver {
     async fn resolve(&self, run_id: RunId) -> ProviderResult<ResolvedRunProvider> {
         self.resolve_binding(run_id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl RunModelProviderResolver for FixedRunModelProviderResolver {
+    async fn resolve(&self, run_id: RunId) -> ProviderResult<ResolvedRunProvider> {
+        let binding = self.bindings.load_run_binding(run_id).await?;
+        if binding.run_id() != run_id {
+            return Err(binding_error());
+        }
+        Ok(ResolvedRunProvider {
+            binding,
+            provider: self.provider.clone(),
+        })
     }
 }
 

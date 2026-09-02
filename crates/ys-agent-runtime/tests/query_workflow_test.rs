@@ -104,6 +104,12 @@ async fn each_live_model_phase_receives_the_runtime_identities_it_must_reuse() {
     assert_eq!(result.status, RunStatus::Succeeded);
 
     let requests = fixture.model_requests().await;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.model == "deepseek/test-model"),
+        "every Query model request must use the immutable Run-bound model"
+    );
     let plan = runtime_state(request_for_phase(&requests, "Plan"));
     assert_eq!(plan["source_id"], "sqlite-demo");
     assert_eq!(plan["intent"], "governed_metric");

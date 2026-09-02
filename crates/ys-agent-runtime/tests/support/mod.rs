@@ -404,7 +404,7 @@ use ys_agent_core::{
 };
 use ys_agent_runtime::{
     ContextAssembler, Harness, HarnessConfig, HarnessDependencies, InMemoryQueryContextProvider,
-    LoopDriver, PromptBuilder,
+    FixedRunModelProviderResolver, LoopDriver, PromptBuilder,
     telemetry::TelemetryDispatcher,
     tools::{ConnectorToolAvailability, ToolCatalog, ToolRuntime, WorkspaceToolPolicy},
 };
@@ -657,15 +657,18 @@ fn build_query_dependencies(
 
     let harness = Arc::new(Harness::new(
         HarnessDependencies {
-            store: runtime_store,
+            store: runtime_store.clone(),
             artifacts: artifact_store,
-            model,
+            model_resolver: Arc::new(FixedRunModelProviderResolver::new(
+                Arc::new(runtime.run_binding_repository()),
+                model,
+            )),
             catalog,
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler,
             telemetry,
         },
-        PromptBuilder::new("fake-query-model"),
+        PromptBuilder::new(),
         HarnessConfig {
             workspace_id,
             principal,

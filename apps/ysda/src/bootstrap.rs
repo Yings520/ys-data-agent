@@ -27,8 +27,8 @@ use ys_agent_core::{
 };
 use ys_agent_runtime::{
     AgentServiceApi, ContextAssembler, Harness, HarnessConfig, HarnessDependencies,
-    InMemoryQueryContextProvider, InProcessAgentService, LoopDriver, PromptBuilder, RunScheduler,
-    ServiceEventPublisher, StaticRunProviderBindingSource,
+    FixedRunModelProviderResolver, InMemoryQueryContextProvider, InProcessAgentService,
+    LoopDriver, PromptBuilder, RunScheduler, ServiceEventPublisher, StaticRunProviderBindingSource,
     doctor::{DoctorInputs, DoctorProbe, ModelReadiness, SourceReadiness, WorkspaceDoctor},
     export::{ArtifactExporter, DefaultExportPolicy, ExportWriter, WrittenExport},
     telemetry::{TelemetryDispatcher, TracingTelemetrySink},
@@ -1067,7 +1067,7 @@ async fn assemble_scheduler(
     config: &AppConfig,
     workspace_id: WorkspaceId,
     principal: ys_agent_core::Principal,
-    runtime_store: Arc<dyn RuntimeStore>,
+    runtime_store: Arc<ys_agent_store::SqliteRuntimeStore>,
     artifact_store: Arc<dyn ArtifactStore>,
 ) -> CoreResult<(
     Arc<BackgroundScheduler>,
@@ -1205,15 +1205,18 @@ async fn assemble_scheduler(
     let telemetry = Arc::new(TelemetryDispatcher::new(Arc::new(TracingTelemetrySink)));
     let harness = Arc::new(Harness::new(
         HarnessDependencies {
-            store: runtime_store,
+            store: runtime_store.clone(),
             artifacts: artifact_store,
-            model: model.clone(),
+            model_resolver: Arc::new(FixedRunModelProviderResolver::new(
+                Arc::new(runtime_store.run_binding_repository()),
+                model.clone(),
+            )),
             catalog: Arc::new(catalog),
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler: Arc::new(ContextAssembler::new(metrics, dbt_context, run_context)),
             telemetry,
         },
-        PromptBuilder::new(config.llm_model.clone()),
+        PromptBuilder::new(),
         HarnessConfig {
             workspace_id,
             principal,
@@ -1288,7 +1291,7 @@ pub async fn assemble_deterministic_query_runtime(
     let artifacts = Arc::new(ys_agent_store::LocalArtifactStore::new(
         &config.artifact_path,
     )?);
-    let runtime_store: Arc<dyn RuntimeStore> = runtime;
+    let runtime_store: Arc<dyn RuntimeStore> = runtime.clone();
     let artifact_store: Arc<dyn ArtifactStore> = artifacts;
     let policy_bytes = tokio::fs::read(&config.query_policy_path)
         .await
@@ -1363,13 +1366,16 @@ pub async fn assemble_deterministic_query_runtime(
         HarnessDependencies {
             store: runtime_store.clone(),
             artifacts: artifact_store.clone(),
-            model: Arc::new(model.clone()),
+            model_resolver: Arc::new(FixedRunModelProviderResolver::new(
+                Arc::new(runtime.run_binding_repository()),
+                Arc::new(model.clone()),
+            )),
             catalog,
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler: Arc::new(ContextAssembler::new(metrics, dbt_context, run_context)),
             telemetry,
         },
-        PromptBuilder::new("deterministic-query-eval"),
+        PromptBuilder::new(),
         HarnessConfig {
             workspace_id,
             principal: principal.clone(),
@@ -1597,7 +1603,7 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
             &config,
             workspace_id,
             principal.clone(),
-            runtime_port.clone(),
+            runtime_store.clone(),
             artifact_port.clone(),
         )
         .await

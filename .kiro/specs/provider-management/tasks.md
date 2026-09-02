@@ -209,7 +209,7 @@
   - _Requirements: 6.1, 6.2, 6.5, 6.6, 9.5, 9.6_
   - _Boundary: AgentService and SqliteRuntimeStore run-creation integration_
   - _Depends: 1.4, 2.4, 4.5_
-- [ ] 5.3 将 Run-bound Provider 接回既有 Query 工作流
+- [x] 5.3 将 Run-bound Provider 接回既有 Query 工作流
   - Harness、Query prompt builder 与恢复路径按 run_id 获取 resolved provider/model，不再持有 bootstrap 全局 model 或重新读取 active Profile。
   - 保持 Agent Loop、tool call/result ID、Policy、Tool Runtime、QueryBudget、数据外发、Completion Gate、Artifact 与显式失败语义不变。
   - 继续允许测试显式注入 Fake/Replay，但不把它们暴露为面向用户的 Profile 配置路径。

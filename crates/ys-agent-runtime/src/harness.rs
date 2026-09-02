@@ -9,9 +9,9 @@ use serde::Serialize;
 use serde_json::json;
 use ys_agent_core::{
     AllowedDataScope, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore, CoreError,
-    CoreResult, CostClass, EventActor, ModelProvider, PendingRunEvent, Principal, PutArtifact,
-    QueryBudget, RetentionPolicy, RunEventKind, RunId, RunSnapshot, RunStatus, Sensitivity, StepId,
-    ToolExecutionContext, WorkspaceId,
+    CoreResult, CostClass, EventActor, PendingRunEvent, Principal, PutArtifact, QueryBudget,
+    RetentionPolicy, RunEventKind, RunId, RunModelProviderResolver, RunSnapshot, RunStatus,
+    Sensitivity, StepId, ToolExecutionContext, WorkspaceId,
 };
 
 use crate::{
@@ -41,7 +41,7 @@ pub struct HarnessConfig {
 pub struct Harness {
     store: Arc<dyn ys_agent_core::RuntimeStore>,
     artifacts: Arc<dyn ArtifactStore>,
-    model: Arc<dyn ModelProvider>,
+    model_resolver: Arc<dyn RunModelProviderResolver>,
     catalog: Arc<ToolCatalog>,
     tool_runtime: Arc<ToolRuntime>,
     context_assembler: Arc<ContextAssembler>,
@@ -55,7 +55,7 @@ pub struct Harness {
 pub struct HarnessDependencies {
     pub store: Arc<dyn ys_agent_core::RuntimeStore>,
     pub artifacts: Arc<dyn ArtifactStore>,
-    pub model: Arc<dyn ModelProvider>,
+    pub model_resolver: Arc<dyn RunModelProviderResolver>,
     pub catalog: Arc<ToolCatalog>,
     pub tool_runtime: Arc<ToolRuntime>,
     pub context_assembler: Arc<ContextAssembler>,
@@ -93,7 +93,7 @@ impl Harness {
         Self {
             store: dependencies.store,
             artifacts: dependencies.artifacts,
-            model: dependencies.model,
+            model_resolver: dependencies.model_resolver,
             catalog: dependencies.catalog,
             tool_runtime: dependencies.tool_runtime,
             context_assembler: dependencies.context_assembler,
@@ -449,6 +449,11 @@ impl Harness {
         state: QueryWorkflowState,
     ) -> CoreResult<StepOutcome> {
         let now = Utc::now();
+        let resolved = self
+            .model_resolver
+            .resolve(current.run_id)
+            .await
+            .map_err(|error| CoreError::validation(error.code(), error.to_string()))?;
         let step_id = StepId::new();
         let view = ToolViewBuilder::new(self.catalog.as_ref())
             .for_workflow(current.workflow)
@@ -492,6 +497,7 @@ impl Harness {
             )
             .await?;
         let mut request = self.prompt_builder.build(
+            resolved.binding.model().as_str(),
             &state.question,
             state.phase,
             &assembled.manifest,
@@ -531,7 +537,7 @@ impl Harness {
         .await?;
 
         let model_started_at = Instant::now();
-        let response = self.model.complete(request).await?;
+        let response = resolved.provider.complete(request).await?;
         let tokens = response
             .usage
             .as_ref()

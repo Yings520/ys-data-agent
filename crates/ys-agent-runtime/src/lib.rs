@@ -23,6 +23,7 @@ pub use harness::{Harness, HarnessConfig, HarnessDependencies};
 pub use loop_driver::{
     HarnessStep, LoopBudget, LoopDriver, LoopResult, LoopUsage, StepAccounting, StepOutcome,
 };
+pub use provider::resolver::{FixedRunModelProviderResolver, RunBoundProviderResolver};
 pub use recovery::{RecoveryDecision, RecoveryManager, RecoveryRequest};
 pub use service::{
     ActiveRunProviderBindingSource, AgentServiceApi, ArtifactView, CreateTaskRequest,
