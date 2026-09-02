@@ -16,6 +16,10 @@ use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
 const RUNTIME_MIGRATION: &str = include_str!("../migrations/0001_runtime.sql");
 const PROVIDER_MIGRATION_V2: &str = include_str!("../migrations/0002_provider_management.sql");
+const CREDENTIAL_JOURNAL_MIGRATION_V3: &str =
+    include_str!("../migrations/0003_credential_journal_recovery.sql");
+const RUN_BINDING_MIGRATION_V4: &str =
+    include_str!("../migrations/0004_run_binding_activation_revision.sql");
 
 #[tokio::test]
 async fn provider_repository_keeps_active_ready_revision_when_a_new_draft_is_saved() {
@@ -83,9 +87,8 @@ async fn provider_repository_keeps_active_ready_revision_when_a_new_draft_is_sav
         .await
         .expect("save candidate revision");
 
-    let evidence = CompatibilityEvidence::passing(candidate.validation_inputs(
-        ValidationVersions::new("catalog-v1", "probe-v1", "liter-v1", "codec-v1"),
-    ));
+    let versions = ValidationVersions::new("catalog-v1", "probe-v1", "liter-v1", "codec-v1");
+    let evidence = CompatibilityEvidence::passing(candidate.validation_inputs(versions.clone()));
     let validation_digest = evidence.digest();
     let validation_id = evidence.id();
     repository
@@ -98,6 +101,7 @@ async fn provider_repository_keeps_active_ready_revision_when_a_new_draft_is_sav
                 validation_digest: validation_digest.clone(),
             },
             evidence,
+            versions,
         })
         .await
         .expect("commit matching passing validation");
@@ -857,6 +861,64 @@ async fn provider_migration_upgrades_legacy_database_and_leaves_no_active_profil
 }
 
 #[tokio::test]
+async fn invalid_validation_migration_upgrades_existing_provider_schema_without_losing_contracts() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    let connection = Connection::open(&database).expect("open pre-upgrade database");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );",
+        )
+        .expect("create migration ledger");
+    connection
+        .execute_batch(RUNTIME_MIGRATION)
+        .expect("apply runtime migration");
+    connection
+        .execute_batch(PROVIDER_MIGRATION_V2)
+        .expect("apply Provider migration");
+    connection
+        .execute_batch(CREDENTIAL_JOURNAL_MIGRATION_V3)
+        .expect("apply Credential journal migration");
+    connection
+        .execute_batch(RUN_BINDING_MIGRATION_V4)
+        .expect("apply Run binding migration");
+    connection
+        .execute_batch(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'legacy');
+             INSERT INTO schema_migrations(version, applied_at) VALUES (2, 'legacy');
+             INSERT INTO schema_migrations(version, applied_at) VALUES (3, 'legacy');
+             INSERT INTO schema_migrations(version, applied_at) VALUES (4, 'legacy');",
+        )
+        .expect("record pre-validation schema");
+    drop(connection);
+
+    SqliteRuntimeStore::open(&database)
+        .await
+        .expect("upgrade failed-validation persistence contract");
+    let connection = Connection::open(&database).expect("inspect upgraded schema");
+    let version: i64 = connection
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE version = 5",
+            [],
+            |row| row.get(0),
+        )
+        .expect("validation migration recorded");
+    assert_eq!(version, 5);
+    let schema: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'provider_profile_revisions'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load rebuilt revision schema");
+    assert!(schema.contains("CHECK ((state = 'draft') = (validation_id IS NULL))"));
+}
+
+#[tokio::test]
 async fn provider_migration_is_idempotent_and_rejects_unknown_parameter_schema() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = directory.path().join("runtime.db");
@@ -1502,6 +1564,7 @@ async fn create_run(store: &SqliteRuntimeStore, snapshot: RunSnapshot) -> Create
                 validation_digest: validation_digest.clone(),
             },
             evidence,
+            versions,
         })
         .await
         .expect("save test Provider validation");

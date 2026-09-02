@@ -14,6 +14,7 @@ const MIGRATION_0001: &str = include_str!("../migrations/0001_runtime.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_provider_management.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_credential_journal_recovery.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_run_binding_activation_revision.sql");
+const MIGRATION_0005: &str = include_str!("../migrations/0005_invalid_validation_state.sql");
 
 #[derive(Debug, Clone)]
 pub struct SqliteRuntimeStore {
@@ -90,36 +91,86 @@ fn apply_migrations(connection: &mut Connection) -> CoreResult<()> {
         )
         .map_err(storage_error)?;
 
+    {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let runtime_applied = migration_is_applied(&transaction, 1)?;
+        if !runtime_applied {
+            transaction
+                .execute_batch(MIGRATION_0001)
+                .map_err(storage_error)?;
+            record_migration(&transaction, 1)?;
+        }
+
+        if !migration_is_applied(&transaction, 2)? {
+            transaction
+                .execute_batch(MIGRATION_0002)
+                .map_err(storage_error)?;
+            record_migration(&transaction, 2)?;
+        }
+        if !migration_is_applied(&transaction, 3)? {
+            transaction
+                .execute_batch(MIGRATION_0003)
+                .map_err(storage_error)?;
+            record_migration(&transaction, 3)?;
+        }
+        if !migration_is_applied(&transaction, 4)? {
+            transaction
+                .execute_batch(MIGRATION_0004)
+                .map_err(storage_error)?;
+            record_migration(&transaction, 4)?;
+        }
+        transaction.commit().map_err(storage_error)?;
+    }
+
+    let migration_five_applied: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 5)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)?;
+    if migration_five_applied {
+        return Ok(());
+    }
+
+    // SQLite cannot change a CHECK constraint in place. The v5 rebuild keeps the table name and
+    // all rows stable; foreign keys are verified again immediately after the atomic rebuild.
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .map_err(storage_error)?;
+    let migration_result = apply_invalid_validation_migration(connection);
+    let foreign_key_result = connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(storage_error);
+    migration_result?;
+    foreign_key_result?;
+    verify_foreign_keys(connection)
+}
+
+fn apply_invalid_validation_migration(connection: &mut Connection) -> CoreResult<()> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(storage_error)?;
-    let runtime_applied = migration_is_applied(&transaction, 1)?;
-    if !runtime_applied {
-        transaction
-            .execute_batch(MIGRATION_0001)
-            .map_err(storage_error)?;
-        record_migration(&transaction, 1)?;
-    }
-
-    if !migration_is_applied(&transaction, 2)? {
-        transaction
-            .execute_batch(MIGRATION_0002)
-            .map_err(storage_error)?;
-        record_migration(&transaction, 2)?;
-    }
-    if !migration_is_applied(&transaction, 3)? {
-        transaction
-            .execute_batch(MIGRATION_0003)
-            .map_err(storage_error)?;
-        record_migration(&transaction, 3)?;
-    }
-    if !migration_is_applied(&transaction, 4)? {
-        transaction
-            .execute_batch(MIGRATION_0004)
-            .map_err(storage_error)?;
-        record_migration(&transaction, 4)?;
-    }
+    transaction
+        .execute_batch(MIGRATION_0005)
+        .map_err(storage_error)?;
+    record_migration(&transaction, 5)?;
     transaction.commit().map_err(storage_error)
+}
+
+fn verify_foreign_keys(connection: &Connection) -> CoreResult<()> {
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(storage_error)?;
+    let mut rows = statement.query([]).map_err(storage_error)?;
+    if rows.next().map_err(storage_error)?.is_some() {
+        return Err(CoreError::Storage {
+            message: "Provider schema migration left a foreign-key violation".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn migration_is_applied(transaction: &Transaction<'_>, version: i64) -> CoreResult<bool> {

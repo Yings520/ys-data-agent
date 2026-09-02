@@ -4,29 +4,34 @@
 //! deliberately has no Vault, OAuth, model client, probe, Query, or deletion authority; those
 //! flows arrive in their dedicated tasks.
 
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use ys_agent_core::{
-    ActiveProviderSnapshot, CredentialGeneration, CredentialKind, CredentialMutation,
-    CredentialMutationIntent, CredentialMutationOperation, CredentialMutationRepository,
-    CredentialMutationRequest, CredentialProtectionStatus, CredentialVault, CredentialViewStatus,
-    ProfileDetail, ProfileId, ProfileName, ProfileRevision, ProfileRevisionRepository,
-    ProfileSummary, ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode,
-    ProviderField, ProviderManagementError, ProviderRemediation, ProviderResult,
-    RevisionPrecondition, RunProviderBindingRepository, SaveProfileRequest, SaveProfileRevision,
-    SecretValue,
+    ActivateProfileRequest, ActivationConfirmation, ActiveProviderSnapshot, ActiveProviderView,
+    CredentialGeneration, CredentialKind, CredentialMutation, CredentialMutationIntent,
+    CredentialMutationOperation, CredentialMutationRepository, CredentialMutationRequest,
+    CredentialProtectionStatus, CredentialVault, CredentialViewStatus, OperationId, ProfileDetail,
+    ProfileId, ProfileName, ProfileRevision, ProfileSummary, ProtectedCredentialWrite,
+    ProviderCredentialReference, ProviderErrorCode, ProviderField, ProviderManagementError,
+    ProviderRemediation, ProviderResult, RevisionPrecondition, RunProviderBindingRepository,
+    SaveProfileRequest, SaveProfileRevision, SecretValue, ValidationActivationRepository,
+    ValidationCommit,
 };
 use zeroize::Zeroizing;
 
 use super::validation::{LocalProfileValidationRequest, LocalProfileValidator};
 
-/// The Profile-only portion of the Provider-management application service.
+/// Profile lifecycle, validation, and activation orchestration.
 ///
-/// It depends on the narrow revision port so creating, listing, editing, and copying Profiles do
-/// not acquire unintended credential mutation or deletion authority.
+/// It depends on the validation/activation port so it can append Drafts, submit evidence, and
+/// switch the active singleton without acquiring credential mutation or deletion authority.
 pub struct ProviderManagementService {
-    profiles: Arc<dyn ProfileRevisionRepository>,
+    profiles: Arc<dyn ValidationActivationRepository>,
     local_validator: LocalProfileValidator,
+    cancelled_operations: Mutex<HashSet<OperationId>>,
 }
 
 /// Credential-only mutation orchestration.
@@ -280,11 +285,78 @@ impl CredentialService {
 }
 
 impl ProviderManagementService {
-    pub fn new(profiles: Arc<dyn ProfileRevisionRepository>) -> Self {
+    pub fn new(profiles: Arc<dyn ValidationActivationRepository>) -> Self {
         Self {
             profiles,
             local_validator: LocalProfileValidator::default(),
+            cancelled_operations: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Persists evidence only when it still names the durable current revision and generation.
+    /// A successful result is Ready or Invalid; it never changes the active singleton.
+    pub async fn commit_validation(
+        &self,
+        commit: ValidationCommit,
+    ) -> ProviderResult<ProfileDetail> {
+        self.require_not_cancelled(commit.precondition.operation_id)?;
+        let profile_id = commit.precondition.profile_id;
+        self.profiles.save_validation(commit).await?;
+        self.load_profile(profile_id).await
+    }
+
+    /// Returns the non-sensitive statement a caller renders before it explicitly changes the
+    /// active singleton. Existing Run bindings are immutable, so only later Runs can observe it.
+    pub async fn activation_confirmation(
+        &self,
+        request: &ActivateProfileRequest,
+    ) -> ProviderResult<ActivationConfirmation> {
+        self.require_not_cancelled(request.operation_id)?;
+        let current = self
+            .profiles
+            .load_current_revision(request.precondition.profile_id)
+            .await?;
+        let validation = current.validation().ok_or_else(activation_error)?;
+        let active_revision = self
+            .profiles
+            .active()
+            .await?
+            .map(|active| active.activation_revision());
+        if current.revision() != request.precondition.revision
+            || current.state() != ys_agent_core::ProfileState::Ready
+            || validation.id() != request.precondition.validation_id
+            || validation.digest() != request.precondition.validation_digest
+            || active_revision != request.precondition.expected_activation_revision
+        {
+            return Err(activation_error());
+        }
+        Ok(ActivationConfirmation {
+            profile_id: current.profile_id(),
+            profile_revision: current.revision(),
+            affects_new_runs_only: true,
+        })
+    }
+
+    /// Activates a previously confirmed Ready current revision through the repository's
+    /// singleton compare-and-swap, then returns the committed snapshot rather than a prediction.
+    pub async fn activate(
+        &self,
+        request: ActivateProfileRequest,
+    ) -> ProviderResult<ActiveProviderView> {
+        self.activation_confirmation(&request).await?;
+        let active = self.profiles.activate(request).await?;
+        Ok(ActiveProviderView::from(&active))
+    }
+
+    /// Cancellation is idempotent and only prevents an operation that has not crossed a durable
+    /// repository boundary. A late save/activate is independently guarded by its CAS
+    /// preconditions and can never replace a newer current revision or active singleton.
+    pub fn cancel_operation(&self, operation_id: OperationId) -> ProviderResult<()> {
+        self.cancelled_operations
+            .lock()
+            .map_err(|_| internal_operation_error())?
+            .insert(operation_id);
+        Ok(())
     }
 
     /// Returns masked persisted summaries without any network, Vault, or model-client access.
@@ -423,6 +495,21 @@ impl ProviderManagementService {
         }
         Ok(())
     }
+
+    fn require_not_cancelled(&self, operation_id: OperationId) -> ProviderResult<()> {
+        let cancelled = self
+            .cancelled_operations
+            .lock()
+            .map_err(|_| internal_operation_error())?;
+        if cancelled.contains(&operation_id) {
+            return Err(ProviderManagementError::new(
+                ProviderErrorCode::OperationCancelled,
+                Some(ProviderField::Validation),
+                ProviderRemediation::ReturnToEdit,
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn profile_detail(summary: ProfileSummary, revision: ProfileRevision) -> ProfileDetail {
@@ -444,6 +531,22 @@ fn profile_error() -> ProviderManagementError {
         ProviderErrorCode::StorageConflict,
         Some(ProviderField::Provider),
         ProviderRemediation::ReturnToEdit,
+    )
+}
+
+fn activation_error() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::ActivationPreconditionFailed,
+        Some(ProviderField::Activation),
+        ProviderRemediation::WaitForCurrentOperation,
+    )
+}
+
+fn internal_operation_error() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::Internal,
+        Some(ProviderField::Validation),
+        ProviderRemediation::ContactSupport,
     )
 }
 

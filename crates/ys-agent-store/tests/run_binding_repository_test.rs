@@ -80,9 +80,8 @@ async fn seed_active_profile(
         })
         .await
         .expect("save candidate revision");
-    let evidence = CompatibilityEvidence::passing(candidate.validation_inputs(
-        ValidationVersions::new("catalog-v1", "probe-v1", "liter-v1", "codec-v1"),
-    ));
+    let versions = ValidationVersions::new("catalog-v1", "probe-v1", "liter-v1", "codec-v1");
+    let evidence = CompatibilityEvidence::passing(candidate.validation_inputs(versions.clone()));
     let validation_id = evidence.id();
     let validation_digest = evidence.digest();
     repository
@@ -95,6 +94,7 @@ async fn seed_active_profile(
                 validation_digest: validation_digest.clone(),
             },
             evidence,
+            versions,
         })
         .await
         .expect("save passing validation");

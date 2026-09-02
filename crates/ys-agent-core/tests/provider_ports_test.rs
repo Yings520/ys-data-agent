@@ -11,7 +11,7 @@ use ys_agent_core::{
     ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi, ProviderManagementError,
     ProviderProfileRepository, ProviderRemediation, ProviderResult, ResolvedRunProvider, RunId,
     RunModelProviderResolver, RunProviderBindingRepository, SaveProfileRevision,
-    ValidateProfileRequest, ValidationCommit,
+    ValidateProfileRequest, ValidationActivationRepository, ValidationCommit,
 };
 
 struct FakeProviderManagementApi;
@@ -245,7 +245,7 @@ impl CredentialMutationRepository for FakeProviderProfileRepository {
 }
 
 #[async_trait::async_trait]
-impl ProviderProfileRepository for FakeProviderProfileRepository {
+impl ValidationActivationRepository for FakeProviderProfileRepository {
     async fn save_validation(&self, _commit: ValidationCommit) -> ProviderResult<ProfileRevision> {
         unavailable()
     }
@@ -256,7 +256,10 @@ impl ProviderProfileRepository for FakeProviderProfileRepository {
     ) -> ProviderResult<ActiveProviderSnapshot> {
         unavailable()
     }
+}
 
+#[async_trait::async_trait]
+impl ProviderProfileRepository for FakeProviderProfileRepository {
     async fn delete_profile(&self, _request: DeleteProfileRequest) -> ProviderResult<()> {
         unavailable()
     }

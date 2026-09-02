@@ -56,10 +56,11 @@ pub use ports::{
     ProviderProfileRepository, QueryContextProvider, QueryPreflightReader,
     RunModelProviderResolver, RunProviderBindingRepository, RunProviderBindingSource,
     RuntimeCommandBatch, RuntimeStore, SqlQueryExecutor, Tool, ToolExecutionContext,
+    ValidationActivationRepository,
 };
 pub use provider::{
-    ActivateProfileRequest, ActivationPrecondition, ActiveProviderSlot, ActiveProviderSnapshot,
-    ActiveProviderView, ActiveRevisionPrecondition, CompatibilityEvidence,
+    ActivateProfileRequest, ActivationConfirmation, ActivationPrecondition, ActiveProviderSlot,
+    ActiveProviderSnapshot, ActiveProviderView, ActiveRevisionPrecondition, CompatibilityEvidence,
     CompatibilityEvidenceView, CredentialGeneration, CredentialKind, CredentialLease,
     CredentialMutation, CredentialMutationIntent, CredentialMutationOperation,
     CredentialMutationPhase, CredentialMutationRecord, CredentialMutationRequest,

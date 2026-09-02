@@ -13,7 +13,7 @@ use ys_agent_core::{
     ProfileRevisionRepository, ProfileState, ProfileSummary, ProviderErrorCode, ProviderField,
     ProviderId, ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
     ProviderResult, RevisionPrecondition, RunId, RunProviderBinding, RunProviderBindingRepository,
-    SaveProfileRevision, ValidationCommit,
+    SaveProfileRevision, ValidationActivationRepository, ValidationCommit,
 };
 
 use crate::{SqliteRuntimeStore, sqlite::open_connection};
@@ -299,6 +299,9 @@ impl SqliteProviderRepository {
             )?;
             if revision.credential_generation() != Some(commit.precondition.credential_generation)
                 || revision.state() != ProfileState::Draft
+                || !commit
+                    .evidence
+                    .matches(&revision.validation_inputs(commit.versions.clone()))
             {
                 return Err(validation_stale_error());
             }
@@ -348,6 +351,11 @@ impl SqliteProviderRepository {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(provider_storage_error)?;
+            if current_revision(&transaction, request.precondition.profile_id)?
+                != Some(request.precondition.revision)
+            {
+                return Err(activation_error());
+            }
             let revision = load_revision(
                 &transaction,
                 request.precondition.profile_id,
@@ -995,6 +1003,20 @@ impl ProfileRevisionRepository for SqliteProviderRepository {
 
     async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>> {
         SqliteProviderRepository::active(self).await
+    }
+}
+
+#[async_trait]
+impl ValidationActivationRepository for SqliteProviderRepository {
+    async fn save_validation(&self, commit: ValidationCommit) -> ProviderResult<ProfileRevision> {
+        SqliteProviderRepository::save_validation(self, commit).await
+    }
+
+    async fn activate(
+        &self,
+        request: ActivateProfileRequest,
+    ) -> ProviderResult<ActiveProviderSnapshot> {
+        SqliteProviderRepository::activate(self, request).await
     }
 }
 

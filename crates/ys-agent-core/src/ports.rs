@@ -244,6 +244,19 @@ pub trait ProfileRevisionRepository: Send + Sync {
     async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>>;
 }
 
+/// Current-revision validation and active-singleton transitions. This remains separate from
+/// Credential mutation and Profile deletion so the application service has only the authority
+/// required to submit compatibility evidence and switch the active Provider.
+#[async_trait]
+pub trait ValidationActivationRepository: ProfileRevisionRepository {
+    async fn save_validation(&self, commit: ValidationCommit) -> ProviderResult<ProfileRevision>;
+
+    async fn activate(
+        &self,
+        request: ActivateProfileRequest,
+    ) -> ProviderResult<ActiveProviderSnapshot>;
+}
+
 /// Durable credential-mutation journal state. This is deliberately narrower than the full
 /// Provider lifecycle port so credential orchestration can be wired to persistence without
 /// acquiring validation, activation, or Profile-deletion authority.
@@ -294,14 +307,9 @@ pub trait CredentialMutationRepository: ProfileRevisionRepository {
 /// Durable Provider profile state. Every mutation includes an explicit compare-and-swap
 /// precondition so a late operation cannot replace a newer revision or active selection.
 #[async_trait]
-pub trait ProviderProfileRepository: CredentialMutationRepository {
-    async fn save_validation(&self, commit: ValidationCommit) -> ProviderResult<ProfileRevision>;
-
-    async fn activate(
-        &self,
-        request: ActivateProfileRequest,
-    ) -> ProviderResult<ActiveProviderSnapshot>;
-
+pub trait ProviderProfileRepository:
+    CredentialMutationRepository + ValidationActivationRepository
+{
     async fn delete_profile(&self, request: DeleteProfileRequest) -> ProviderResult<()>;
 }
 

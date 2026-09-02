@@ -167,7 +167,7 @@
   - _Requirements: 3.1, 3.3, 3.5, 3.6, 3.7, 3.8, 5.6, 8.4, 11.2_
   - _Boundary: CredentialService mutation orchestration_
   - _Depends: 2.3, 3.2, 4.3_
-- [ ] 4.5 提交 Validation 并原子激活 Ready revision
+- [x] 4.5 提交 Validation 并原子激活 Ready revision
   - 仅当 operation、revision、credential generation 和 evidence digest 仍匹配时提交 Ready/Invalid；迟到验证返回 Stale 而不改写新状态。
   - activation 再次验证 Ready、当前 evidence 与 active singleton precondition，并返回 commit 后 snapshot；任何失败保持 TUI/Runtime 对旧 active 的一致观察。
   - 暴露显式取消入口与“只影响之后 Run”的确认数据，拒绝 Draft、Invalid、未验证或已失效 revision。

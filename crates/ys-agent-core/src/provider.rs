@@ -1407,6 +1407,16 @@ pub struct ActiveProviderView {
     pub parameters: ProviderParameters,
 }
 
+/// Non-sensitive confirmation data rendered before changing the active singleton. It makes the
+/// Run boundary explicit: existing Run bindings remain immutable and only later Runs can observe
+/// the selected revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivationConfirmation {
+    pub profile_id: ProfileId,
+    pub profile_revision: u64,
+    pub affects_new_runs_only: bool,
+}
+
 impl From<&ActiveProviderSnapshot> for ActiveProviderView {
     fn from(snapshot: &ActiveProviderSnapshot) -> Self {
         Self {
@@ -1454,6 +1464,10 @@ pub struct ValidationCommitPrecondition {
 pub struct ValidationCommit {
     pub precondition: ValidationCommitPrecondition,
     pub evidence: CompatibilityEvidence,
+    /// Versioned, non-sensitive inputs used to bind the evidence digest to the exact current
+    /// Profile revision before persistence. They are verified but need not be retained after the
+    /// resulting digest has been committed.
+    pub versions: ValidationVersions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

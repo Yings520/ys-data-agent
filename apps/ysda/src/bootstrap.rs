@@ -1474,14 +1474,15 @@ async fn seed_deterministic_active_provider(
         .await
         .map_err(fixture_error)?;
 
-    let evidence = ys_agent_core::CompatibilityEvidence::passing(candidate.validation_inputs(
-        ys_agent_core::ValidationVersions::new(
-            "deterministic-catalog",
-            "deterministic-probe",
-            "deterministic-liter",
-            "deterministic-codec",
-        ),
-    ));
+    let versions = ys_agent_core::ValidationVersions::new(
+        "deterministic-catalog",
+        "deterministic-probe",
+        "deterministic-liter",
+        "deterministic-codec",
+    );
+    let evidence = ys_agent_core::CompatibilityEvidence::passing(
+        candidate.validation_inputs(versions.clone()),
+    );
     let validation_id = evidence.id();
     let validation_digest = evidence.digest();
     repository
@@ -1494,6 +1495,7 @@ async fn seed_deterministic_active_provider(
                 validation_digest: validation_digest.clone(),
             },
             evidence,
+            versions,
         })
         .await
         .map_err(fixture_error)?;
