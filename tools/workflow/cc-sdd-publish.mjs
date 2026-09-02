@@ -45,11 +45,8 @@ export function expectedBase(env = process.env) {
   return env.CC_SDD_PR_BASE || "master";
 }
 
-function git(root, args) {
-  // Publication consumes exact, machine-readable Git output (including NUL-delimited paths).
-  // `rtk git` is intentionally human-oriented and may append compact diff markers, so use
-  // RTK's raw tracked proxy while still routing every Git operation through RTK.
-  const result = spawnSync("rtk", ["proxy", "git", ...args], {
+function runRtkGit(root, prefix, args) {
+  const result = spawnSync("rtk", [...prefix, ...args], {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
@@ -58,6 +55,19 @@ function git(root, args) {
     throw new PublicationError("git operation failed");
   }
   return result.stdout;
+}
+
+function git(root, args) {
+  // Publication consumes exact, machine-readable Git output (including NUL-delimited paths).
+  // `rtk git` is intentionally human-oriented and may append compact diff markers, so use
+  // RTK's raw tracked proxy for reads.
+  return runRtkGit(root, ["proxy", "git"], args);
+}
+
+function mutateGit(root, args) {
+  // Ralph's workspace permission profile authorizes the dedicated RTK Git command to mutate
+  // `.git`; the generic raw proxy is read-only in that sandbox.
+  return runRtkGit(root, ["git"], args);
 }
 
 function remoteHead(root, feature) {
@@ -313,14 +323,14 @@ export async function publishTask(feature, taskId, paths, root = process.cwd()) 
     feature,
     taskId,
   );
-  git(root, [
+  mutateGit(root, [
     "commit",
     "-m",
     subject,
     "-m",
     `${featureTrailer}\n${taskTrailer}`,
   ]);
-  git(root, [
+  mutateGit(root, [
     "push",
     "origin",
     `HEAD:refs/heads/${expectedBranch(feature)}`,
@@ -359,7 +369,7 @@ export async function recoverFeature(
 
   const local = git(root, ["rev-parse", "HEAD"]).trim();
   if (remoteHead(root, feature) !== local) {
-    git(root, [
+    mutateGit(root, [
       "push",
       "origin",
       `HEAD:refs/heads/${expectedBranch(feature)}`,
@@ -449,7 +459,7 @@ export async function publishValidation(
       feature,
       env,
     );
-    git(root, [
+    mutateGit(root, [
       "commit",
       "--allow-empty",
       "-m",
@@ -460,7 +470,7 @@ export async function publishValidation(
   }
 
   if (remoteHead(root, feature) !== git(root, ["rev-parse", "HEAD"]).trim()) {
-    git(root, [
+    mutateGit(root, [
       "push",
       "origin",
       `HEAD:refs/heads/${expectedBranch(feature)}`,

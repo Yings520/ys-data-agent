@@ -97,6 +97,10 @@ esac
 printf '%s\\n' "$*" >> "$RTK_CALL_LOG"
 if [ "$1 $2" = "proxy git" ]; then
   shift 2
+  if [ "\${RTK_PROXY_WRITES_DENIED:-}" = "1" ] && { [ "$1" = "commit" ] || [ "$1" = "push" ]; }; then
+    printf '%s\\n' 'proxy git writes are denied by the Ralph sandbox' >&2
+    exit 126
+  fi
   exec "$REAL_GIT" "$@"
 fi
 if [ "$1" = "git" ]; then
@@ -280,6 +284,20 @@ test("uses raw RTK proxy output for machine-readable Git commands", async () => 
     await readFile(path.join(root, ".rtk-calls"), "utf8"),
     /^proxy git diff --cached --name-only -z$/m,
   );
+});
+
+test("routes Git mutations through the Ralph sandbox-compatible RTK command", async () => {
+  const { root } = await createRepository();
+
+  const result = publish(root, {
+    env: { RTK_PROXY_WRITES_DENIED: "1" },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const calls = await readFile(path.join(root, ".rtk-calls"), "utf8");
+  assert.match(calls, /^git commit /m);
+  assert.match(calls, /^git push /m);
+  assert.doesNotMatch(calls, /^proxy git (?:commit|push) /m);
 });
 
 test("reuses the one open Draft PR for the expected head and base", async () => {
