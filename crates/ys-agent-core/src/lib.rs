@@ -51,8 +51,9 @@ pub use model::{
 
 pub use ports::{
     ArtifactStore, CatalogReader, CreateRunCommand, CredentialVault, FreshnessReader,
-    MetricProvider, ModelDiscovery, ModelProvider, OAuthConnectionService, ProviderClientFactory,
-    ProviderManagementApi, ProviderProfileRepository, QueryContextProvider, QueryPreflightReader,
+    MetricProvider, ModelDiscovery, ModelProvider, OAuthConnectionService,
+    ProfileRevisionRepository, ProviderClientFactory, ProviderManagementApi,
+    ProviderProfileRepository, QueryContextProvider, QueryPreflightReader,
     RunModelProviderResolver, RunProviderBindingRepository, RunProviderBindingSource,
     RuntimeCommandBatch, RuntimeStore, SqlQueryExecutor, Tool, ToolExecutionContext,
 };

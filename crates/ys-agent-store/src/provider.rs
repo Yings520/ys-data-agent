@@ -9,10 +9,10 @@ use ys_agent_core::{
     CredentialMutationIntent, CredentialMutationOperation, CredentialMutationPhase,
     CredentialMutationRecord, CredentialPointerCommit, CredentialViewStatus, OperationId,
     PersistedCompatibilityEvidence, PersistedCredentialMutationRecord, PersistedProfileRevision,
-    ProfileId, ProfileRevision, ProfileState, ProfileSummary, ProviderErrorCode, ProviderField,
-    ProviderId, ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
-    ProviderResult, RevisionPrecondition, RunId, RunProviderBinding, RunProviderBindingRepository,
-    SaveProfileRevision, ValidationCommit,
+    ProfileId, ProfileRevision, ProfileRevisionRepository, ProfileState, ProfileSummary,
+    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError, ProviderModelId,
+    ProviderParameters, ProviderRemediation, ProviderResult, RevisionPrecondition, RunId,
+    RunProviderBinding, RunProviderBindingRepository, SaveProfileRevision, ValidationCommit,
 };
 
 use crate::{SqliteRuntimeStore, sqlite::open_connection};
@@ -211,6 +211,18 @@ impl SqliteProviderRepository {
     ) -> ProviderResult<ProfileRevision> {
         self.with_connection(move |connection| load_revision(connection, profile_id, revision))
             .await
+    }
+
+    pub async fn load_current_revision(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<ProfileRevision> {
+        self.with_connection(move |connection| {
+            let revision =
+                current_revision(connection, profile_id)?.ok_or_else(storage_conflict_error)?;
+            load_revision(connection, profile_id, revision)
+        })
+        .await
     }
 
     pub async fn save_revision(
@@ -891,6 +903,36 @@ impl SqliteProviderRepository {
                 .collect()
         })
         .await
+    }
+}
+
+#[async_trait]
+impl ProfileRevisionRepository for SqliteProviderRepository {
+    async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>> {
+        SqliteProviderRepository::list_profiles(self).await
+    }
+
+    async fn load_current_revision(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<ProfileRevision> {
+        SqliteProviderRepository::load_current_revision(self, profile_id).await
+    }
+
+    async fn load_revision(
+        &self,
+        profile_id: ProfileId,
+        revision: u64,
+    ) -> ProviderResult<ProfileRevision> {
+        SqliteProviderRepository::load_revision(self, profile_id, revision).await
+    }
+
+    async fn save_revision(&self, request: SaveProfileRevision) -> ProviderResult<ProfileRevision> {
+        SqliteProviderRepository::save_revision(self, request).await
+    }
+
+    async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>> {
+        SqliteProviderRepository::active(self).await
     }
 }
 

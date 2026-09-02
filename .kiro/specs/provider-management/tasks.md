@@ -151,13 +151,13 @@
   - _Requirements: 4.3, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 8.3, 9.2, 11.4_
   - _Boundary: CompatibilityValidator and ProbeEvidence_
   - _Depends: 2.2, 3.7, 3.8, 4.1_
-- [ ] 4.3 (P) 实现 Profile revision 生命周期
+- [x] 4.3 (P) 实现 Profile revision 生命周期
   - 编排创建、查看、编辑与复制；每次操作创建新 revision，复制只带适用的非敏感字段并产生 Missing Credential 的 Draft。
   - 保存未完整字段为 Draft，字段/持久化失败保留上一完整 revision 与 active pointer，取消编辑无需服务端写入。
   - 提供离线 list/detail/active snapshot，并把配置、认证与支持状态组合成 masked Profile view。
   - 完成后，服务测试能观察多个唯一命名 Profile 的 CRUD/复制与 revision 历史，且无网络时仍可浏览。
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.6, 4.2, 4.8, 7.7_
-  - _Boundary: ProviderManagementService profile revision lifecycle_
+  - _Boundary: ProviderManagementService profile revision lifecycle, current-revision ProfileRevisionRepository contract, and SqliteProviderRepository port implementation_
   - _Depends: 2.2, 4.1_
 - [ ] 4.4 编排 Credential generation 创建、替换与删除
   - 按 journal 顺序先记录 intent、写不可变 Vault generation、再 compare-and-swap Profile pointer；旧 generation 按 active/Run 引用进入 Retained 或 cleanup。

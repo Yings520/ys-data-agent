@@ -5,12 +5,12 @@ use ys_agent_core::{
     CredentialPointerCommit, CredentialProtectionStatus, CredentialVault, CredentialViewStatus,
     DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
     ModelDiscovery, OAuthConnectionService, OAuthConnectionView, OperationId, ProfileDetail,
-    ProfileId, ProfileName, ProfileRevision, ProfileSummary, ProtectedCredentialWrite,
-    ProviderCatalogView, ProviderClientBinding, ProviderClientFactory, ProviderCredentialReference,
-    ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi,
-    ProviderManagementError, ProviderProfileRepository, ProviderRemediation, ProviderResult,
-    ResolvedRunProvider, RunId, RunModelProviderResolver, RunProviderBindingRepository,
-    SaveProfileRevision, ValidateProfileRequest, ValidationCommit,
+    ProfileId, ProfileName, ProfileRevision, ProfileRevisionRepository, ProfileSummary,
+    ProtectedCredentialWrite, ProviderCatalogView, ProviderClientBinding, ProviderClientFactory,
+    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId,
+    ProviderManagementApi, ProviderManagementError, ProviderProfileRepository, ProviderRemediation,
+    ProviderResult, ResolvedRunProvider, RunId, RunModelProviderResolver,
+    RunProviderBindingRepository, SaveProfileRevision, ValidateProfileRequest, ValidationCommit,
 };
 
 struct FakeProviderManagementApi;
@@ -154,9 +154,16 @@ impl ProviderManagementApi for FakeProviderManagementApi {
 }
 
 #[async_trait::async_trait]
-impl ProviderProfileRepository for FakeProviderProfileRepository {
+impl ProfileRevisionRepository for FakeProviderProfileRepository {
     async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>> {
         Ok(Vec::new())
+    }
+
+    async fn load_current_revision(
+        &self,
+        _profile_id: ProfileId,
+    ) -> ProviderResult<ProfileRevision> {
+        unavailable()
     }
 
     async fn load_revision(
@@ -174,6 +181,13 @@ impl ProviderProfileRepository for FakeProviderProfileRepository {
         unavailable()
     }
 
+    async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>> {
+        Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderProfileRepository for FakeProviderProfileRepository {
     async fn save_validation(&self, _commit: ValidationCommit) -> ProviderResult<ProfileRevision> {
         unavailable()
     }
@@ -183,10 +197,6 @@ impl ProviderProfileRepository for FakeProviderProfileRepository {
         _request: ActivateProfileRequest,
     ) -> ProviderResult<ActiveProviderSnapshot> {
         unavailable()
-    }
-
-    async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>> {
-        Ok(None)
     }
 
     async fn begin_credential_mutation(

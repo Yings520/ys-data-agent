@@ -220,11 +220,18 @@ pub trait QueryContextProvider: Send + Sync {
     async fn load_evidence(&self, query: &str) -> CoreResult<Vec<ContextEvidence>>;
 }
 
-/// Durable Provider profile state. Every mutation includes an explicit compare-and-swap
-/// precondition so a late operation cannot replace a newer revision or active selection.
+/// Durable Profile revision state required for offline browsing and Draft lifecycle management.
+///
+/// This narrow port is intentionally separate from the wider lifecycle port below: browsing,
+/// editing, and copying must work before credential mutation and deletion orchestration exist.
 #[async_trait]
-pub trait ProviderProfileRepository: Send + Sync {
+pub trait ProfileRevisionRepository: Send + Sync {
     async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>>;
+
+    /// Loads the revision selected by the durable current pointer, rather than requiring callers
+    /// to guess a revision after an application restart.
+    async fn load_current_revision(&self, profile_id: ProfileId)
+    -> ProviderResult<ProfileRevision>;
 
     async fn load_revision(
         &self,
@@ -234,14 +241,19 @@ pub trait ProviderProfileRepository: Send + Sync {
 
     async fn save_revision(&self, request: SaveProfileRevision) -> ProviderResult<ProfileRevision>;
 
+    async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>>;
+}
+
+/// Durable Provider profile state. Every mutation includes an explicit compare-and-swap
+/// precondition so a late operation cannot replace a newer revision or active selection.
+#[async_trait]
+pub trait ProviderProfileRepository: ProfileRevisionRepository {
     async fn save_validation(&self, commit: ValidationCommit) -> ProviderResult<ProfileRevision>;
 
     async fn activate(
         &self,
         request: ActivateProfileRequest,
     ) -> ProviderResult<ActiveProviderSnapshot>;
-
-    async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>>;
 
     async fn begin_credential_mutation(
         &self,
