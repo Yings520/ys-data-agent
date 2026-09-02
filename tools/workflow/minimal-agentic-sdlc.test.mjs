@@ -284,6 +284,8 @@ test("repository has no Ralph runtime or compatibility assets", async () => {
     "scripts/ralph-cc-sdd.sh",
     "scripts/codex-ralph",
     "tools/workflow/ralph-cc-sdd-launcher.test.mjs",
+    "docs/superpowers/plans/2026-09-02-ralph-task-policy-publishing.md",
+    "docs/superpowers/specs/2026-09-02-ralph-task-policy-publishing-design.md",
   ]) {
     await assert.rejects(stat(path.join(projectRoot, relativePath)), {
       code: "ENOENT",
