@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -42,10 +42,44 @@ function run(root, command, args, env = process.env) {
 async function createRepository() {
   const root = await mkdtemp(path.join(tmpdir(), "cc-sdd-publish-"));
   const remote = `${root}-remote.git`;
+  const fakeBin = path.join(root, ".test-bin");
+  const ghCallLog = path.join(root, ".gh-calls");
+  const ghPrState = path.join(root, ".gh-pr-state");
   await mkdir(path.join(root, ".kiro/specs/sample-feature"), {
     recursive: true,
   });
   await mkdir(path.join(root, "src"), { recursive: true });
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(
+    path.join(fakeBin, "gh"),
+    `#!/bin/sh
+printf '%s\\n' "$*" >> "$GH_CALL_LOG"
+if [ "\${GH_FAIL:-}" = "1" ]; then
+  printf '%s\\n' 'gh failed' >&2
+  exit 1
+fi
+case "$1 $2" in
+  "pr view")
+    if [ -n "\${GH_PR_JSON:-}" ]; then
+      printf '%s\\n' "$GH_PR_JSON"
+    elif [ -f "$GH_PR_STATE" ]; then
+      printf '%s\\n' '{"state":"OPEN","isDraft":true,"baseRefName":"master","headRefName":"feat/sample-feature","url":"https://github.example/pull/1"}'
+    else
+      printf '%s\\n' 'no pull requests found' >&2
+      exit 1
+    fi
+    ;;
+  "pr create")
+    : > "$GH_PR_STATE"
+    printf '%s\\n' 'https://github.example/pull/1'
+    ;;
+  "pr ready") printf '%s\\n' 'ready' ;;
+  *) exit 64 ;;
+esac
+`,
+    "utf8",
+  );
+  await chmod(path.join(fakeBin, "gh"), 0o755);
 
   run(root, "git", ["init", "-b", "master"]);
   run(root, "git", ["config", "user.name", "Ralph Test"]);
@@ -71,7 +105,17 @@ async function createRepository() {
   );
   await writeFile(path.join(root, sourcePath), "pub struct Provider;\n", "utf8");
   run(root, "git", ["add", tasksPath, sourcePath]);
-  return { root, remote };
+  return {
+    root,
+    remote,
+    ghCallLog,
+    ghPrState,
+    env: {
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+      GH_CALL_LOG: ghCallLog,
+      GH_PR_STATE: ghPrState,
+    },
+  };
 }
 
 function publish(root, options = {}) {
@@ -85,11 +129,39 @@ function publish(root, options = {}) {
     encoding: "utf8",
     env: {
       ...process.env,
+      PATH: `${path.join(root, ".test-bin")}${path.delimiter}${process.env.PATH}`,
+      GH_CALL_LOG: path.join(root, ".gh-calls"),
+      GH_PR_STATE: path.join(root, ".gh-pr-state"),
       CC_SDD_DISPATCH_FEATURE: feature,
       CC_SDD_DISPATCH_TASK_ID: taskId,
       ...options.env,
     },
   });
+}
+
+function recover(root, options = {}) {
+  return spawnSync(process.execPath, [publisher, "--recover", feature], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${path.join(root, ".test-bin")}${path.delimiter}${process.env.PATH}`,
+      GH_CALL_LOG: path.join(root, ".gh-calls"),
+      GH_PR_STATE: path.join(root, ".gh-pr-state"),
+      ...options.env,
+    },
+  });
+}
+
+function commitFixtureTask(root, withTrailers = true) {
+  const args = ["commit", "-m", "feat(sample-feature): complete task 1.1"];
+  if (withTrailers) {
+    args.push(
+      "-m",
+      "CC-SDD-Feature: sample-feature\nCC-SDD-Task: 1.1",
+    );
+  }
+  run(root, "git", args);
 }
 
 function assertDenied(result) {
@@ -99,7 +171,7 @@ function assertDenied(result) {
 }
 
 test("publishes one atomic task commit to its exact feature branch", async () => {
-  const { root, remote } = await createRepository();
+  const { root, remote, ghCallLog } = await createRepository();
 
   const result = publish(root);
 
@@ -121,6 +193,125 @@ test("publishes one atomic task commit to its exact feature branch", async () =>
     run(root, "git", ["diff", "--cached", "--name-only"]),
     "",
   );
+  assert.match(await readFile(ghCallLog, "utf8"), /pr create .*--draft/);
+});
+
+test("reuses the one open Draft PR for the expected head and base", async () => {
+  const { root, ghCallLog } = await createRepository();
+  const result = publish(root, {
+    env: {
+      GH_PR_JSON: JSON.stringify({
+        state: "OPEN",
+        isDraft: true,
+        baseRefName: "master",
+        headRefName: "feat/sample-feature",
+        url: "https://github.example/pull/1",
+      }),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const calls = await readFile(ghCallLog, "utf8");
+  assert.match(calls, /pr view/);
+  assert.doesNotMatch(calls, /pr create/);
+});
+
+test("denies a PR with the wrong lifecycle or branch identity", async () => {
+  const invalidPullRequests = [
+    {
+      state: "OPEN",
+      isDraft: true,
+      baseRefName: "master",
+      headRefName: "feat/wrong-feature",
+    },
+    {
+      state: "OPEN",
+      isDraft: true,
+      baseRefName: "develop",
+      headRefName: "feat/sample-feature",
+    },
+    {
+      state: "CLOSED",
+      isDraft: true,
+      baseRefName: "master",
+      headRefName: "feat/sample-feature",
+    },
+    {
+      state: "OPEN",
+      isDraft: false,
+      baseRefName: "master",
+      headRefName: "feat/sample-feature",
+    },
+  ];
+
+  for (const pullRequest of invalidPullRequests) {
+    const { root } = await createRepository();
+    assertDenied(
+      publish(root, {
+        env: {
+          GH_PR_JSON: JSON.stringify({
+            ...pullRequest,
+            url: "https://github.example/pull/1",
+          }),
+        },
+      }),
+    );
+  }
+});
+
+test("denies GitHub CLI failures without leaking their output", async () => {
+  const { root } = await createRepository();
+  assertDenied(publish(root, { env: { GH_FAIL: "1" } }));
+});
+
+test("recovery pushes a trailer-backed task commit when remote is behind", async () => {
+  const { root, remote } = await createRepository();
+  commitFixtureTask(root);
+
+  const result = recover(root, {
+    env: {
+      GH_PR_JSON: JSON.stringify({
+        state: "OPEN",
+        isDraft: true,
+        baseRefName: "master",
+        headRefName: "feat/sample-feature",
+        url: "https://github.example/pull/1",
+      }),
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    run(root, "git", ["rev-parse", "HEAD"]),
+    run(root, "git", [
+      "--git-dir",
+      remote,
+      "rev-parse",
+      "refs/heads/feat/sample-feature",
+    ]),
+  );
+});
+
+test("recovery creates the Draft PR after an earlier PR interruption", async () => {
+  const { root, ghCallLog } = await createRepository();
+  commitFixtureTask(root);
+  run(root, "git", [
+    "push",
+    "origin",
+    "HEAD:refs/heads/feat/sample-feature",
+  ]);
+
+  const result = recover(root);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(await readFile(ghCallLog, "utf8"), /pr create .*--draft/);
+});
+
+test("recovery rejects a checked task without its durable commit trailers", async () => {
+  const { root } = await createRepository();
+  commitFixtureTask(root, false);
+
+  assertDenied(recover(root));
 });
 
 test("denies publication when dispatch identity does not match", async () => {
