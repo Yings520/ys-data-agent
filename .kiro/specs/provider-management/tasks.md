@@ -143,7 +143,7 @@
   - _Requirements: 2.2, 2.3, 2.4, 4.4, 4.5, 4.6, 4.7, 4.8, 5.1, 5.2, 5.6, 5.8_
   - _Boundary: LocalProfileValidator and ParameterValidator_
   - _Depends: 2.2, 3.1_
-- [ ] 4.2 (P) 实现模型级兼容性安全探测
+- [x] 4.2 (P) 实现模型级兼容性安全探测
   - 在本地校验通过后，用固定、无客户数据且无副作用的合成 tool 执行 tool call、非空 ID、多轮 tool result 和 continuation 探测。
   - 从目录/响应/证据得到已知 context limit；模型结果优先于 Provider 声明，未知限制或任一能力缺失均为 Invalid。
   - 按 revision、generation、model、参数、catalog/probe/codec/`liter-llm` 版本生成不可变 evidence digest，并归一化全部规定失败分类。
