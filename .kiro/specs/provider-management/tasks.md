@@ -93,7 +93,7 @@
   - _Requirements: 1.4, 3.2, 5.8, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 11.1, 11.2_
   - _Boundary: ChatGptOAuthManager external transport_
   - _Depends: 1.1, 1.3_
-- [ ] 3.4 (P) 实现八个 API-key Provider 的 Chat codec
+- [x] 3.4 (P) 实现八个 API-key Provider 的 Chat codec
   - 把稳定 ModelRequest/ModelResponse 映射到 `liter-llm` Chat 请求和响应，同时保留 assistant tool call 与 tool result 的原始非空 Provider call ID。
   - 对空白、缺失、重复冲突 ID、无效响应和不支持参数 fail closed，不合成 ID、不静默 strip 参数。
   - 使用不含真实 Credential 或业务数据的协议 fixtures 覆盖九个前缀中的八个 Chat 路径及 Anthropic transform。
