@@ -3,7 +3,7 @@ mod composer;
 mod event_loop;
 mod input;
 mod palette;
-mod provider_management;
+pub mod provider_management;
 mod theme;
 mod ui;
 

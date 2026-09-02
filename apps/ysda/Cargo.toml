@@ -18,6 +18,7 @@ toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 ys-agent-core = { path = "../../crates/ys-agent-core" }
 ys-agent-runtime = { path = "../../crates/ys-agent-runtime" }
 ys-agent-store = { path = "../../crates/ys-agent-store" }

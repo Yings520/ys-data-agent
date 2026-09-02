@@ -219,7 +219,7 @@
   - _Depends: 5.1, 5.2_
 
 - [ ] 6. 交付 TUI、Doctor 与唯一生产配置路径
-- [ ] 6.1 (P) 实现 Provider 管理 screen reducer 与安全 view
+- [x] 6.1 (P) 实现 Provider 管理 screen reducer 与安全 view
   - 建模 Browse、Edit、Confirm、Busy 和 Result 状态，固定 Provider → Authentication → Model → Parameters → Validate → Save/Activate 步骤。
   - Save Draft 与 Activate 分离；返回编辑保留非敏感 buffer，取消编辑不改变已保存/active 状态，失败提供编辑或重试入口。
   - Secret input 使用 zeroizing buffer 和固定 mask，不提供 reveal、copy 或完整值回显；过期/失败 revision 不显示 Active。

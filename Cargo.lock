@@ -4752,6 +4752,7 @@ dependencies = [
  "ys-agent-core",
  "ys-agent-runtime",
  "ys-agent-store",
+ "zeroize",
 ]
 
 [[package]]
