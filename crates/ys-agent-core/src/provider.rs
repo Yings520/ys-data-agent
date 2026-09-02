@@ -273,6 +273,32 @@ impl ProviderParameters {
         Ok(())
     }
 
+    /// Returns the non-sensitive temperature captured by the immutable binding.
+    pub const fn temperature(&self) -> Option<f32> {
+        self.temperature
+    }
+
+    /// Returns the non-sensitive maximum output token request captured by the binding.
+    pub const fn max_tokens(&self) -> Option<u32> {
+        self.max_tokens
+    }
+
+    /// Returns the validated request timeout value captured by the binding.
+    pub const fn timeout_seconds(&self) -> u32 {
+        self.timeout_seconds
+    }
+
+    /// Returns the bounded retry count captured by the binding.
+    pub const fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    /// Returns explicitly scoped provider parameters. The factory must reject entries that are not
+    /// part of the approved model evidence; it must never silently forward arbitrary values.
+    pub fn provider_specific(&self) -> &BTreeMap<String, ParameterValue> {
+        &self.provider_specific
+    }
+
     pub fn validate_applicability(
         &self,
         rules: &BTreeMap<ProviderParameterKey, ParameterApplicability>,

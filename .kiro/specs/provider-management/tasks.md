@@ -117,7 +117,7 @@
   - _Requirements: 1.4, 3.2, 5.3, 5.5, 5.8, 6.7, 8.3, 9.2, 10.4, 11.1, 11.9_
   - _Boundary: ChatGPT Responses request and response codec_
   - _Depends: 1.1, 1.3_
-- [ ] 3.7 组装统一 Liter Provider client factory
+- [x] 3.7 组装统一 Liter Provider client factory
   - 只从 allowlisted `provider/model`、固定 endpoint、显式 scoped secret 与已校验参数构造单一 Provider/model client，并强制关闭环境和配置文件发现。
   - 八个 API-key Provider 走 Chat codec，ChatGPT Subscription 走 Responses codec；参数 disposition、timeout 与有界 retry 按 catalog/evidence 发送。
   - retry 只覆盖已分类的 429/5xx/transient network，不重试认证、模型、参数、协议或 tool ID 错误，也不改变 Provider/model。
