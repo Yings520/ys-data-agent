@@ -65,6 +65,15 @@ Required Feature flow:
 
 Do not introduce BMAD architecture, epic/story, sprint, task, implementation, or review workflows. Do not add a second cc-sdd discovery/status/implementation layer or use Ralph's PRD/task-authoring features.
 
+## Ralph Task Execution Constraints
+
+When and only when Ralph dispatches `$run-cc-sdd-task`, the Agent must read completely
+`.ysda/agents/rust-engineer.md` and
+`.ysda/agents/code-change-pr-workflow.md` before implementation.
+Missing or unreadable policy files leave the task blocked. Their commit, push, and PR
+authority is limited to the selected approved Feature task on its Feature
+branch; they never authorize force-push, automatic merge, or unrelated changes.
+
 ## Project Memory and Language
 
 - Load `.kiro/steering/` as stable project policy. Use local `AGENTS.md` only for folder-specific domain or test contracts.

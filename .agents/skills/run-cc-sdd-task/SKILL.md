@@ -21,6 +21,15 @@ This is the only implementation entry point Ralph may invoke. The arguments are:
 4. Read `docs/PRD.md`, `requirements.md`, `design.md`, `tasks.md`, and only the steering documents relevant to the selected boundary.
 5. Record `git status --short` before execution. Preserve all pre-existing changes and never use a destructive reset.
 
+## Mandatory Policies
+
+1. Read completely `.ysda/agents/rust-engineer.md`.
+2. Read completely `.ysda/agents/code-change-pr-workflow.md`.
+3. If either file is missing, unreadable, or truncated, stop with
+   `STATUS: BLOCKED`. Do not implement or run the completion helper.
+4. Apply both policies inside the selected task boundary. Git publication is
+   authorized only through the repository publication helper described below.
+
 ## Normal Task IDs
 
 1. Locate exactly `<task-id>` in `tasks.md`. It must be incomplete and all `_Depends:_` tasks must be complete.
@@ -44,7 +53,8 @@ This is the only implementation entry point Ralph may invoke. The arguments are:
 
 ## Ralph Result Protocol
 
-- Only after every applicable gate above succeeds, finish the response with the exact token `<promise>COMPLETE</promise>`.
-- On a blocker, spec conflict, stale projection, rejected review, failed command, `NO-GO`, or missing manual evidence, do not print that token anywhere in the response.
+- Only after every applicable gate above succeeds, run `rtk node tools/workflow/cc-sdd-complete.mjs <feature> <task-id>` as the final shell action. The helper independently checks the authoritative checkbox state before emitting Ralph's completion sentinel.
+- Never spell, reconstruct, quote, echo, or otherwise include the completion sentinel in Agent prose or tool commands. The completion helper is its only allowed producer.
+- On a blocker, spec conflict, stale projection, rejected review, failed command, `NO-GO`, or missing manual evidence, do not run the completion helper.
 - For a blocker, update `tasks.md` with cc-sdd's `_Blocked: <reason>_` annotation when the owning cc-sdd protocol calls for it, then report a concise `STATUS: BLOCKED`, the evidence, and the required human action.
 - Never edit `.ralph-tui/generated/*.json`; Ralph owns the scheduling projection during a run.
