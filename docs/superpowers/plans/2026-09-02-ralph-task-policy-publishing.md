@@ -13,6 +13,7 @@
 ## File Map
 
 - Modify `AGENTS.md`: document the Ralph-only scope of both mandatory policies and the authorized Git boundary.
+- Track `.ysda/agents/rust-engineer.md` and `.ysda/agents/code-change-pr-workflow.md` explicitly even though the rest of `.ysda/` remains ignored.
 - Modify `.ralph-tui-prompt.hbs`: require both policies before invoking the task skill.
 - Modify `.agents/skills/run-cc-sdd-task/SKILL.md`: load both policies completely, fail closed, stage explicit paths, publish, then complete.
 - Modify `scripts/codex-ralph`: fail closed when a policy is unreadable and inject both complete policy documents into every formal Ralph task prompt.
@@ -28,6 +29,8 @@
 
 **Files:**
 - Modify: `tools/workflow/cc-sdd-completion.test.mjs`
+- Track: `.ysda/agents/rust-engineer.md`
+- Track: `.ysda/agents/code-change-pr-workflow.md`
 - Modify: `AGENTS.md`
 - Modify: `.ralph-tui-prompt.hbs`
 - Modify: `.agents/skills/run-cc-sdd-task/SKILL.md`
@@ -95,6 +98,8 @@ branch; they never authorize force-push, automatic merge, or unrelated changes.
 ```
 
 Do not add the files to `Allowed Project Skills`; they are policies, not skills.
+Use `git add -f` for exactly these two policy files because `/.ysda/` remains
+ignored. Do not weaken or remove the existing `.gitignore` rule.
 
 - [ ] **Step 4: Add dispatch and skill enforcement**
 
@@ -159,6 +164,8 @@ Expected: all completion tests pass and no scanned instruction contains the full
 - [ ] **Step 6: Commit the policy contract**
 
 ```bash
+rtk git add -f .ysda/agents/rust-engineer.md \
+  .ysda/agents/code-change-pr-workflow.md
 rtk git add AGENTS.md .ralph-tui-prompt.hbs \
   .agents/skills/run-cc-sdd-task/SKILL.md \
   scripts/codex-ralph \
