@@ -9,6 +9,7 @@ mod ids;
 mod metric;
 mod model;
 mod ports;
+mod provider;
 mod query;
 mod run;
 mod session;
@@ -38,8 +39,8 @@ pub use event::{
 
 pub use identity::{Capability, Principal};
 pub use ids::{
-    ArtifactId, CommandId, EventId, PrincipalId, RunId, SessionId, StepId, TaskId, ToolCallId,
-    WorkspaceId,
+    ArtifactId, CommandId, EventId, OperationId, PrincipalId, ProfileId, RunId, SessionId, StepId,
+    TaskId, ToolCallId, ValidationId, WorkspaceId,
 };
 
 pub use metric::{MetricDefinition, MetricStatus};
@@ -49,9 +50,28 @@ pub use model::{
 };
 
 pub use ports::{
-    ArtifactStore, CatalogReader, FreshnessReader, MetricProvider, ModelProvider,
-    QueryContextProvider, QueryPreflightReader, RuntimeCommandBatch, RuntimeStore,
+    ArtifactStore, CatalogReader, CredentialVault, FreshnessReader, MetricProvider, ModelDiscovery,
+    ModelProvider, OAuthConnectionService, ProviderClientFactory, ProviderManagementApi,
+    ProviderProfileRepository, QueryContextProvider, QueryPreflightReader,
+    RunModelProviderResolver, RunProviderBindingRepository, RuntimeCommandBatch, RuntimeStore,
     SqlQueryExecutor, Tool, ToolExecutionContext,
+};
+pub use provider::{
+    ActivateProfileRequest, ActivationPrecondition, ActiveProviderSlot, ActiveProviderSnapshot,
+    ActiveProviderView, CompatibilityEvidence, CompatibilityEvidenceView, CredentialGeneration,
+    CredentialKind, CredentialLease, CredentialMutationIntent, CredentialMutationRequest,
+    CredentialPointerCommit, CredentialProtectionStatus, CredentialViewStatus,
+    DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
+    OAuthConnectionStatus, OAuthConnectionView, ParameterApplicability, ParameterValue,
+    ProfileDetail, ProfileHistory, ProfileName, ProfileRevision, ProfileState, ProfileSummary,
+    ProtectedCredentialWrite, ProviderCatalogView, ProviderClientBinding,
+    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField,
+    ProviderFingerprint, ProviderId, ProviderManagementError, ProviderModelId,
+    ProviderParameterKey, ProviderParameters, ProviderProfile, ProviderProfileRevision,
+    ProviderRemediation, ProviderResult, ProviderSupportStatus, RemoteRevocationOutcome,
+    ResolvedRunProvider, RevisionPrecondition, RunProviderBinding, SaveProfileRequest,
+    SaveProfileRevision, SecretValue, ValidateProfileRequest, ValidationCommit,
+    ValidationCommitPrecondition, ValidationDigest, ValidationInputs, ValidationVersions,
 };
 
 pub use query::{

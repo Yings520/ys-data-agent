@@ -50,3 +50,6 @@ id_type!(ToolCallId);
 id_type!(ArtifactId);
 id_type!(EventId);
 id_type!(CommandId);
+id_type!(ProfileId);
+id_type!(ValidationId);
+id_type!(OperationId);
