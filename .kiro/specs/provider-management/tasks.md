@@ -85,7 +85,7 @@
   - _Requirements: 3.1, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 8.4, 8.5, 8.6, 11.2_
   - _Boundary: KeyringCredentialVault adapter and vault contract tests_
   - _Depends: 1.1, 1.3_
-- [ ] 3.3 (P) 实现固定端点的 ChatGPT OAuth transport
+- [x] 3.3 (P) 实现固定端点的 ChatGPT OAuth transport
   - 实现 device authorization、browser verification、poll/token exchange、refresh、reauthorize 和 remote revoke，仅允许设计批准的 origin、client 与 callback。
   - 将 access/refresh token、expiry 与 account ID 作为单一秘密 bundle 交给 Vault port，普通返回值只含 Pending、Connected、Expired、Revoked 或 Failed 状态。
   - 归一化取消、过期、刷新和撤销失败，不把 raw response、token、account ID 或认证 headers 送入错误和日志。
