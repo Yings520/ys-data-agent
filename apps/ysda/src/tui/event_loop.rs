@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{collections::HashMap, future::Future, io, path::PathBuf, sync::Arc, time::Duration};
 
 use crossterm::{
     cursor::{Hide, SetCursorStyle, Show},
@@ -13,17 +13,311 @@ use crossterm::{
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui_textarea::Input;
-use tokio::time;
-use ys_agent_core::{CoreError, CoreResult};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::{Id as TokioTaskId, JoinSet},
+    time,
+};
+use ys_agent_core::{
+    CoreError, CoreResult, OperationId, ProviderErrorCode, ProviderManagementError,
+    ProviderRemediation, ProviderResult, ProviderRetryability,
+};
 
 use crate::bootstrap::AppDependencies;
 
 use super::{
     TranscriptItem, TransientView, TuiApp, TuiController, UiPreferenceStore, UiPreferences,
-    parse_input, render,
+    parse_input, provider_management::ProviderOperationKind, render,
 };
 
 type RealTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+const MAX_PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_PROVIDER_OPERATION_RETRIES: u8 = 2;
+
+/// Bounded timing policy supplied from already-validated Provider parameters. The registry also
+/// validates it defensively before it can schedule any network, OAuth, Vault, or probe work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderOperationPolicy {
+    timeout: Duration,
+    max_retries: u8,
+}
+
+impl ProviderOperationPolicy {
+    pub fn new(timeout: Duration, max_retries: u8) -> CoreResult<Self> {
+        if timeout.is_zero() || timeout > MAX_PROVIDER_OPERATION_TIMEOUT {
+            return Err(CoreError::validation(
+                "invalid_provider_operation_timeout",
+                "Provider operation timeout must be between one millisecond and five minutes",
+            ));
+        }
+        if max_retries > MAX_PROVIDER_OPERATION_RETRIES {
+            return Err(CoreError::validation(
+                "invalid_provider_operation_retries",
+                "Provider operation retries exceed the approved bound",
+            ));
+        }
+        Ok(Self {
+            timeout,
+            max_retries,
+        })
+    }
+
+    pub const fn timeout(self) -> Duration {
+        self.timeout
+    }
+
+    pub const fn max_retries(self) -> u8 {
+        self.max_retries
+    }
+}
+
+/// Cooperative cancellation signal passed to a spawned Provider operation. It has no operation
+/// payload and cannot reveal a secret; the wrapper also drops the in-flight future on cancel.
+#[derive(Clone)]
+pub struct ProviderOperationCancellation {
+    cancelled: watch::Receiver<bool>,
+}
+
+impl ProviderOperationCancellation {
+    pub async fn cancelled(&mut self) {
+        if !*self.cancelled.borrow() {
+            let _ = self.cancelled.changed().await;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ProviderOperationCompletion<T> {
+    pub operation_id: OperationId,
+    pub kind: ProviderOperationKind,
+    pub attempts: u8,
+    pub result: ProviderResult<T>,
+}
+
+struct OperationControl {
+    cancel: watch::Sender<bool>,
+    cancelled: bool,
+    kind: ProviderOperationKind,
+}
+
+enum OperationExit<T> {
+    Completed(ProviderOperationCompletion<T>),
+    Cancelled(OperationId),
+}
+
+/// Owns Provider-operation lifetimes for the TUI event loop. All work is spawned and globally
+/// serialized, so a discovery/probe burst cannot block rendering or multiply Provider cost. A
+/// service-facing integration may start a new operation only after the prior completion is
+/// observed; durable save/activation retries remain explicit and journal-protected.
+pub struct AsyncOperationRegistry<T> {
+    policy: ProviderOperationPolicy,
+    gate: Arc<Semaphore>,
+    operations: HashMap<OperationId, OperationControl>,
+    task_operations: HashMap<TokioTaskId, OperationId>,
+    tasks: JoinSet<OperationExit<T>>,
+}
+
+impl<T> AsyncOperationRegistry<T>
+where
+    T: Send + 'static,
+{
+    pub fn new(policy: ProviderOperationPolicy) -> Self {
+        Self {
+            policy,
+            // A single Provider operation is intentional: no parallel model probing, OAuth, or
+            // Vault work is needed for one interactive TUI screen.
+            gate: Arc::new(Semaphore::new(1)),
+            operations: HashMap::new(),
+            task_operations: HashMap::new(),
+            tasks: JoinSet::new(),
+        }
+    }
+
+    /// Allocates a fresh ID and schedules work without awaiting it on the render loop.
+    pub fn start<F, Fut>(&mut self, kind: ProviderOperationKind, operation: F) -> OperationId
+    where
+        F: FnMut(OperationId, ProviderOperationCancellation) -> Fut + Send + 'static,
+        Fut: Future<Output = ProviderResult<T>> + Send + 'static,
+    {
+        let operation_id = OperationId::new();
+        let (cancel, receiver) = watch::channel(false);
+        self.operations.insert(
+            operation_id,
+            OperationControl {
+                cancel,
+                cancelled: false,
+                kind,
+            },
+        );
+        let task = self.tasks.spawn(run_provider_operation(
+            operation_id,
+            kind,
+            self.policy,
+            self.gate.clone(),
+            ProviderOperationCancellation {
+                cancelled: receiver,
+            },
+            operation,
+        ));
+        self.task_operations.insert(task.id(), operation_id);
+        operation_id
+    }
+
+    /// Marks an unfinished operation cancelled immediately. Its wrapper observes the signal and
+    /// drops the future; any completion already racing with Esc is discarded by `next_completion`.
+    pub fn cancel(&mut self, operation_id: OperationId) -> bool {
+        let Some(control) = self.operations.get_mut(&operation_id) else {
+            return false;
+        };
+        if control.cancelled {
+            return false;
+        }
+        control.cancelled = true;
+        let _ = control.cancel.send(true);
+        true
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.operations
+            .values()
+            .filter(|control| !control.cancelled)
+            .count()
+    }
+
+    /// Delivers only the latest non-cancelled result. Cancellation/late completion consumes its
+    /// task slot without exposing a state change to the reducer.
+    pub async fn next_completion(&mut self) -> Option<ProviderOperationCompletion<T>> {
+        while let Some(joined) = self.tasks.join_next_with_id().await {
+            let (task_id, exit) = match joined {
+                Ok(value) => value,
+                Err(error) => {
+                    let Some(operation_id) = self.task_operations.remove(&error.id()) else {
+                        continue;
+                    };
+                    let Some(control) = self.operations.remove(&operation_id) else {
+                        continue;
+                    };
+                    if control.cancelled {
+                        continue;
+                    }
+                    return Some(ProviderOperationCompletion {
+                        operation_id,
+                        kind: control.kind,
+                        attempts: 0,
+                        result: Err(internal_operation_error()),
+                    });
+                }
+            };
+            self.task_operations.remove(&task_id);
+            let operation_id = match &exit {
+                OperationExit::Completed(completion) => completion.operation_id,
+                OperationExit::Cancelled(operation_id) => *operation_id,
+            };
+            let cancelled = self
+                .operations
+                .remove(&operation_id)
+                .is_none_or(|control| control.cancelled);
+            if cancelled {
+                continue;
+            }
+            if let OperationExit::Completed(completion) = exit {
+                return Some(completion);
+            }
+        }
+        None
+    }
+}
+
+async fn run_provider_operation<T, F, Fut>(
+    operation_id: OperationId,
+    kind: ProviderOperationKind,
+    policy: ProviderOperationPolicy,
+    gate: Arc<Semaphore>,
+    mut cancellation: ProviderOperationCancellation,
+    mut operation: F,
+) -> OperationExit<T>
+where
+    T: Send + 'static,
+    F: FnMut(OperationId, ProviderOperationCancellation) -> Fut + Send + 'static,
+    Fut: Future<Output = ProviderResult<T>> + Send + 'static,
+{
+    let permit = tokio::select! {
+        _ = cancellation.cancelled() => return OperationExit::Cancelled(operation_id),
+        permit = gate.acquire_owned() => match permit {
+            Ok(permit) => permit,
+            Err(_) => return OperationExit::Completed(ProviderOperationCompletion {
+                operation_id,
+                kind,
+                attempts: 0,
+                result: Err(internal_operation_error()),
+            }),
+        },
+    };
+    let _permit = permit;
+    let mut attempts = 0_u8;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let operation_cancellation = cancellation.clone();
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => return OperationExit::Cancelled(operation_id),
+            result = time::timeout(policy.timeout(), operation(operation_id, operation_cancellation)) => result,
+        };
+        match result {
+            Ok(Ok(value)) => {
+                return OperationExit::Completed(ProviderOperationCompletion {
+                    operation_id,
+                    kind,
+                    attempts,
+                    result: Ok(value),
+                });
+            }
+            Ok(Err(error)) if retries_are_safe(kind, &error, attempts, policy) => continue,
+            Ok(Err(error)) => {
+                return OperationExit::Completed(ProviderOperationCompletion {
+                    operation_id,
+                    kind,
+                    attempts,
+                    result: Err(error),
+                });
+            }
+            Err(_) if retries_are_safe(kind, &timeout_error(), attempts, policy) => continue,
+            Err(_) => {
+                return OperationExit::Completed(ProviderOperationCompletion {
+                    operation_id,
+                    kind,
+                    attempts,
+                    result: Err(timeout_error()),
+                });
+            }
+        }
+    }
+}
+
+fn retries_are_safe(
+    kind: ProviderOperationKind,
+    error: &ProviderManagementError,
+    attempts: u8,
+    policy: ProviderOperationPolicy,
+) -> bool {
+    matches!(
+        kind,
+        ProviderOperationKind::DiscoverModels | ProviderOperationKind::Validate
+    ) && attempts <= policy.max_retries()
+        && error.retryability() == ProviderRetryability::Bounded
+}
+
+fn timeout_error() -> ProviderManagementError {
+    ProviderManagementError::new(ProviderErrorCode::Timeout, None, ProviderRemediation::Retry)
+}
+
+fn internal_operation_error() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::Internal,
+        None,
+        ProviderRemediation::ContactSupport,
+    )
+}
 
 pub struct TerminalGuard {
     terminal: RealTerminal,
@@ -408,22 +702,234 @@ fn user_readable_error(error: &CoreError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        future,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use tempfile::tempdir;
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Notify, Semaphore, oneshot};
     use ys_agent_adapters::model::FakeModelProvider;
-    use ys_agent_core::{AgentAction, ModelResponse, Principal, WorkspaceId};
+    use ys_agent_core::{
+        AgentAction, ModelResponse, Principal, ProviderErrorCode, ProviderManagementError,
+        ProviderRemediation, WorkspaceId,
+    };
     use ys_agent_runtime::{
         InProcessAgentService, NoopRunScheduler, StaticRunProviderBindingSource,
         doctor::{DoctorReport, QueryCapability},
     };
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
-    use crate::tui::render_to_string;
+    use crate::tui::{provider_management::ProviderOperationKind, render_to_string};
 
-    use super::{TuiApp, TuiController, handle_terminal_event, user_readable_error};
+    use super::{
+        AsyncOperationRegistry, ProviderOperationPolicy, TuiApp, TuiController,
+        handle_terminal_event, user_readable_error,
+    };
+
+    #[tokio::test]
+    async fn provider_operations_start_without_blocking_the_tui_loop() {
+        let mut registry: AsyncOperationRegistry<()> = AsyncOperationRegistry::new(
+            ProviderOperationPolicy::new(Duration::from_secs(1), 0).expect("valid bounded policy"),
+        );
+
+        assert_eq!(registry.active_count(), 0);
+        let operation_id = registry.start(ProviderOperationKind::DiscoverModels, |_, _| async {
+            future::pending().await
+        });
+        assert_eq!(registry.active_count(), 1);
+        tokio::time::timeout(Duration::from_millis(25), tokio::task::yield_now())
+            .await
+            .expect("the event loop remains able to yield while Provider work is pending");
+        assert!(registry.cancel(operation_id));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), registry.next_completion())
+                .await
+                .expect("cancelled task is reaped")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_are_bounded_for_safe_probe_work_and_not_for_durable_saves() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut registry: AsyncOperationRegistry<()> = AsyncOperationRegistry::new(
+            ProviderOperationPolicy::new(Duration::from_secs(1), 2).expect("approved retry bound"),
+        );
+        let probe_attempts = attempts.clone();
+        let probe_id = registry.start(ProviderOperationKind::Validate, move |_, _| {
+            let probe_attempts = probe_attempts.clone();
+            async move {
+                probe_attempts.fetch_add(1, Ordering::SeqCst);
+                Err(ProviderManagementError::new(
+                    ProviderErrorCode::Network,
+                    None,
+                    ProviderRemediation::Retry,
+                ))
+            }
+        });
+        let probe = registry.next_completion().await.expect("probe completion");
+        assert_eq!(probe.operation_id, probe_id);
+        assert_eq!(probe.attempts, 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            probe.result.expect_err("network remains a failure").code(),
+            "provider.network"
+        );
+
+        let save_attempts = Arc::new(AtomicUsize::new(0));
+        let operation_attempts = save_attempts.clone();
+        let save_id = registry.start(ProviderOperationKind::SaveDraft, move |_, _| {
+            let operation_attempts = operation_attempts.clone();
+            async move {
+                operation_attempts.fetch_add(1, Ordering::SeqCst);
+                Err(ProviderManagementError::new(
+                    ProviderErrorCode::Network,
+                    None,
+                    ProviderRemediation::Retry,
+                ))
+            }
+        });
+        let save = registry.next_completion().await.expect("save completion");
+        assert_eq!(save.operation_id, save_id);
+        assert_eq!(save.attempts, 1);
+        assert_eq!(save_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_late_result_and_unblocks_the_next_operation() {
+        let mut registry = AsyncOperationRegistry::new(
+            ProviderOperationPolicy::new(Duration::from_secs(1), 0).expect("valid bounded policy"),
+        );
+        let (started, started_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let pending_release = release.clone();
+        let mut started = Some(started);
+        let cancelled_id = registry.start(ProviderOperationKind::DiscoverModels, move |_, _| {
+            let started = started.take();
+            let pending_release = pending_release.clone();
+            async move {
+                started
+                    .expect("operation starts once")
+                    .send(())
+                    .expect("test receives start");
+                pending_release.notified().await;
+                Ok(1_u8)
+            }
+        });
+        started_rx.await.expect("operation entered its future");
+        assert!(registry.cancel(cancelled_id));
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), registry.next_completion())
+                .await
+                .expect("cancelled task is reaped")
+                .is_none(),
+            "a completion racing with cancellation must not update the reducer"
+        );
+
+        let next_id = registry.start(ProviderOperationKind::DiscoverModels, |_, _| async {
+            Ok(2_u8)
+        });
+        let next = registry
+            .next_completion()
+            .await
+            .expect("next operation completes");
+        assert_eq!(next.operation_id, next_id);
+        assert_eq!(next.result.expect("new result"), 2);
+    }
+
+    #[tokio::test]
+    async fn registry_serializes_provider_work_and_turns_timeout_into_stable_failure() {
+        let mut registry = AsyncOperationRegistry::new(
+            ProviderOperationPolicy::new(Duration::from_secs(1), 0)
+                .expect("valid timeout and retry bound"),
+        );
+        let (first_started, first_started_rx) = oneshot::channel();
+        let (second_started, mut second_started_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let first_release = release.clone();
+        let mut first_started = Some(first_started);
+        registry.start(ProviderOperationKind::Validate, move |_, _| {
+            let first_started = first_started.take();
+            let first_release = first_release.clone();
+            async move {
+                first_started
+                    .expect("first operation starts once")
+                    .send(())
+                    .expect("test receives first start");
+                first_release.notified().await;
+                Ok(1_u8)
+            }
+        });
+        let mut second_started = Some(second_started);
+        registry.start(ProviderOperationKind::Validate, move |_, _| {
+            let second_started = second_started.take();
+            async move {
+                second_started
+                    .expect("second operation starts once")
+                    .send(())
+                    .expect("test receives second start");
+                Ok(2_u8)
+            }
+        });
+        first_started_rx.await.expect("first starts");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut second_started_rx)
+                .await
+                .is_err(),
+            "a second probe may not start while the first owns the Provider gate"
+        );
+        release.notify_one();
+        assert_eq!(
+            registry
+                .next_completion()
+                .await
+                .expect("first completion")
+                .result
+                .expect("first result"),
+            1
+        );
+        assert_eq!(
+            registry
+                .next_completion()
+                .await
+                .expect("second completion")
+                .result
+                .expect("second result"),
+            2
+        );
+
+        let mut timeout_registry: AsyncOperationRegistry<()> = AsyncOperationRegistry::new(
+            ProviderOperationPolicy::new(Duration::from_millis(10), 1)
+                .expect("valid timeout and retry bound"),
+        );
+        let timeout_id = timeout_registry.start(ProviderOperationKind::Validate, |_, _| async {
+            future::pending().await
+        });
+        let timeout = timeout_registry
+            .next_completion()
+            .await
+            .expect("timed out completion");
+        assert_eq!(timeout.operation_id, timeout_id);
+        assert_eq!(timeout.attempts, 2);
+        assert_eq!(
+            timeout.result.expect_err("stable timeout").code(),
+            "provider.timeout"
+        );
+    }
+
+    #[test]
+    fn operation_policy_rejects_unbounded_timeout_and_retry_values() {
+        assert!(ProviderOperationPolicy::new(Duration::ZERO, 0).is_err());
+        assert!(ProviderOperationPolicy::new(Duration::from_secs(301), 0).is_err());
+        assert!(ProviderOperationPolicy::new(Duration::from_secs(1), 3).is_err());
+    }
 
     async fn take_submission(
         controller: &mut TuiController,

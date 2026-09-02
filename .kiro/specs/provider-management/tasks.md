@@ -227,7 +227,7 @@
   - _Requirements: 2.5, 3.1, 3.4, 4.1, 4.2, 4.4, 4.5, 4.6, 4.7, 4.8, 7.1, 7.2, 7.3, 7.4, 7.6, 7.7, 7.8, 8.2_
   - _Boundary: ProviderManagementScreen reducer and view model_
   - _Depends: 1.3, 4.3, 4.5_
-- [ ] 6.2 (P) 实现可取消的异步 operation registry
+- [x] 6.2 (P) 实现可取消的异步 operation registry
   - 为 model discovery、Vault、OAuth 与 compatibility probe 分配唯一 operation ID 和取消信号，网络与阻塞任务不占用 TUI render loop。
   - reducer 只接受当前 operation 的完成事件；Esc 取消未开始轮次并忽略迟到结果，已完成的跨存储原子步骤交由 journal 收敛。
   - 每个 operation 使用已校验 timeout 和有界 retry，避免并行 probe 多模型导致成本或限流放大。
