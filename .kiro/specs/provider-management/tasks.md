@@ -1,0 +1,322 @@
+# Implementation Plan
+
+- [ ] 1. 建立 Provider 管理基础契约
+- [x] 1.1 锁定生产依赖与并行模块边界
+  - 固定 `liter-llm`、OAuth、原生 Credential Store 与秘密内存保护依赖的批准版本和最小 feature 集，明确排除 router、fallback、proxy、MCP、cache、hedging 与环境自动发现能力。
+  - 建立设计中已批准的 adapter、runtime 和 TUI 模块入口，使后续并行任务不需要竞争共享依赖清单或模块导出文件。
+  - 完成后，依赖树能证明仅启用 `liter-llm native-http`，工作区在模块实现前保持可编译，且没有旧/新双路由开关。
+  - _Requirements: 5.8, 6.7, 10.3, 10.4, 11.9_
+  - _Boundary: Workspace dependency surface and approved module skeletons_
+  - _Depends: none_
+- [x] 1.2 定义非敏感 Provider 领域快照与不变量
+  - 建模精确九项 Provider、固定模型前缀、Profile identity/revision、Credential generation、参数适用性、Validation、Active snapshot、Run binding 与 Provider fingerprint。
+  - 使秘密值无法 Debug、Serialize 或 Clone，并从所有可持久化/可展示类型中结构性排除 Credential、locator、业务数据与请求内容。
+  - 用领域测试证明 revision 不可覆盖、active 最多一个、关键输入变化使 validation digest 失效，fingerprint 只使用 canonical 非敏感白名单字段。
+  - 完成后，core 能独立拒绝目录外 Provider、错前缀模型、共享 Credential 语义和不合法状态转换。
+  - _Requirements: 1.1, 1.2, 2.2, 2.3, 2.8, 3.4, 3.5, 3.10, 4.4, 4.7, 5.6, 6.5, 9.5, 9.6, 9.7, 11.2_
+  - _Boundary: Core Provider types and domain invariants_
+  - _Depends: 1.1_
+- [ ] 1.3 定义 Provider 管理 ports 与遮蔽视图契约
+  - 为 Profile repository、Credential Vault、Provider client factory、model discovery、Run resolver、OAuth connection 和 Provider management service 建立厂商无关 ports。
+  - 规定 compare-and-swap 前置条件、稳定错误 code/field/remediation、取消 operation ID，以及只含 Credential 状态的 TUI/Doctor view types。
+  - 保持第三方 crate、Keyring 与 OAuth HTTP 类型不越过 adapter 边界，TUI 只通过既有 service API 访问能力。
+  - 完成后，store、adapter、runtime 与 TUI 可分别针对同一已编译契约实现并使用 fake port 测试。
+  - _Requirements: 2.1, 3.1, 3.2, 3.4, 4.1, 5.1, 7.1, 8.1, 8.2, 9.4_
+  - _Boundary: Core Provider ports and masked service views_
+  - _Depends: 1.2_
+- [ ] 1.4 扩展 Run 创建与 Provider 绑定命令契约
+  - 使 Run 创建命令批次强制携带完整的不可变 Provider binding，并定义首个非敏感 ProviderBound lifecycle event。
+  - 保留现有 tool call ID、Policy、Tool Runtime、QueryBudget、Completion Gate 与显式失败契约，不把治理权威交给 Provider。
+  - 增加 contract tests，拒绝缺少 binding 的生产 Run 创建并证明 Fake/Replay 仍可遵循稳定 ModelProvider port。
+  - 完成后，任何生产 Run 都无法在没有原子 binding 输入的情况下进入持久层。
+  - _Requirements: 6.5, 6.6, 9.1, 9.5, 9.6_
+  - _Boundary: Core Run command, event, and ModelProvider contracts_
+  - _Depends: 1.2, 1.3_
+
+- [ ] 2. 建立 SQLite 持久化与跨存储一致性基础
+- [ ] 2.1 创建 Provider 管理 schema 与迁移约束
+  - 在既有 runtime migration 之后原子创建 Profile identity/revision、Credential metadata、Validation evidence、Active singleton、Credential journal 与 Run binding 表和索引。
+  - 用 foreign key、枚举/check、唯一名称、schema version 和 insert-only 规则表达设计中的所有持久化不变量；SQLite 不存任何秘密。
+  - 增加从既有数据库升级、重复迁移、未知 JSON schema fail-closed 与空初始 active 状态测试。
+  - 完成后，迁移成功得到可查询的七类非敏感状态，任一迁移错误不会留下部分 schema。
+  - _Requirements: 2.2, 2.8, 3.3, 3.5, 3.7, 5.6, 6.1, 6.5, 9.5, 9.6, 9.7_
+  - _Boundary: Provider management SQLite migration_
+  - _Depends: 1.2, 1.4_
+- [ ] 2.2 实现 Profile revision、Validation 与 Active repository
+  - 实现 Profile list/load/save、不可覆盖 revision、validation evidence 条件提交和全局 active singleton compare-and-swap。
+  - 保证编辑 active Profile 只产生 newer Draft，旧 Ready revision 持续 active，直到相同 revision/generation/digest 被显式激活。
+  - 失败、名称冲突、迟到 validation 或 activation race 必须回滚并返回稳定、可修复结果。
+  - 完成后，repository tests 能观察到 CRUD、Draft/Ready/Invalid、单一 active 与失败时上一完整状态不变。
+  - _Requirements: 2.1, 2.2, 2.3, 2.6, 2.7, 2.8, 5.6, 6.1, 6.2, 6.3, 6.6_
+  - _Boundary: SqliteProviderRepository profile, validation, and active state_
+  - _Depends: 1.3, 2.1_
+- [ ] 2.3 实现 Credential mutation journal 与启动恢复
+  - 持久化 intent、old/new/rollback generation、phase 和稳定错误，不保存 secret；实现 pointer commit、cleanup pending、rollback 与 fail-closed reconciliation 状态机。
+  - 只在没有 active revision 或非终态 Run 引用时退休旧 generation，并为无法确认的恢复状态阻止新调用。
+  - 用故障注入覆盖 Vault write、SQLite compare-and-swap、cleanup 和重启各断点，验证不存在悬空可见指针或明文降级。
+  - 完成后，每个故障点都可恢复到上一逻辑状态或明确 Invalid/blocked 状态。
+  - _Requirements: 3.3, 3.5, 3.7, 3.8, 3.9, 8.4, 8.5, 8.6, 11.2_
+  - _Boundary: Credential mutation journal and reconciliation repository_
+  - _Depends: 1.3, 2.1, 2.2_
+- [ ] 2.4 实现不可变 Run binding repository 与原子写入
+  - 在同一 SQLite transaction 中验证 expected active snapshot，并写入 Run、Run provider binding 与首批 lifecycle events。
+  - 提供按 Run 读取 binding、按 profile/generation 查询非终态引用和终态 retirement 支持，禁止更新既有 binding。
+  - 用 race、rollback、恢复与历史 Profile 删除测试证明没有半个 Run、binding 后补写或历史解释丢失。
+  - 完成后，Run 创建要么三类状态全部可见，要么全部不可见，且已创建 binding 终身不变。
+  - _Requirements: 3.6, 6.5, 6.6, 9.5, 9.6, 9.7_
+  - _Boundary: RunBindingRepository and SQLite RuntimeCommandBatch transaction_
+  - _Depends: 1.4, 2.2, 2.3_
+
+- [ ] 3. 实现可独立推进的 Provider 与安全 adapters
+- [ ] 3.1 (P) 实现受治理 Catalog 与证据派生状态
+  - 定义且仅定义九个 Provider 的名称、prefix、认证类型、固定 endpoint key、参数规则、发现能力和 RequiredEvidence。
+  - 从 catalog/model/codec/`liter-llm` 版本 digest 与批准 evidence hashes 派生 Supported、Candidate 或 Blocked；静态 registry 声明不能直接产生 Supported。
+  - 返回每个非 Supported 条目的具体 EvidenceGap，并排除目录外 Provider 和 `openai/`。
+  - 完成后，离线 catalog 测试精确得到九项，任何证据缺失或 digest 变化都会降级支持状态并说明原因。
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 4.6, 4.7, 5.4, 5.8, 11.4, 11.5, 11.6_
+  - _Boundary: GovernedProviderCatalog and EvidenceRegistry_
+  - _Depends: 1.2_
+- [ ] 3.2 (P) 实现 OS 原生 Credential Vault
+  - 使用固定 service 和不可猜测 profile UUID/generation locator，把 API key 或 OAuth bundle 作为版本化 envelope 仅写入原生 Credential Store。
+  - 启动时执行不回显秘密的 create/read/delete protection probe；无法确认 native protection 时拒绝写入，不提供文件、env 或明文 fallback。
+  - 把阻塞平台调用隔离到可安全忽略迟到结果的 worker，并提供显式 in-memory fake 供测试使用。
+  - 完成后，Vault contract tests 证明重启读取、generation 隔离、替换/删除失败恢复、redacted Debug 和 drop 清理。
+  - _Requirements: 3.1, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 8.4, 8.5, 8.6, 11.2_
+  - _Boundary: KeyringCredentialVault adapter and vault contract tests_
+  - _Depends: 1.1, 1.3_
+- [ ] 3.3 (P) 实现固定端点的 ChatGPT OAuth transport
+  - 实现 device authorization、browser verification、poll/token exchange、refresh、reauthorize 和 remote revoke，仅允许设计批准的 origin、client 与 callback。
+  - 将 access/refresh token、expiry 与 account ID 作为单一秘密 bundle 交给 Vault port，普通返回值只含 Pending、Connected、Expired、Revoked 或 Failed 状态。
+  - 归一化取消、过期、刷新和撤销失败，不把 raw response、token、account ID 或认证 headers 送入错误和日志。
+  - 完成后，local OAuth fixture tests 覆盖完整状态机、token 轮换、迟到 operation 与 remote revoke residual risk。
+  - _Requirements: 1.4, 3.2, 5.8, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 11.1, 11.2_
+  - _Boundary: ChatGptOAuthManager external transport_
+  - _Depends: 1.1, 1.3_
+- [ ] 3.4 (P) 实现八个 API-key Provider 的 Chat codec
+  - 把稳定 ModelRequest/ModelResponse 映射到 `liter-llm` Chat 请求和响应，同时保留 assistant tool call 与 tool result 的原始非空 Provider call ID。
+  - 对空白、缺失、重复冲突 ID、无效响应和不支持参数 fail closed，不合成 ID、不静默 strip 参数。
+  - 使用不含真实 Credential 或业务数据的协议 fixtures 覆盖九个前缀中的八个 Chat 路径及 Anthropic transform。
+  - 完成后，八类 Chat adapter 均能完成确定性的 tool-call/tool-result round trip，协议错误具有稳定失败结果。
+  - _Requirements: 1.2, 4.4, 4.6, 5.3, 5.5, 6.7, 9.2, 10.4, 11.1, 11.9_
+  - _Boundary: Liter Chat request and response codec_
+  - _Depends: 1.1, 1.3_
+- [ ] 3.5 实现 allowlist 约束的模型发现
+  - 仅通过 catalog 固定 endpoint 和显式绑定 Credential 调用目标 Provider 的模型目录，不接受用户 URL 或目录外路由。
+  - 将发现失败、空结果和不完整结果归一化为可恢复状态，使调用方仍可保留 Draft 并手工输入模型。
+  - 过滤错前缀和目录外结果，且发现请求与诊断不包含业务 Query 数据。
+  - 完成后，fixture tests 能观察成功选择、失败回退到手工 Draft 和目录污染被拒绝。
+  - _Requirements: 4.1, 4.2, 4.3, 5.5, 5.8_
+  - _Boundary: ModelDiscovery adapter_
+  - _Depends: 1.1, 1.3, 3.1_
+- [ ] 3.6 (P) 实现 ChatGPT Responses codec
+  - 使用固定 ChatGPT backend、Bearer token、account header 与 originator，把 core 消息映射到 Responses items。
+  - 将 `function_call.call_id` 原样映射为 core Provider call ID，并用相同 ID 生成 `function_call_output`；空、缺失或冲突 ID 一律 fail closed。
+  - 对非 Connected OAuth、模型/协议错误与不兼容能力返回稳定失败，不回退到 OpenAI API 或 Chat codec。
+  - 完成后，Responses fixture 能通过安全多轮 tool result 测试，所有敏感 headers 与 raw payload 均不越过 adapter。
+  - _Requirements: 1.4, 3.2, 5.3, 5.5, 5.8, 6.7, 8.3, 9.2, 10.4, 11.1, 11.9_
+  - _Boundary: ChatGPT Responses request and response codec_
+  - _Depends: 1.1, 1.3_
+- [ ] 3.7 组装统一 Liter Provider client factory
+  - 只从 allowlisted `provider/model`、固定 endpoint、显式 scoped secret 与已校验参数构造单一 Provider/model client，并强制关闭环境和配置文件发现。
+  - 八个 API-key Provider 走 Chat codec，ChatGPT Subscription 走 Responses codec；参数 disposition、timeout 与有界 retry 按 catalog/evidence 发送。
+  - retry 只覆盖已分类的 429/5xx/transient network，不重试认证、模型、参数、协议或 tool ID 错误，也不改变 Provider/model。
+  - 完成后，factory contract tests 证明九路映射正确、目录外输入/自定义 URL 被拒绝、没有 fallback/router client 被构造。
+  - _Requirements: 1.2, 3.6, 4.3, 4.4, 4.6, 4.7, 4.8, 5.3, 5.7, 5.8, 6.7, 9.2, 10.4, 11.2, 11.9_
+  - _Boundary: LiterProviderFactory and LiterModelProvider_
+  - _Depends: 3.1, 3.4, 3.5, 3.6_
+- [ ] 3.8 归一化 Provider 错误并限制可观测数据
+  - 将认证、模型不存在、能力、限流、超时、网络、服务端、协议和取消错误映射为固定 code、retryability 与可执行 remediation。
+  - 在 adapter 内丢弃 raw request/response、headers、token、account ID、tool arguments 与业务内容，仅允许非敏感 Provider enum、hashed model、operation/run ID、latency 和 retry count。
+  - 用恶意 Provider 回显和 canary 值验证清理行为，确保错误归一化本身不会触发重试、fallback 或 silent success。
+  - 完成后，所有已知故障均得到稳定、已清理且分类正确的失败，未知协议错误明确 fail closed。
+  - _Requirements: 5.5, 6.7, 8.5, 8.7, 11.1, 11.8, 11.9_
+  - _Boundary: ProviderErrorNormalizer_
+  - _Depends: 3.7_
+
+- [ ] 4. 实现 Provider 管理应用服务与兼容性门禁
+- [ ] 4.1 实现纯本地 Profile 与参数校验
+  - 校验唯一名称、必填字段、精确 allowlist/prefix、Credential 状态、五个通用参数的类型/范围/组合和 provider-specific 参数适用性。
+  - 禁止 Profile 中出现 Base URL、auth origin 或 redirect 覆盖；Unsupported/Conditional 参数必须给出字段级可修复结果，不得静默忽略。
+  - 任何本地错误必须在调用 Vault、model discovery 或网络 probe 前返回，并使已有 validation 在关键输入变化时失效。
+  - 完成后，测试能证明本地失败时网络调用计数为零，完整与未完整 Profile 分别得到可验证候选或 Draft。
+  - _Requirements: 2.2, 2.3, 2.4, 4.4, 4.5, 4.6, 4.7, 4.8, 5.1, 5.2, 5.6, 5.8_
+  - _Boundary: LocalProfileValidator and ParameterValidator_
+  - _Depends: 2.2, 3.1_
+- [ ] 4.2 (P) 实现模型级兼容性安全探测
+  - 在本地校验通过后，用固定、无客户数据且无副作用的合成 tool 执行 tool call、非空 ID、多轮 tool result 和 continuation 探测。
+  - 从目录/响应/证据得到已知 context limit；模型结果优先于 Provider 声明，未知限制或任一能力缺失均为 Invalid。
+  - 按 revision、generation、model、参数、catalog/probe/codec/`liter-llm` 版本生成不可变 evidence digest，并归一化全部规定失败分类。
+  - 完成后，手工与发现模型经过完全相同的门禁，任何失败都不会激活 Profile 或发起业务 Query。
+  - _Requirements: 4.3, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 8.3, 9.2, 11.4_
+  - _Boundary: CompatibilityValidator and ProbeEvidence_
+  - _Depends: 2.2, 3.7, 3.8, 4.1_
+- [ ] 4.3 (P) 实现 Profile revision 生命周期
+  - 编排创建、查看、编辑与复制；每次操作创建新 revision，复制只带适用的非敏感字段并产生 Missing Credential 的 Draft。
+  - 保存未完整字段为 Draft，字段/持久化失败保留上一完整 revision 与 active pointer，取消编辑无需服务端写入。
+  - 提供离线 list/detail/active snapshot，并把配置、认证与支持状态组合成 masked Profile view。
+  - 完成后，服务测试能观察多个唯一命名 Profile 的 CRUD/复制与 revision 历史，且无网络时仍可浏览。
+  - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.6, 4.2, 4.8, 7.7_
+  - _Boundary: ProviderManagementService profile revision lifecycle_
+  - _Depends: 2.2, 4.1_
+- [ ] 4.4 编排 Credential generation 创建、替换与删除
+  - 按 journal 顺序先记录 intent、写不可变 Vault generation、再 compare-and-swap Profile pointer；旧 generation 按 active/Run 引用进入 Retained 或 cleanup。
+  - 为 API key 输入、替换、删除和失败恢复提供只含 Credential 状态的结果，绝不共享或隐式读取其他 Profile generation。
+  - 取消或迟到结果不得覆盖较新的 revision；无法证明 native protection/reconciliation 时将 Profile 明确阻断。
+  - 完成后，故障注入可证明所有 mutation 只暴露完整新状态、完整旧状态或明确 fail-closed 状态。
+  - _Requirements: 3.1, 3.3, 3.5, 3.6, 3.7, 3.8, 5.6, 8.4, 11.2_
+  - _Boundary: CredentialService mutation orchestration_
+  - _Depends: 2.3, 3.2, 4.3_
+- [ ] 4.5 提交 Validation 并原子激活 Ready revision
+  - 仅当 operation、revision、credential generation 和 evidence digest 仍匹配时提交 Ready/Invalid；迟到验证返回 Stale 而不改写新状态。
+  - activation 再次验证 Ready、当前 evidence 与 active singleton precondition，并返回 commit 后 snapshot；任何失败保持 TUI/Runtime 对旧 active 的一致观察。
+  - 暴露显式取消入口与“只影响之后 Run”的确认数据，拒绝 Draft、Invalid、未验证或已失效 revision。
+  - 完成后，并发编辑/验证/激活测试证明最多一个 active，取消和 race 不会产生误显示或部分提交。
+  - _Requirements: 2.6, 5.6, 6.1, 6.2, 6.3, 6.4, 7.5, 7.6_
+  - _Boundary: ProviderManagementService validation and activation orchestration_
+  - _Depends: 2.2, 4.2, 4.3, 4.4_
+- [ ] 4.6 实现 Profile 删除、no-active 与 Credential retirement
+  - 删除非活动 Profile 前确认并清理其专属 Credential；存在非终态 Run 引用时拒绝删除并保留历史 binding。
+  - 删除活动 Profile 必须先激活另一 Ready revision，或显式进入 no-active；远端撤销失败返回已清理本地状态、残留风险和 remediation。
+  - no-active 是可浏览的管理状态，但新 Query 必须得到稳定 `provider.no_active_profile`，不得选择其他 Profile。
+  - 完成后，删除测试覆盖 active/non-active、Run 引用、Vault 失败与 OAuth 撤销失败且无悬空关联。
+  - _Requirements: 2.7, 3.7, 3.9, 6.3, 8.6, 8.7_
+  - _Boundary: ProviderManagementService deletion and credential retirement flow_
+  - _Depends: 2.4, 3.3, 4.4, 4.5_
+- [ ] 4.7 编排 ChatGPT OAuth Connection 生命周期
+  - 将 start/complete/view/refresh/reauthorize/logout 接入 Profile 与 Credential generation，普通状态只返回安全 view。
+  - 非 Connected 状态阻止 probe 与 activation；refresh 成功写新 generation、重跑当前模型 probe 并形成新 revision，旧 active 在显式激活前不变。
+  - refresh/token 失效时立即 fail closed；logout 先封锁/删除本地 generation，再报告 remote revoke outcome。
+  - 完成后，应用服务测试覆盖 Pending 到 Connected、Expired/Revoked/Failed、取消、轮换和残留风险修复动作。
+  - _Requirements: 3.2, 7.5, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7_
+  - _Boundary: ProviderManagementService OAuth connection orchestration_
+  - _Depends: 3.3, 4.2, 4.4, 4.5_
+
+- [ ] 5. 把不可变 Provider binding 接入 Query Runtime
+- [ ] 5.1 按 Run binding 解析并缓存 ModelProvider
+  - Resolver 只按 run_id 读取 insert-only binding 和精确 Credential generation，绝不读取 active pointer、当前 Profile 或其他 generation。
+  - 用 binding digest 构造并在 Run 生命周期内缓存单一 Provider client；并发构造使用 single-flight，终态释放，不做跨 Profile/Run secret cache。
+  - Missing、Expired、Revoked 或不一致 generation 返回明确失败，不尝试当前 key、其他 Profile、其他 Provider 或自由文本降级。
+  - 完成后，resolver tests 证明同一 binding 稳定解析、不同 generation 严格隔离且 fingerprint/secret 均不进入 cache key 日志。
+  - _Requirements: 3.6, 6.5, 6.7, 9.5, 9.6, 9.7, 9.8, 11.2_
+  - _Boundary: RunBoundProviderResolver_
+  - _Depends: 2.4, 3.2, 3.7, 3.8_
+- [ ] 5.2 集成 Active snapshot 与原子 Run 创建
+  - Agent service 在 Run 创建事务中读取并验证 committed Ready active snapshot，把同一 revision/generation/validation/fingerprint 作为 command batch 输入。
+  - active activation revision 竞争时重试完整创建；没有 active、binding 写入失败或 generation 不可解析时不创建 Run 或首批事件。
+  - 用 store/runtime 集成测试证明切换发生在事务前后时，新 Run 只能绑定一个完整快照。
+  - 完成后，每个成功的新 Run 都有同事务、可解释且不可变的 Provider binding。
+  - _Requirements: 6.1, 6.2, 6.5, 6.6, 9.5, 9.6_
+  - _Boundary: AgentService and SqliteRuntimeStore run-creation integration_
+  - _Depends: 1.4, 2.4, 4.5_
+- [ ] 5.3 将 Run-bound Provider 接回既有 Query 工作流
+  - Harness、Query prompt builder 与恢复路径按 run_id 获取 resolved provider/model，不再持有 bootstrap 全局 model 或重新读取 active Profile。
+  - 保持 Agent Loop、tool call/result ID、Policy、Tool Runtime、QueryBudget、数据外发、Completion Gate、Artifact 与显式失败语义不变。
+  - 继续允许测试显式注入 Fake/Replay，但不把它们暴露为面向用户的 Profile 配置路径。
+  - 完成后，Run A 在切换后仍使用原 binding，Run B 使用新 active，Provider 失败明确返回且没有 fallback 或治理绕过。
+  - _Requirements: 6.5, 6.6, 6.7, 6.8, 9.1, 9.2, 9.3, 9.8, 10.4, 10.5, 11.3, 11.9_
+  - _Boundary: Runtime Harness, Query workflow, and RunModelProviderResolver integration_
+  - _Depends: 5.1, 5.2_
+
+- [ ] 6. 交付 TUI、Doctor 与唯一生产配置路径
+- [ ] 6.1 (P) 实现 Provider 管理 screen reducer 与安全 view
+  - 建模 Browse、Edit、Confirm、Busy 和 Result 状态，固定 Provider → Authentication → Model → Parameters → Validate → Save/Activate 步骤。
+  - Save Draft 与 Activate 分离；返回编辑保留非敏感 buffer，取消编辑不改变已保存/active 状态，失败提供编辑或重试入口。
+  - Secret input 使用 zeroizing buffer 和固定 mask，不提供 reveal、copy 或完整值回显；过期/失败 revision 不显示 Active。
+  - 完成后，纯 reducer/view tests 覆盖完整 wizard、多个 Profile、手工/发现模型、参数适用性、确认切换和离线浏览状态。
+  - _Requirements: 2.5, 3.1, 3.4, 4.1, 4.2, 4.4, 4.5, 4.6, 4.7, 4.8, 7.1, 7.2, 7.3, 7.4, 7.6, 7.7, 7.8, 8.2_
+  - _Boundary: ProviderManagementScreen reducer and view model_
+  - _Depends: 1.3, 4.3, 4.5_
+- [ ] 6.2 (P) 实现可取消的异步 operation registry
+  - 为 model discovery、Vault、OAuth 与 compatibility probe 分配唯一 operation ID 和取消信号，网络与阻塞任务不占用 TUI render loop。
+  - reducer 只接受当前 operation 的完成事件；Esc 取消未开始轮次并忽略迟到结果，已完成的跨存储原子步骤交由 journal 收敛。
+  - 每个 operation 使用已校验 timeout 和有界 retry，避免并行 probe 多模型导致成本或限流放大。
+  - 完成后，事件循环测试证明界面保持响应，取消/迟到/失败不会覆盖新编辑或 active 状态。
+  - _Requirements: 2.5, 2.6, 7.4, 7.5_
+  - _Boundary: TUI AsyncOperationRegistry and event-loop operation lifecycle_
+  - _Depends: 1.3, 4.5_
+- [ ] 6.3 (P) 扩展 Doctor 的 Provider readiness 检查
+  - 检查 committed active revision、Credential 状态、validation freshness、tool/ID/multi-turn/context evidence、Vault protection 与 reconciliation 状态。
+  - 无 active、阻断项和警告使用稳定分类与 remediation；Doctor 不读取秘密、不发业务 Query，需要网络复验时只建议显式 Validate。
+  - 完成后，Doctor tests 对 Ready、Draft/stale、Credential missing/expired 和 reconciliation failure 给出正确非敏感结果。
+  - _Requirements: 9.1, 9.4, 11.1_
+  - _Boundary: ProviderDoctorCheck_
+  - _Depends: 4.5, 5.1_
+- [ ] 6.4 (P) 扩展 Provider 敏感数据清理边界
+  - 让 Provider/OAuth/Vault 错误、Telemetry、Run Event、Artifact、TUI snapshot 与 panic/error path 统一经过非敏感白名单或 sanitizer。
+  - Telemetry 默认只记录 fingerprint hash，不记录完整 model、Credential locator、request body、tool arguments 或业务数据。
+  - 完成后，边界级 canary tests 能证明秘密无法通过 Debug、Serialize、tracing、错误转换或崩溃输出泄露。
+  - _Requirements: 3.10, 9.7, 11.1, 11.2_
+  - _Boundary: SecretSanitizer and Provider telemetry contracts_
+  - _Depends: 1.2, 3.8, 5.1_
+- [ ] 6.5 集成 AgentServiceApi 与 TUI 管理闭环
+  - 通过既有 service boundary 暴露 catalog、Profile、Credential、discovery、validation、activation、OAuth 和 cancel commands，TUI 不直接访问 SQLite、Vault 或网络。
+  - `/providers` 打开统一管理面，旧 `/model` 只导航到同一 screen 的 Model step；展示 active Profile、Provider、model、非敏感参数、认证和最近 validation。
+  - 把 committed operation result、字段错误、retry/cancel 和 no-active 状态连接到 reducer，确保失败不清空非敏感输入或误显示 Active。
+  - 完成后，TUI integration tests 可仅通过键盘流程完成选择 Provider 到激活，并可离线确认当前状态而无需读取配置文件。
+  - _Requirements: 1.3, 2.1, 2.4, 2.7, 3.1, 3.4, 4.1, 4.2, 6.3, 6.4, 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7_
+  - _Boundary: AgentServiceApi and TUI Provider management integration_
+  - _Depends: 4.6, 4.7, 6.1, 6.2_
+- [ ] 6.6 切换 bootstrap 到唯一 Provider 管理生产路径
+  - 组装 repository、Vault、OAuth、catalog/evidence、factory、management service、resolver、Doctor 与 TUI，并在处理 journal 后才允许新 Query。
+  - 删除 `YSDA_LLM_BASE_URL`、`YSDA_LLM_API_KEY`、`YSDA_LLM_MODEL` 读取和旧 OpenAI-compatible production export，不导入、迁移、回写或保留 feature flag。
+  - 保留 Fake/Replay 测试入口和现有 Query 产品边界，生产模型调用全部穿过同一 core ModelProvider 契约。
+  - 完成后，启动行为只认 Provider Profile；空安装进入可管理的 no-active 状态，旧环境变量无法影响生产调用。
+  - _Requirements: 7.8, 9.1, 10.1, 10.2, 10.3, 10.4, 10.5_
+  - _Boundary: Application bootstrap and production Provider composition integration_
+  - _Depends: 3.2, 3.3, 3.7, 4.7, 5.3, 6.3, 6.4, 6.5_
+
+- [ ] 7. 完成跨边界自动化验证与发布证据门禁
+- [ ] 7.1 (P) 建立九 Provider 本地 transport contract fixtures
+  - 使用本地 HTTP fixture server 驱动真实 `liter-llm` client 路径，覆盖八个 Chat codec、ChatGPT Responses、多轮 tool ID、context、参数与稳定错误矩阵。
+  - 断言 `load_env(false)`、固定 endpoint、无 custom URL、无 fallback feature、无秘密/raw body 泄露，并验证 bounded retry 分类。
+  - 完成后，九类 transport contract tests 可在无真实 Credential、无外网和无客户数据的环境中确定性通过。
+  - _Requirements: 1.2, 4.1, 4.3, 4.6, 5.3, 5.5, 5.7, 5.8, 6.7, 9.2, 10.4, 11.1, 11.9_
+  - _Boundary: Provider adapter local HTTP integration fixtures_
+  - _Depends: 3.3, 3.7, 3.8_
+- [ ] 7.2 (P) 建立 Profile、Credential 与持久化恢复端到端测试
+  - 覆盖创建/编辑/复制/取消/删除、Draft/Ready/Invalid、Credential replace/delete、validation invalidation、activation 和 no-active Query 阻断。
+  - 在每个 Vault/SQLite journal phase 注入失败并重启，验证 protection probe、reconciliation、retention 与 active snapshot 保持完整。
+  - 覆盖 OAuth token rotation/logout/revoke residual risk，所有检查只观察 masked 状态。
+  - 完成后，端到端测试能从空数据库走到激活、重启恢复和安全删除，任何断点都无部分更新或悬空关联。
+  - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 3.3, 3.7, 3.8, 3.9, 5.6, 6.1, 6.2, 6.3, 7.7, 8.4, 8.5, 8.6, 8.7_
+  - _Boundary: Provider management store and service end-to-end tests_
+  - _Depends: 4.7, 6.5_
+- [ ] 7.3 (P) 验证并发 Run 的 immutable binding 与 Credential 隔离
+  - 构造 Run A 绑定 revision/generation 1 后编辑、轮换并激活 revision/generation 2，再启动 Run B。
+  - 并发执行 probe、retry、失败和 Profile 切换，证明 Run A 始终解析 generation 1、Run B 始终解析 generation 2，fingerprint 全程不变。
+  - 断言 Provider 调用失败不会自动路由、降低门禁或读取其他 Profile Credential。
+  - 完成后，压力与 race tests 在重复运行中没有 binding 漂移、Credential 串用或 silent fallback。
+  - _Requirements: 3.5, 3.6, 6.5, 6.6, 6.7, 9.5, 9.6, 9.7_
+  - _Boundary: Runtime Provider binding concurrency tests_
+  - _Depends: 5.3, 6.6_
+- [ ] 7.4 (P) 建立跨输出面的 Credential canary 扫描
+  - 将唯一 canary secret 注入 API key、OAuth token、Provider 回显与失败路径，扫描 tracing、errors、SQLite、events、artifacts、TUI snapshots、evidence fixtures 和 panic output。
+  - 同时验证普通配置、环境变量回写、clipboard/reveal 与 crash report 均不是秘密出口。
+  - 完成后，任一 canary 命中都会稳定使测试失败，正常全路径命中数为零。
+  - _Requirements: 3.4, 3.10, 9.7, 11.1, 11.2, 11.8_
+  - _Boundary: Cross-surface Provider secret leak test harness_
+  - _Depends: 6.4, 6.6_
+- [ ] 7.5 (P) 实现受控真实 Provider 证据采集器
+  - 为批准环境提供九 Provider 代表模型的认证、tool/ID/multi-turn、context、参数和错误行为探测入口；普通 CI 不读取个人 Credential。
+  - 只输出 schema-validated sanitized JSON，记录环境类别、模型、时间和 catalog/codec/`liter-llm` digests，不保存 token、raw prompt/response 或客户数据。
+  - ChatGPT 证据必须单独覆盖 OAuth 与固定 Responses backend；静态 catalog 或 `liter-llm` registry 记录不能替代实际结果。
+  - 完成后，fixture-driven collector tests 能生成可复核 evidence，并拒绝缺类、过期、错 digest 或含敏感字段的输出。
+  - _Requirements: 1.5, 1.6, 1.7, 5.3, 5.4, 5.5, 11.4, 11.5, 11.6_
+  - _Boundary: Live compatibility evidence schema and collector_
+  - _Depends: 3.1, 3.3, 3.7, 4.2_
+- [ ] 7.6 实现 Provider evidence 与发布声明门禁
+  - 校验 catalog 精确九项、每个 Supported 条目的四类 evidence、代表模型、schema/version/hash/digest 和九 Provider aggregate verdict。
+  - 基线升级或任一证据缺失时强制重新验证并阻止 9/9 声明；Candidate/Blocked 仍可发布管理能力但必须显示 EvidenceGap。
+  - 将 Provider、Doctor、secret canary 与显式错误指标纳入非零退出 gate，并保持 evidence/诊断输出无秘密。
+  - 完成后，正/负 fixtures 分别得到可复现通过或准确阻断，缺证据绝不产生 Supported 或 9/9。
+  - _Requirements: 1.5, 1.6, 1.7, 9.4, 11.4, 11.5, 11.6, 11.7, 11.8_
+  - _Boundary: ProviderManagement EvidenceGate and release-gate script_
+  - _Depends: 6.3, 7.1, 7.4, 7.5_
+- [ ] 7.7 收口既有 Query/Doctor/Fake/Replay 回归与主发布门禁
+  - 更新既有 contract、lifecycle、store、Query workflow、service、Doctor、TUI、Artifact、Telemetry 和 query eval tests 以使用 Run-bound Provider，不改变原产品断言。
+  - 将 Provider management release gate 接入 v0.2 主 gate，并验证 Fake/Replay 无网确定性、tool/policy/completion 权威和显式非成功状态。
+  - 运行工作区 fmt、clippy、test 与 production-like release gate；发现的回归只在本 Feature 边界内修复，不重构无关行为。
+  - 完成后，完整自动化门禁以 fresh evidence 通过，Credential 泄露和 Provider 严重静默错误计数均为零。
+  - _Requirements: 6.8, 9.1, 9.2, 9.3, 9.4, 9.8, 10.5, 11.3, 11.7, 11.8, 11.9_
+  - _Boundary: Existing Query, Doctor, TUI, artifact, telemetry, and v0.2 release integration tests_
+  - _Depends: 6.6, 7.2, 7.3, 7.6_
