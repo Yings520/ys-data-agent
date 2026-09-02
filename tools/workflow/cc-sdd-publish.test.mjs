@@ -63,7 +63,11 @@ case "$1 $2" in
     if [ -n "\${GH_PR_JSON:-}" ]; then
       printf '%s\\n' "$GH_PR_JSON"
     elif [ -f "$GH_PR_STATE" ]; then
-      printf '%s\\n' '{"state":"OPEN","isDraft":true,"baseRefName":"master","headRefName":"feat/sample-feature","url":"https://github.example/pull/1"}'
+      if grep -q '^ready$' "$GH_PR_STATE"; then
+        printf '%s\\n' '{"state":"OPEN","isDraft":false,"baseRefName":"master","headRefName":"feat/sample-feature","url":"https://github.example/pull/1"}'
+      else
+        printf '%s\\n' '{"state":"OPEN","isDraft":true,"baseRefName":"master","headRefName":"feat/sample-feature","url":"https://github.example/pull/1"}'
+      fi
     else
       printf '%s\\n' 'no pull requests found' >&2
       exit 1
@@ -73,7 +77,10 @@ case "$1 $2" in
     : > "$GH_PR_STATE"
     printf '%s\\n' 'https://github.example/pull/1'
     ;;
-  "pr ready") printf '%s\\n' 'ready' ;;
+  "pr ready")
+    printf '%s\\n' 'ready' > "$GH_PR_STATE"
+    printf '%s\\n' 'ready'
+    ;;
   *) exit 64 ;;
 esac
 `,
@@ -120,7 +127,8 @@ esac
 
 function publish(root, options = {}) {
   const paths = options.paths ?? [tasksPath, sourcePath];
-  const args = [publisher, feature, taskId];
+  const selectedTaskId = options.taskId ?? taskId;
+  const args = [publisher, feature, selectedTaskId];
   for (const stagedPath of paths) {
     args.push("--path", stagedPath);
   }
@@ -133,10 +141,40 @@ function publish(root, options = {}) {
       GH_CALL_LOG: path.join(root, ".gh-calls"),
       GH_PR_STATE: path.join(root, ".gh-pr-state"),
       CC_SDD_DISPATCH_FEATURE: feature,
-      CC_SDD_DISPATCH_TASK_ID: taskId,
+      CC_SDD_DISPATCH_TASK_ID: selectedTaskId,
       ...options.env,
     },
   });
+}
+
+function validateFeature(root, options = {}) {
+  return spawnSync(process.execPath, [publisher, feature, "VALIDATE"], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${path.join(root, ".test-bin")}${path.delimiter}${process.env.PATH}`,
+      GH_CALL_LOG: path.join(root, ".gh-calls"),
+      GH_PR_STATE: path.join(root, ".gh-pr-state"),
+      CC_SDD_DISPATCH_FEATURE: feature,
+      CC_SDD_DISPATCH_TASK_ID: "VALIDATE",
+      ...options.env,
+    },
+  });
+}
+
+async function publishSecondTask(root) {
+  const currentTasks = uncheckedTasks
+    .replace("- [ ] 1.1", "- [x] 1.1")
+    .replace("- [ ] 1.2", "- [x] 1.2");
+  await writeFile(path.join(root, tasksPath), currentTasks, "utf8");
+  await writeFile(path.join(root, "src/registry.rs"), "pub struct Registry;\n", "utf8");
+  run(root, "git", ["add", tasksPath, "src/registry.rs"]);
+  const result = publish(root, {
+    taskId: "1.2",
+    paths: [tasksPath, "src/registry.rs"],
+  });
+  assert.equal(result.status, 0, result.stderr);
 }
 
 function recover(root, options = {}) {
@@ -312,6 +350,48 @@ test("recovery rejects a checked task without its durable commit trailers", asyn
   commitFixtureTask(root, false);
 
   assertDenied(recover(root));
+});
+
+test("VALIDATE publishes an audit commit and marks the shared PR ready", async () => {
+  const { root, ghCallLog } = await createRepository();
+  const first = publish(root);
+  assert.equal(first.status, 0, first.stderr);
+  await publishSecondTask(root);
+
+  const result = validateFeature(root);
+
+  assert.equal(result.status, 0, result.stderr);
+  const calls = await readFile(ghCallLog, "utf8");
+  assert.match(calls, /pr ready feat\/sample-feature/);
+  assert.doesNotMatch(calls, /pr merge/);
+  const validationCommit = run(root, "git", ["log", "-1", "--format=%B"]);
+  assert.match(validationCommit, /^chore\(sample-feature\): validate feature/m);
+  assert.match(validationCommit, /^CC-SDD-Feature: sample-feature$/m);
+  assert.match(validationCommit, /^CC-SDD-Task: VALIDATE$/m);
+});
+
+test("VALIDATE refuses an incomplete feature without marking its PR ready", async () => {
+  const { root, ghCallLog } = await createRepository();
+  const first = publish(root);
+  assert.equal(first.status, 0, first.stderr);
+
+  assertDenied(validateFeature(root));
+  assert.doesNotMatch(await readFile(ghCallLog, "utf8"), /pr ready/);
+});
+
+test("VALIDATE retry is idempotent after the PR is already Ready", async () => {
+  const { root } = await createRepository();
+  const first = publish(root);
+  assert.equal(first.status, 0, first.stderr);
+  await publishSecondTask(root);
+  const validated = validateFeature(root);
+  assert.equal(validated.status, 0, validated.stderr);
+  const validationHead = run(root, "git", ["rev-parse", "HEAD"]);
+
+  const retried = validateFeature(root);
+
+  assert.equal(retried.status, 0, retried.stderr);
+  assert.equal(run(root, "git", ["rev-parse", "HEAD"]), validationHead);
 });
 
 test("denies publication when dispatch identity does not match", async () => {

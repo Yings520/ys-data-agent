@@ -50,10 +50,14 @@ This is the only implementation entry point Ralph may invoke. The arguments are:
 2. Read `references/validation.md` and `references/verify-completion.md` completely, then validate the entire `<feature>`.
 3. `NO-GO` or `MANUAL_VERIFY_REQUIRED` is not completion. Record the exact finding and stop.
 4. On `GO`, verify the feature-level claim with fresh test, build, smoke, traceability, and boundary evidence.
+5. Publish the validation audit with
+   `rtk node tools/workflow/cc-sdd-publish.mjs <feature> VALIDATE`, then run
+   `rtk node tools/workflow/cc-sdd-complete.mjs <feature> VALIDATE` as the final
+   shell action. The publisher marks the shared PR Ready but never merges it.
 
 ## Ralph Result Protocol
 
-- Only after every applicable gate above succeeds, review the exact task diff,
+- For a normal task ID, only after every applicable gate above succeeds, review the exact task diff,
   stage exactly its approved paths, and run:
   ```text
   rtk node tools/workflow/cc-sdd-publish.mjs <feature> <task-id> \

@@ -116,10 +116,15 @@ function inspectPullRequest(root, feature, env = process.env) {
   }
 }
 
-function requireExpectedDraftPullRequest(pullRequest, feature, env) {
+function requireExpectedPullRequest(
+  pullRequest,
+  feature,
+  env,
+  expectedDraft,
+) {
   if (
     pullRequest?.state !== "OPEN" ||
-    pullRequest?.isDraft !== true ||
+    pullRequest?.isDraft !== expectedDraft ||
     pullRequest?.baseRefName !== expectedBase(env) ||
     pullRequest?.headRefName !== expectedBranch(feature) ||
     typeof pullRequest?.url !== "string" ||
@@ -128,6 +133,14 @@ function requireExpectedDraftPullRequest(pullRequest, feature, env) {
     throw new PublicationError("GitHub PR does not match the feature contract");
   }
   return pullRequest;
+}
+
+function requireExpectedDraftPullRequest(pullRequest, feature, env) {
+  return requireExpectedPullRequest(pullRequest, feature, env, true);
+}
+
+function requireExpectedReadyPullRequest(pullRequest, feature, env) {
+  return requireExpectedPullRequest(pullRequest, feature, env, false);
 }
 
 export function ensureDraftPullRequest(root, feature, env = process.env) {
@@ -386,6 +399,119 @@ export function assertTaskPublished({
   );
 }
 
+export async function publishValidation(
+  feature,
+  root = process.cwd(),
+  env = process.env,
+) {
+  if (!FEATURE_NAME.test(feature ?? "")) {
+    throw new PublicationError("invalid validation feature identity");
+  }
+  if (
+    env.CC_SDD_DISPATCH_FEATURE !== feature ||
+    env.CC_SDD_DISPATCH_TASK_ID !== "VALIDATE"
+  ) {
+    throw new PublicationError("validation does not match dispatch");
+  }
+  const branch = git(root, ["branch", "--show-current"]).trim();
+  if (branch !== expectedBranch(feature)) {
+    throw new PublicationError("validation branch does not match feature");
+  }
+  if (
+    git(root, ["diff", "--cached", "--name-only", "-z"]).length !== 0
+  ) {
+    throw new PublicationError("validation cannot include staged changes");
+  }
+
+  await requireApprovedSpec(root, feature);
+  const tasks = await readAuthoritativeTasks(root, feature);
+  if (tasks.some((task) => !task.passes)) {
+    throw new PublicationError("validation requires every task to be complete");
+  }
+  const bodies = commitBodies(root);
+  if (tasks.some((task) => !hasTaskCommit(bodies, feature, task.id))) {
+    throw new PublicationError("validation requires every task publication");
+  }
+
+  const currentHeadBody = git(root, ["log", "-1", "--format=%B"]);
+  const auditAlreadyExists = hasTaskCommit(
+    [currentHeadBody],
+    feature,
+    "VALIDATE",
+  );
+  if (!auditAlreadyExists) {
+    assertRemoteContainsHead(root, feature);
+    requireExpectedDraftPullRequest(
+      inspectPullRequest(root, feature, env),
+      feature,
+      env,
+    );
+    git(root, [
+      "commit",
+      "--allow-empty",
+      "-m",
+      `chore(${feature}): validate feature`,
+      "-m",
+      `CC-SDD-Feature: ${feature}\nCC-SDD-Task: VALIDATE`,
+    ]);
+  }
+
+  if (remoteHead(root, feature) !== git(root, ["rev-parse", "HEAD"]).trim()) {
+    git(root, [
+      "push",
+      "origin",
+      `HEAD:refs/heads/${expectedBranch(feature)}`,
+    ]);
+  }
+  assertRemoteContainsHead(root, feature);
+  const pullRequest = inspectPullRequest(root, feature, env);
+  if (auditAlreadyExists && pullRequest?.isDraft === false) {
+    requireExpectedReadyPullRequest(pullRequest, feature, env);
+    return;
+  }
+  requireExpectedDraftPullRequest(
+    pullRequest,
+    feature,
+    env,
+  );
+  gh(root, ["pr", "ready", expectedBranch(feature)], env);
+  requireExpectedReadyPullRequest(
+    inspectPullRequest(root, feature, env),
+    feature,
+    env,
+  );
+}
+
+export function assertValidationPublished({
+  feature,
+  root = process.cwd(),
+  env = process.env,
+}) {
+  if (!FEATURE_NAME.test(feature ?? "")) {
+    throw new PublicationError("invalid validated feature identity");
+  }
+  const branch = git(root, ["branch", "--show-current"]).trim();
+  if (branch !== expectedBranch(feature)) {
+    throw new PublicationError("validated feature branch does not match");
+  }
+  const tasks = validateTasks(
+    parseTasks(git(root, ["show", `HEAD:.kiro/specs/${feature}/tasks.md`])),
+  );
+  if (tasks.some((task) => !task.passes)) {
+    throw new PublicationError("validated commit contains incomplete tasks");
+  }
+  const headBody = git(root, ["log", "-1", "--format=%B"]);
+  if (!hasTaskCommit([headBody], feature, "VALIDATE")) {
+    throw new PublicationError("validation audit commit is not HEAD");
+  }
+  assertRemoteContainsHead(root, feature);
+  requireExpectedReadyPullRequest(
+    inspectPullRequest(root, feature, env),
+    feature,
+    env,
+  );
+}
+
 export async function runCli(args, root = process.cwd()) {
   if (args[0] === "--recover") {
     if (args.length !== 2) {
@@ -395,6 +521,13 @@ export async function runCli(args, root = process.cwd()) {
     return;
   }
   const { feature, taskId, paths } = parsePublishArgs(args);
+  if (taskId === "VALIDATE") {
+    if (paths.length !== 0) {
+      throw new PublicationError("validation does not accept task paths");
+    }
+    await publishValidation(feature, root);
+    return;
+  }
   await publishTask(feature, taskId, paths, root);
 }
 

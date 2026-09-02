@@ -37,7 +37,7 @@ function run(root, command, args) {
   return result.stdout.trim();
 }
 
-async function createPublishedFeature(tasks) {
+async function createPublishedFeature(tasks, isDraft = true) {
   const { root, featureDirectory } = await createFeature(
     tasks.replaceAll("- [x]", "- [ ]"),
   );
@@ -48,7 +48,7 @@ async function createPublishedFeature(tasks) {
     path.join(fakeBin, "gh"),
     `#!/bin/sh
 if [ "$1 $2" = "pr view" ]; then
-  printf '%s\\n' '{"state":"OPEN","isDraft":true,"baseRefName":"master","headRefName":"feat/sample-feature","url":"https://github.example/pull/1"}'
+  printf '%s\\n' '{"state":"OPEN","isDraft":${isDraft},"baseRefName":"master","headRefName":"feat/sample-feature","url":"https://github.example/pull/1"}'
   exit 0
 fi
 exit 64
@@ -86,6 +86,24 @@ exit 64
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
     },
   };
+}
+
+async function createValidatedFeature(tasks) {
+  const fixture = await createPublishedFeature(tasks, false);
+  run(fixture.root, "git", [
+    "commit",
+    "--allow-empty",
+    "-m",
+    "chore(sample-feature): validate feature",
+    "-m",
+    "CC-SDD-Feature: sample-feature\nCC-SDD-Task: VALIDATE",
+  ]);
+  run(fixture.root, "git", [
+    "push",
+    "origin",
+    "HEAD:refs/heads/feat/sample-feature",
+  ]);
+  return fixture;
 }
 
 function runHelper(root, taskId, env = {}) {
@@ -279,6 +297,21 @@ test("VALIDATE completion requires every authoritative task to be checked", asyn
   await writeFile(tasksPath, completed, "utf8");
 
   const allowed = runHelper(root, "VALIDATE");
-  assert.equal(allowed.status, 0, allowed.stderr);
-  assert.equal(allowed.stdout.trim(), expectedSentinel);
+  assert.notEqual(allowed.status, 0);
+  assert.doesNotMatch(allowed.stdout, completionPattern);
+  assert.match(allowed.stderr, /completion denied/i);
+});
+
+test("VALIDATE completion accepts a remotely published audit and Ready PR", async () => {
+  const { root, env } = await createValidatedFeature(`- [x] 1.1 First task
+  - The first behavior exists.
+  - _Requirements: 1.1_
+  - _Boundary: src/first.rs_
+  - _Depends: none_
+`);
+
+  const result = runHelper(root, "VALIDATE", env);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), expectedSentinel);
 });

@@ -7,7 +7,10 @@ import {
   validateTasks,
   WorkflowInputError,
 } from "./cc-sdd-to-ralph.mjs";
-import { assertTaskPublished } from "./cc-sdd-publish.mjs";
+import {
+  assertTaskPublished,
+  assertValidationPublished,
+} from "./cc-sdd-publish.mjs";
 
 const TASK_ID = /^(?:\d+(?:\.\d+)*|VALIDATE)$/;
 const COMPLETION_SENTINEL = ["<promise>", "COMPLETE", "</promise>"].join("");
@@ -66,6 +69,7 @@ export async function authorizeCompletion(feature, taskId, root = process.cwd())
         `Cannot complete VALIDATE; incomplete tasks: ${incomplete.join(", ")}`,
       );
     }
+    assertValidationPublished({ feature, root, env: process.env });
     return COMPLETION_SENTINEL;
   }
 
