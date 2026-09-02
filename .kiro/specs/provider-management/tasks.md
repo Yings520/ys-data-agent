@@ -274,7 +274,7 @@
   - _Requirements: 1.2, 4.1, 4.3, 4.6, 5.3, 5.5, 5.7, 5.8, 6.7, 9.2, 10.4, 11.1, 11.9_
   - _Boundary: Provider adapter local HTTP integration fixtures_
   - _Depends: 3.3, 3.7, 3.8_
-- [ ] 7.2 (P) 建立 Profile、Credential 与持久化恢复端到端测试
+- [x] 7.2 (P) 建立 Profile、Credential 与持久化恢复端到端测试
   - 覆盖创建/编辑/复制/取消/删除、Draft/Ready/Invalid、Credential replace/delete、validation invalidation、activation 和 no-active Query 阻断。
   - 在每个 Vault/SQLite journal phase 注入失败并重启，验证 protection probe、reconciliation、retention 与 active snapshot 保持完整。
   - 覆盖 OAuth token rotation/logout/revoke residual risk，所有检查只观察 masked 状态。

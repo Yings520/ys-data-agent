@@ -523,17 +523,19 @@ impl SqliteProviderRepository {
                 )
                 .optional()
                 .map_err(provider_storage_error)?;
-            let active_matches_request = active.as_ref().zip(request.expected_active).is_some_and(
-                |((profile_id, revision, activation_revision), expected)| {
+            let active_matches_request = match (active.as_ref(), request.expected_active) {
+                (None, None) => true,
+                (Some((profile_id, revision, activation_revision)), Some(expected)) => {
                     profile_id == &expected.profile_id.to_string()
                         && *revision == i64::try_from(expected.revision).ok().unwrap_or_default()
                         && *activation_revision
                             == i64::try_from(expected.activation_revision)
                                 .ok()
                                 .unwrap_or_default()
-                },
-            );
-            if active.is_some() != request.expected_active.is_some() || !active_matches_request {
+                }
+                _ => false,
+            };
+            if !active_matches_request {
                 return Err(activation_error());
             }
             if active
