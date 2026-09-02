@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { parseTasks, validateTasks } from "./cc-sdd-to-ralph.mjs";
+import { parseTasks, validateTasks } from "./cc-sdd-task-state.mjs";
 
 const FEATURE_NAME = /^[a-z0-9][a-z0-9._-]*$/;
 const TASK_ID = /^\d+(?:\.\d+)*$/;
