@@ -234,6 +234,20 @@ pub struct ProviderEditView {
     pub parameter_issue: Option<ProviderEditIssue>,
 }
 
+/// The non-sensitive half of an edit command. It is deliberately separate from `SecretValue` so
+/// the event loop can construct revision/validation requests without copying a Credential into a
+/// view, command log, or retry buffer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderEditCommand {
+    pub profile_id: Option<ProfileId>,
+    pub name: String,
+    pub provider: ProviderId,
+    pub authentication: ProviderAuthentication,
+    pub model: ProviderModelId,
+    pub parameters: ProviderParameters,
+    pub observed_context_limit: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfirmationView {
     pub action: ProviderManagementAction,
@@ -279,6 +293,7 @@ struct ProviderEditBuffer {
     provider: Option<ProviderId>,
     authentication: Option<ProviderAuthentication>,
     model: Option<ProviderModelId>,
+    model_input: String,
     model_source: Option<ProviderModelSource>,
     discovered_models: Vec<DiscoveredModel>,
     parameters: ProviderParameters,
@@ -294,6 +309,7 @@ impl ProviderEditBuffer {
             provider: None,
             authentication: None,
             model: None,
+            model_input: String::new(),
             model_source: None,
             discovered_models: Vec::new(),
             parameters: ProviderParameters::default(),
@@ -309,6 +325,7 @@ impl ProviderEditBuffer {
             provider: self.provider,
             authentication: self.authentication,
             model: self.model.clone(),
+            model_input: self.model_input.clone(),
             model_source: self.model_source,
             discovered_models: self.discovered_models.clone(),
             parameters: self.parameters.clone(),
@@ -440,6 +457,40 @@ impl ProviderManagementScreen {
         view
     }
 
+    pub fn edit_command(&self) -> Option<ProviderEditCommand> {
+        let buffer = match &self.state {
+            ScreenState::Edit { buffer, .. }
+            | ScreenState::Confirm { buffer, .. }
+            | ScreenState::Busy { buffer, .. }
+            | ScreenState::Result { buffer, .. } => buffer,
+            ScreenState::Browse => return None,
+        };
+        let provider = buffer.provider?;
+        let model = buffer.model.clone()?;
+        let authentication = buffer.authentication?;
+        let observed_context_limit = buffer
+            .discovered_models
+            .iter()
+            .find(|candidate| candidate.model == model.as_str())
+            .and_then(|candidate| candidate.context_limit);
+        Some(ProviderEditCommand {
+            profile_id: buffer.profile_id,
+            name: buffer.name.clone(),
+            provider,
+            authentication,
+            model,
+            parameters: buffer.parameters.clone(),
+            observed_context_limit,
+        })
+    }
+
+    /// Replaces only committed, masked browse data after an operation completes. The reducer
+    /// retains its edit buffer (without secret input) so a failure cannot make a local prediction
+    /// look Active or erase fields that the user may retry.
+    pub fn replace_browse(&mut self, browse: ProviderManagementView) {
+        self.browse = browse;
+    }
+
     pub fn start_create(&mut self, name: impl Into<String>) -> bool {
         if !matches!(self.state, ScreenState::Browse) {
             return false;
@@ -458,6 +509,7 @@ impl ProviderManagementScreen {
         let mut buffer = ProviderEditBuffer::new(Some(profile.profile_id), profile.name.clone());
         buffer.provider = Some(profile.provider);
         buffer.model = Some(profile.model.clone());
+        buffer.model_input = profile.model.as_str().to_owned();
         buffer.parameters = profile.parameters.clone();
         buffer.authentication = self
             .browse
@@ -491,6 +543,7 @@ impl ProviderManagementScreen {
         }
         buffer.provider = Some(provider);
         buffer.model = None;
+        buffer.model_input.clear();
         buffer.model_source = None;
         buffer.discovered_models.clear();
         buffer.parameter_issue = None;
@@ -519,6 +572,33 @@ impl ProviderManagementScreen {
         }
         buffer.credential = Zeroizing::new(value.to_owned());
         true
+    }
+
+    /// Appends one keyboard character to the zeroizing API-key buffer. The renderer still sees
+    /// only a fixed mask; this is deliberately not a general-purpose text or clipboard API.
+    pub fn append_secret_character(&mut self, character: char) -> bool {
+        let ScreenState::Edit { step, buffer } = &mut self.state else {
+            return false;
+        };
+        if *step != ProviderManagementStep::Authentication
+            || buffer.authentication != Some(ProviderAuthentication::ApiKey)
+        {
+            return false;
+        }
+        buffer.credential.push(character);
+        true
+    }
+
+    pub fn delete_secret_character(&mut self) -> bool {
+        let ScreenState::Edit { step, buffer } = &mut self.state else {
+            return false;
+        };
+        if *step != ProviderManagementStep::Authentication
+            || buffer.authentication != Some(ProviderAuthentication::ApiKey)
+        {
+            return false;
+        }
+        buffer.credential.pop().is_some()
     }
 
     /// Moves the typed value into the core's non-cloneable, non-debuggable secret type for the
@@ -562,6 +642,7 @@ impl ProviderManagementScreen {
         let provider = buffer.provider.ok_or(ProviderEditIssue::InvalidModel)?;
         let model = ProviderModelId::new(provider, model.to_owned())
             .map_err(|_| ProviderEditIssue::InvalidModel)?;
+        buffer.model_input = model.as_str().to_owned();
         buffer.model = Some(model);
         buffer.model_source = Some(ProviderModelSource::Discovered);
         Ok(())
@@ -577,9 +658,43 @@ impl ProviderManagementScreen {
         let provider = buffer.provider.ok_or(ProviderEditIssue::InvalidModel)?;
         let model = ProviderModelId::new(provider, model.to_owned())
             .map_err(|_| ProviderEditIssue::InvalidModel)?;
+        buffer.model_input = model.as_str().to_owned();
         buffer.model = Some(model);
         buffer.model_source = Some(ProviderModelSource::Manual);
         Ok(())
+    }
+
+    /// Edits a manual model one key at a time. An incomplete prefix remains an incomplete local
+    /// field rather than becoming a request; `next_step` still rejects it until it is valid.
+    pub fn append_manual_model_character(&mut self, character: char) -> bool {
+        let ScreenState::Edit { step, buffer } = &mut self.state else {
+            return false;
+        };
+        if *step != ProviderManagementStep::Model {
+            return false;
+        }
+        let Some(provider) = buffer.provider else {
+            return false;
+        };
+        buffer.model_input.push(character);
+        buffer.model = ProviderModelId::new(provider, buffer.model_input.clone()).ok();
+        buffer.model_source = Some(ProviderModelSource::Manual);
+        true
+    }
+
+    pub fn delete_manual_model_character(&mut self) -> bool {
+        let ScreenState::Edit { step, buffer } = &mut self.state else {
+            return false;
+        };
+        if *step != ProviderManagementStep::Model || buffer.model_input.pop().is_none() {
+            return false;
+        }
+        let Some(provider) = buffer.provider else {
+            return false;
+        };
+        buffer.model = ProviderModelId::new(provider, buffer.model_input.clone()).ok();
+        buffer.model_source = Some(ProviderModelSource::Manual);
+        true
     }
 
     /// Rejects inapplicable parameters before replacing the buffer, so the widget can report the
@@ -659,10 +774,15 @@ impl ProviderManagementScreen {
     }
 
     pub fn request_save_draft(&self) -> Option<ProviderScreenRequest> {
-        self.request_at(
-            ProviderManagementStep::SaveActivate,
-            ProviderOperationKind::SaveDraft,
-        )
+        match self.state {
+            ScreenState::Edit {
+                step: ProviderManagementStep::Validate | ProviderManagementStep::SaveActivate,
+                ..
+            } => Some(ProviderScreenRequest::Operation(
+                ProviderOperationKind::SaveDraft,
+            )),
+            _ => None,
+        }
     }
 
     pub fn request_activation(&mut self) -> bool {
@@ -721,7 +841,12 @@ impl ProviderManagementScreen {
             ScreenState::Edit { step, .. } => match kind {
                 ProviderOperationKind::DiscoverModels => *step == ProviderManagementStep::Model,
                 ProviderOperationKind::Validate => *step == ProviderManagementStep::Validate,
-                ProviderOperationKind::SaveDraft => *step == ProviderManagementStep::SaveActivate,
+                ProviderOperationKind::SaveDraft => {
+                    matches!(
+                        step,
+                        ProviderManagementStep::Validate | ProviderManagementStep::SaveActivate
+                    )
+                }
                 ProviderOperationKind::Activate => false,
                 ProviderOperationKind::OAuth => *step == ProviderManagementStep::Authentication,
             },
@@ -816,6 +941,41 @@ impl ProviderManagementScreen {
         self.state = ScreenState::Result {
             operation: kind,
             outcome,
+            buffer,
+        };
+        true
+    }
+
+    /// A durable draft is a precondition for compatibility validation. Updating only the opaque
+    /// Profile identity is safe to retain in the reducer and lets the next Validate command read
+    /// the revision through the service boundary; it does not copy a credential or imply active.
+    pub fn complete_saved_draft(
+        &mut self,
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        resume_step: ProviderManagementStep,
+    ) -> bool {
+        let state = std::mem::replace(&mut self.state, ScreenState::Browse);
+        let ScreenState::Busy {
+            operation_id: current,
+            kind: ProviderOperationKind::SaveDraft,
+            mut buffer,
+        } = state
+        else {
+            self.state = state;
+            return false;
+        };
+        if current != operation_id {
+            self.state = ScreenState::Busy {
+                operation_id: current,
+                kind: ProviderOperationKind::SaveDraft,
+                buffer,
+            };
+            return false;
+        }
+        buffer.profile_id = Some(profile_id);
+        self.state = ScreenState::Edit {
+            step: resume_step,
             buffer,
         };
         true

@@ -41,6 +41,10 @@ impl ProviderManagementApi for FakeProviderManagementApi {
         Ok(Vec::new())
     }
 
+    async fn active_provider(&self) -> ProviderResult<Option<ActiveProviderView>> {
+        Ok(None)
+    }
+
     async fn load_profile(&self, _profile_id: ProfileId) -> ProviderResult<ProfileDetail> {
         unavailable()
     }
@@ -88,6 +92,14 @@ impl ProviderManagementApi for FakeProviderManagementApi {
     async fn activate(
         &self,
         _request: ActivateProfileRequest,
+    ) -> ProviderResult<ActiveProviderView> {
+        unavailable()
+    }
+
+    async fn activate_current(
+        &self,
+        _profile_id: ProfileId,
+        _operation_id: OperationId,
     ) -> ProviderResult<ActiveProviderView> {
         unavailable()
     }

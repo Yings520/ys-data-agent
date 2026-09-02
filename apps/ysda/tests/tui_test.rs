@@ -41,6 +41,18 @@ fn slash_quit_detaches_without_cancelling_a_run() {
 }
 
 #[test]
+fn provider_commands_use_the_single_management_route() {
+    assert_eq!(
+        parse_input("/providers").expect("Provider manager command"),
+        InputAction::Providers
+    );
+    assert_eq!(
+        parse_input("/model").expect("legacy model command"),
+        InputAction::Model
+    );
+}
+
+#[test]
 fn v02_tui_does_not_offer_unimplemented_modes() {
     let app = TuiApp::for_principal(Principal::local_operator("ysc"));
     let rendered = render_to_string(&app, 100, 28);

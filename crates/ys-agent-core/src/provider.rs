@@ -2054,6 +2054,9 @@ pub struct ValidateProfileRequest {
     pub operation_id: OperationId,
     pub profile_id: ProfileId,
     pub revision: u64,
+    /// A model-level limit learned from discovery, a protocol probe, or approved evidence. A
+    /// catalog-wide default is intentionally not sufficient to activate a Profile.
+    pub observed_context_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

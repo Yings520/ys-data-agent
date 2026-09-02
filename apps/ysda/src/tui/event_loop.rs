@@ -27,7 +27,11 @@ use crate::bootstrap::AppDependencies;
 
 use super::{
     TranscriptItem, TransientView, TuiApp, TuiController, UiPreferenceStore, UiPreferences,
-    parse_input, provider_management::ProviderOperationKind, render,
+    parse_input,
+    provider_management::{
+        ProviderAuthentication, ProviderManagementStateKind, ProviderOperationKind,
+    },
+    render,
 };
 
 type RealTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -189,6 +193,50 @@ where
     /// task slot without exposing a state change to the reducer.
     pub async fn next_completion(&mut self) -> Option<ProviderOperationCompletion<T>> {
         while let Some(joined) = self.tasks.join_next_with_id().await {
+            let (task_id, exit) = match joined {
+                Ok(value) => value,
+                Err(error) => {
+                    let Some(operation_id) = self.task_operations.remove(&error.id()) else {
+                        continue;
+                    };
+                    let Some(control) = self.operations.remove(&operation_id) else {
+                        continue;
+                    };
+                    if control.cancelled {
+                        continue;
+                    }
+                    return Some(ProviderOperationCompletion {
+                        operation_id,
+                        kind: control.kind,
+                        attempts: 0,
+                        result: Err(internal_operation_error()),
+                    });
+                }
+            };
+            self.task_operations.remove(&task_id);
+            let operation_id = match &exit {
+                OperationExit::Completed(completion) => completion.operation_id,
+                OperationExit::Cancelled(operation_id) => *operation_id,
+            };
+            let cancelled = self
+                .operations
+                .remove(&operation_id)
+                .is_none_or(|control| control.cancelled);
+            if cancelled {
+                continue;
+            }
+            if let OperationExit::Completed(completion) = exit {
+                return Some(completion);
+            }
+        }
+        None
+    }
+
+    /// Returns one completed operation without awaiting. The terminal loop uses this polling
+    /// form so the service-event subscription remains the sole mutable asynchronous borrow of
+    /// the controller inside `tokio::select!`.
+    pub fn try_next_completion(&mut self) -> Option<ProviderOperationCompletion<T>> {
+        while let Some(joined) = self.tasks.try_join_next_with_id() {
             let (task_id, exit) = match joined {
                 Ok(value) => value,
                 Err(error) => {
@@ -463,6 +511,10 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
             }
             dirty = true;
         }
+        if let Some(completion) = controller.take_ready_provider_operation() {
+            controller.apply_provider_operation(&mut app, completion);
+            dirty = true;
+        }
         if app.should_quit {
             return Ok(());
         }
@@ -517,6 +569,12 @@ async fn handle_terminal_event(
                 return Ok(true);
             }
             if key.code == KeyCode::Esc {
+                if app.transient == Some(TransientView::Detail(super::DetailKind::Providers))
+                    && controller.provider_operation_in_flight()
+                {
+                    controller.cancel_provider_operation(app).await;
+                    return Ok(false);
+                }
                 app.close_transient();
                 return Ok(false);
             }
@@ -527,6 +585,118 @@ async fn handle_terminal_event(
             if app.transient == Some(TransientView::SlashPalette) {
                 handle_palette_key(app, controller, key).await?;
                 return Ok(false);
+            }
+            if app.transient == Some(TransientView::Detail(super::DetailKind::Providers)) {
+                let provider_view = controller.provider_screen_view();
+                let step = provider_view.as_ref().and_then(|view| view.step);
+                if key.code == KeyCode::Enter {
+                    let _ = controller.advance_provider_step(app);
+                    return Ok(false);
+                }
+                if key.code == KeyCode::Backspace {
+                    let _ = controller.delete_provider_text(app);
+                    return Ok(false);
+                }
+                if key.code == KeyCode::Char('n')
+                    && provider_view
+                        .as_ref()
+                        .is_some_and(|view| view.state == ProviderManagementStateKind::Browse)
+                {
+                    let _ = controller.start_provider_draft(app);
+                    return Ok(false);
+                }
+                if let KeyCode::Char(digit @ '1'..='9') = key.code
+                    && step == Some(super::provider_management::ProviderManagementStep::Provider)
+                {
+                    let index = usize::from((digit as u8).saturating_sub(b'1'));
+                    if let Some(provider) = ys_agent_core::ProviderId::ALL.get(index).copied() {
+                        let _ = controller.select_provider_for_draft(app, provider);
+                    }
+                    return Ok(false);
+                }
+                if key.code == KeyCode::Char('k')
+                    && step
+                        == Some(super::provider_management::ProviderManagementStep::Authentication)
+                {
+                    let _ = controller
+                        .select_provider_authentication(app, ProviderAuthentication::ApiKey);
+                    return Ok(false);
+                }
+                if key.code == KeyCode::Char('o')
+                    && step
+                        == Some(super::provider_management::ProviderManagementStep::Authentication)
+                {
+                    let selected = provider_view
+                        .as_ref()
+                        .and_then(|view| view.edit.as_ref())
+                        .and_then(|edit| edit.authentication);
+                    if selected == Some(ProviderAuthentication::OAuth) {
+                        if let Err(error) =
+                            controller.start_provider_operation(ProviderOperationKind::OAuth)
+                        {
+                            app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
+                        }
+                    } else {
+                        let _ = controller
+                            .select_provider_authentication(app, ProviderAuthentication::OAuth);
+                    }
+                    return Ok(false);
+                }
+                let operation = match key.code {
+                    KeyCode::Char('D')
+                        if step
+                            == Some(super::provider_management::ProviderManagementStep::Model) =>
+                    {
+                        Some(ProviderOperationKind::DiscoverModels)
+                    }
+                    KeyCode::Char('v')
+                        if step
+                            == Some(super::provider_management::ProviderManagementStep::Validate) =>
+                    {
+                        Some(ProviderOperationKind::Validate)
+                    }
+                    KeyCode::Char('s')
+                        if matches!(
+                            step,
+                            Some(
+                                super::provider_management::ProviderManagementStep::Validate
+                                    | super::provider_management::ProviderManagementStep::SaveActivate
+                            )
+                        ) =>
+                    {
+                        Some(ProviderOperationKind::SaveDraft)
+                    }
+                    _ => None,
+                };
+                if key.code == KeyCode::Char('a')
+                    && step
+                        == Some(super::provider_management::ProviderManagementStep::SaveActivate)
+                {
+                    if let Err(error) = controller.request_provider_activation() {
+                        app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
+                    }
+                    return Ok(false);
+                }
+                if key.code == KeyCode::Char('r')
+                    && provider_view
+                        .as_ref()
+                        .is_some_and(|view| view.state == ProviderManagementStateKind::Result)
+                {
+                    if let Err(error) = controller.retry_provider_operation() {
+                        app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
+                    }
+                    return Ok(false);
+                }
+                if let Some(operation) = operation {
+                    if let Err(error) = controller.start_provider_operation(operation) {
+                        app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
+                    }
+                    return Ok(false);
+                }
+                if let KeyCode::Char(character) = key.code {
+                    let _ = controller.append_provider_text(app, character);
+                    return Ok(false);
+                }
             }
             match (key.code, key.modifiers) {
                 (KeyCode::Enter, _) => submit_composer(app, controller).await?,
@@ -705,19 +875,26 @@ mod tests {
     use std::{
         future,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
+    use async_trait::async_trait;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use tempfile::tempdir;
     use tokio::sync::{Notify, Semaphore, oneshot};
     use ys_agent_adapters::model::FakeModelProvider;
     use ys_agent_core::{
-        AgentAction, ModelResponse, Principal, ProviderErrorCode, ProviderManagementError,
-        ProviderRemediation, WorkspaceId,
+        ActivateProfileRequest, ActiveProviderView, AgentAction, CompatibilityEvidenceView,
+        CredentialMutationRequest, CredentialViewStatus, DeleteProfileRequest,
+        DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, ModelResponse,
+        OAuthConnectionView, OperationId, Principal, ProfileDetail, ProfileId, ProfileName,
+        ProfileState, ProfileSummary, ProviderCatalogView, ProviderDoctorView, ProviderErrorCode,
+        ProviderManagementApi, ProviderManagementError, ProviderRemediation, ProviderResult,
+        ProviderSupportStatus, RemoteRevocationOutcome, SaveProfileRequest, ValidateProfileRequest,
+        ValidationId, WorkspaceId,
     };
     use ys_agent_runtime::{
         InProcessAgentService, NoopRunScheduler, StaticRunProviderBindingSource,
@@ -725,7 +902,7 @@ mod tests {
     };
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
-    use crate::tui::{provider_management::ProviderOperationKind, render_to_string};
+    use crate::tui::{InputAction, provider_management::ProviderOperationKind, render_to_string};
 
     use super::{
         AsyncOperationRegistry, ProviderOperationPolicy, TuiApp, TuiController,
@@ -944,6 +1121,442 @@ mod tests {
         })
         .await
         .expect("submission completion")
+    }
+
+    #[derive(Default)]
+    struct KeyboardProviderState {
+        profile: Option<ProfileDetail>,
+        active: Option<ActiveProviderView>,
+    }
+
+    /// A service-boundary fake used only to exercise the TUI's complete keyboard workflow. It
+    /// accepts no network or filesystem configuration and never inspects the moved secret value.
+    #[derive(Default)]
+    struct KeyboardProviderApi {
+        state: Mutex<KeyboardProviderState>,
+    }
+
+    fn fake_provider_error() -> ProviderManagementError {
+        ProviderManagementError::new(
+            ProviderErrorCode::Internal,
+            None,
+            ProviderRemediation::ContactSupport,
+        )
+    }
+
+    impl KeyboardProviderApi {
+        fn profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail> {
+            self.state
+                .lock()
+                .expect("test state lock")
+                .profile
+                .clone()
+                .filter(|detail| detail.summary.profile_id == profile_id)
+                .ok_or_else(fake_provider_error)
+        }
+    }
+
+    #[async_trait]
+    impl ProviderManagementApi for KeyboardProviderApi {
+        async fn catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>> {
+            Ok(ys_agent_core::ProviderId::ALL
+                .into_iter()
+                .map(|provider| ProviderCatalogView {
+                    provider,
+                    display_name: format!("{provider:?}"),
+                    credential_kind: provider.required_credential_kind(),
+                    support_status: ProviderSupportStatus::Candidate,
+                    evidence_gaps: vec!["test_evidence_gap".to_owned()],
+                })
+                .collect())
+        }
+
+        async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>> {
+            Ok(self
+                .state
+                .lock()
+                .expect("test state lock")
+                .profile
+                .as_ref()
+                .map(|detail| vec![detail.summary.clone()])
+                .unwrap_or_default())
+        }
+
+        async fn active_provider(&self) -> ProviderResult<Option<ActiveProviderView>> {
+            Ok(self.state.lock().expect("test state lock").active.clone())
+        }
+
+        async fn load_profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail> {
+            self.profile(profile_id)
+        }
+
+        async fn save_profile(&self, request: SaveProfileRequest) -> ProviderResult<ProfileDetail> {
+            let revision = request.revision.revision;
+            let detail = ProfileDetail {
+                summary: ProfileSummary {
+                    profile_id: revision.profile_id(),
+                    name: request.revision.name.as_str().to_owned(),
+                    provider: revision.provider(),
+                    state: ProfileState::Draft,
+                    credential_status: CredentialViewStatus::Missing,
+                    is_active: false,
+                },
+                revision: revision.revision(),
+                credential_generation: revision.credential_generation(),
+                model: revision.model().clone(),
+                parameters: revision.parameters().clone(),
+                validation_id: None,
+                oauth_status: None,
+            };
+            self.state.lock().expect("test state lock").profile = Some(detail.clone());
+            Ok(detail)
+        }
+
+        async fn copy_profile(
+            &self,
+            _source: ProfileId,
+            _name: ProfileName,
+        ) -> ProviderResult<ProfileDetail> {
+            Err(fake_provider_error())
+        }
+
+        async fn mutate_credential(
+            &self,
+            request: CredentialMutationRequest,
+        ) -> ProviderResult<ProfileDetail> {
+            let mut state = self.state.lock().expect("test state lock");
+            let detail = state.profile.as_mut().ok_or_else(fake_provider_error)?;
+            detail.revision = detail
+                .revision
+                .checked_add(1)
+                .ok_or_else(fake_provider_error)?;
+            detail.credential_generation = request.intent.new_generation();
+            detail.summary.credential_status = CredentialViewStatus::Saved;
+            Ok(detail.clone())
+        }
+
+        async fn delete_profile(&self, _request: DeleteProfileRequest) -> ProviderResult<()> {
+            Err(fake_provider_error())
+        }
+
+        async fn discover_models(
+            &self,
+            _request: DiscoverModelsRequest,
+        ) -> ProviderResult<Vec<DiscoveredModel>> {
+            Ok(vec![DiscoveredModel {
+                model: "deepseek/keyboard".to_owned(),
+                context_limit: Some(32_768),
+            }])
+        }
+
+        async fn validate_profile(
+            &self,
+            request: ValidateProfileRequest,
+        ) -> ProviderResult<CompatibilityEvidenceView> {
+            let mut state = self.state.lock().expect("test state lock");
+            let detail = state.profile.as_mut().ok_or_else(fake_provider_error)?;
+            if detail.summary.profile_id != request.profile_id
+                || detail.revision != request.revision
+                || detail.summary.credential_status != CredentialViewStatus::Saved
+            {
+                return Err(fake_provider_error());
+            }
+            detail.summary.state = ProfileState::Ready;
+            let validation_id = ValidationId::new();
+            detail.validation_id = Some(validation_id);
+            Ok(CompatibilityEvidenceView {
+                validation_id,
+                state: ProfileState::Ready,
+                credential_status: CredentialViewStatus::Saved,
+                error: None,
+            })
+        }
+
+        async fn activate(
+            &self,
+            request: ActivateProfileRequest,
+        ) -> ProviderResult<ActiveProviderView> {
+            self.activate_current(request.precondition.profile_id, request.operation_id)
+                .await
+        }
+
+        async fn activate_current(
+            &self,
+            profile_id: ProfileId,
+            _operation_id: OperationId,
+        ) -> ProviderResult<ActiveProviderView> {
+            let mut state = self.state.lock().expect("test state lock");
+            let detail = state.profile.as_ref().ok_or_else(fake_provider_error)?;
+            if detail.summary.profile_id != profile_id
+                || detail.summary.state != ProfileState::Ready
+            {
+                return Err(fake_provider_error());
+            }
+            let active = ActiveProviderView {
+                activation_revision: 1,
+                profile_id,
+                profile_revision: detail.revision,
+                provider: detail.summary.provider,
+                model: detail.model.clone(),
+                parameters: detail.parameters.clone(),
+            };
+            state.active = Some(active.clone());
+            Ok(active)
+        }
+
+        async fn credential_status(
+            &self,
+            profile_id: ProfileId,
+        ) -> ProviderResult<CredentialViewStatus> {
+            Ok(self.profile(profile_id)?.summary.credential_status)
+        }
+
+        async fn oauth_connection(
+            &self,
+            _profile_id: ProfileId,
+        ) -> ProviderResult<OAuthConnectionView> {
+            Err(fake_provider_error())
+        }
+
+        async fn doctor(&self) -> ProviderResult<ProviderDoctorView> {
+            Ok(ProviderDoctorView {
+                active: self.active_provider().await?,
+                credential_status: None,
+                blockers: Vec::new(),
+                warnings: Vec::new(),
+            })
+        }
+
+        async fn cancel_operation(&self, _operation_id: OperationId) -> ProviderResult<()> {
+            Ok(())
+        }
+
+        async fn start_oauth(
+            &self,
+            _profile_id: ProfileId,
+            _operation_id: OperationId,
+        ) -> ProviderResult<DeviceAuthorizationView> {
+            Err(fake_provider_error())
+        }
+
+        async fn complete_oauth(
+            &self,
+            _operation_id: OperationId,
+        ) -> ProviderResult<OAuthConnectionView> {
+            Err(fake_provider_error())
+        }
+
+        async fn refresh_oauth(
+            &self,
+            _profile_id: ProfileId,
+            _operation_id: OperationId,
+        ) -> ProviderResult<OAuthConnectionView> {
+            Err(fake_provider_error())
+        }
+
+        async fn reauthorize_oauth(
+            &self,
+            _profile_id: ProfileId,
+            _operation_id: OperationId,
+        ) -> ProviderResult<DeviceAuthorizationView> {
+            Err(fake_provider_error())
+        }
+
+        async fn logout_oauth(
+            &self,
+            _profile_id: ProfileId,
+            _operation_id: OperationId,
+        ) -> ProviderResult<RemoteRevocationOutcome> {
+            Err(fake_provider_error())
+        }
+    }
+
+    async fn apply_provider_completion(controller: &mut TuiController, app: &mut TuiApp) {
+        let completion = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(completion) = controller.take_ready_provider_operation() {
+                    return completion;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Provider operation completes through the service boundary");
+        controller.apply_provider_operation(app, completion);
+    }
+
+    #[tokio::test]
+    async fn provider_keyboard_flow_selects_saves_validates_and_activates_without_config_file() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let workspace_id = WorkspaceId::new();
+        let provider_api = Arc::new(KeyboardProviderApi::default());
+        let service = Arc::new(
+            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_provider_management_api(provider_api),
+        );
+        let principal = Principal::local_operator("keyboard-provider-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+
+        controller
+            .apply(&mut app, InputAction::Providers)
+            .await
+            .expect("open Provider manager through AgentServiceApi");
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+        )
+        .await
+        .expect("start draft with keyboard");
+        let deepseek_index = ys_agent_core::ProviderId::ALL
+            .iter()
+            .position(|provider| *provider == ys_agent_core::ProviderId::DeepSeek)
+            .expect("DeepSeek is in the governed catalog");
+        let provider_key =
+            char::from(b'1' + u8::try_from(deepseek_index).expect("catalog is short"));
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(
+                KeyCode::Char(provider_key),
+                KeyModifiers::NONE,
+            )),
+        )
+        .await
+        .expect("select Provider with keyboard");
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("advance to authentication");
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+        )
+        .await
+        .expect("select API key authentication");
+        for character in "s3cret".chars() {
+            handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+            )
+            .await
+            .expect("type masked credential");
+        }
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("advance to model");
+        for character in "deepseek/keyboard".chars() {
+            handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+            )
+            .await
+            .expect("type manually governed model");
+        }
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("advance to parameters");
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("advance to validation");
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+        )
+        .await
+        .expect("save Draft before validation");
+        apply_provider_completion(&mut controller, &mut app).await;
+        let saved = controller
+            .provider_screen_view()
+            .expect("Provider screen remains open");
+        assert_eq!(
+            saved.step,
+            Some(super::super::provider_management::ProviderManagementStep::Validate)
+        );
+        assert!(
+            saved
+                .edit
+                .as_ref()
+                .expect("saved edit")
+                .profile_id
+                .is_some()
+        );
+        assert!(
+            !format!("{saved:?}").contains("s3cret"),
+            "the typed credential must not escape the mask boundary"
+        );
+
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
+        )
+        .await
+        .expect("validate saved Draft");
+        apply_provider_completion(&mut controller, &mut app).await;
+        assert_eq!(
+            controller.provider_screen_view().expect("screen").step,
+            Some(super::super::provider_management::ProviderManagementStep::SaveActivate)
+        );
+
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        )
+        .await
+        .expect("confirm and schedule activation");
+        apply_provider_completion(&mut controller, &mut app).await;
+        assert!(
+            controller
+                .provider_screen_view()
+                .expect("screen")
+                .browse
+                .active
+                .is_some(),
+            "only the committed service result may mark a Profile active"
+        );
+
+        controller
+            .apply(&mut app, InputAction::Providers)
+            .await
+            .expect("offline-safe active snapshot remains browseable without configuration files");
+        assert!(
+            app.detail
+                .as_ref()
+                .expect("Provider detail")
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Active · DeepSeek"))
+        );
     }
 
     #[tokio::test]

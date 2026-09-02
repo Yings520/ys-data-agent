@@ -7,17 +7,22 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use ys_agent_core::{
-    ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, ArtifactKind, ArtifactMetadata,
-    ArtifactRef, ArtifactStore, CommandId, CommandReceipt, CommandResultKind,
-    CompatibilityEvidence, ContextManifest, CoreError, CoreResult, CredentialGeneration,
-    CredentialKind, CredentialVault, CredentialViewStatus, EventActor, EventEnvelope, ExportFormat,
-    ModelMessage, ModelProvider, ModelRequest, ModelRole, PendingRunEvent, Principal, ProfileId,
-    ProfileRevision, ProfileRevisionRepository, ProviderCredentialReference, ProviderErrorCode,
-    ProviderField, ProviderId, ProviderManagementError, ProviderModelId, ProviderParameters,
-    ProviderRemediation, ProviderResult, PutArtifact, RetentionPolicy, Run, RunEventKind, RunId,
-    RunProviderBinding, RunProviderBindingRepository, RunProviderBindingSource, RunSnapshot,
-    RunStatus, RuntimeCommandBatch, RuntimeStore, Sensitivity, Session, SessionId, Task, TaskId,
-    ValidationVersions, WorkflowKind, WorkspaceId,
+    ActivateProfileRequest, ActiveProviderView, ArtifactAccessContext, ArtifactAccessPurpose,
+    ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore, CommandId,
+    CommandReceipt, CommandResultKind, CompatibilityEvidence, CompatibilityEvidenceView,
+    ContextManifest, CoreError, CoreResult, CredentialGeneration, CredentialKind,
+    CredentialMutationRequest, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
+    DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, EventActor, EventEnvelope,
+    ExportFormat, ModelMessage, ModelProvider, ModelRequest, ModelRole, OAuthConnectionView,
+    OperationId, PendingRunEvent, Principal, ProfileDetail, ProfileId, ProfileName,
+    ProfileRevision, ProfileRevisionRepository, ProfileSummary, ProviderCatalogView,
+    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId,
+    ProviderManagementApi, ProviderManagementError, ProviderModelId, ProviderParameters,
+    ProviderRemediation, ProviderResult, PutArtifact, RemoteRevocationOutcome, RetentionPolicy,
+    Run, RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
+    RunProviderBindingSource, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore,
+    Sensitivity, Session, SessionId, Task, TaskId, ValidateProfileRequest, ValidationVersions,
+    WorkflowKind, WorkspaceId,
 };
 
 use crate::{
@@ -253,6 +258,154 @@ pub trait AgentServiceApi: Send + Sync {
 
     async fn doctor(&self) -> CoreResult<DoctorReport>;
 
+    /// Returns the composed Provider-management boundary when this process has been bootstrapped
+    /// for Provider management. TUI callers use only the default forwarding methods below.
+    fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
+        None
+    }
+
+    async fn provider_catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>> {
+        provider_api(self)?.catalog().await
+    }
+
+    async fn provider_list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>> {
+        provider_api(self)?.list_profiles().await
+    }
+
+    async fn provider_active(&self) -> ProviderResult<Option<ActiveProviderView>> {
+        provider_api(self)?.active_provider().await
+    }
+
+    async fn provider_load_profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail> {
+        provider_api(self)?.load_profile(profile_id).await
+    }
+
+    async fn provider_save_profile(
+        &self,
+        request: ys_agent_core::SaveProfileRequest,
+    ) -> ProviderResult<ProfileDetail> {
+        provider_api(self)?.save_profile(request).await
+    }
+
+    async fn provider_copy_profile(
+        &self,
+        source: ProfileId,
+        name: ProfileName,
+    ) -> ProviderResult<ProfileDetail> {
+        provider_api(self)?.copy_profile(source, name).await
+    }
+
+    async fn provider_mutate_credential(
+        &self,
+        request: CredentialMutationRequest,
+    ) -> ProviderResult<ProfileDetail> {
+        provider_api(self)?.mutate_credential(request).await
+    }
+
+    async fn provider_delete_profile(&self, request: DeleteProfileRequest) -> ProviderResult<()> {
+        provider_api(self)?.delete_profile(request).await
+    }
+
+    async fn provider_discover_models(
+        &self,
+        request: DiscoverModelsRequest,
+    ) -> ProviderResult<Vec<DiscoveredModel>> {
+        provider_api(self)?.discover_models(request).await
+    }
+
+    async fn provider_validate(
+        &self,
+        request: ValidateProfileRequest,
+    ) -> ProviderResult<CompatibilityEvidenceView> {
+        provider_api(self)?.validate_profile(request).await
+    }
+
+    async fn provider_activate(
+        &self,
+        request: ActivateProfileRequest,
+    ) -> ProviderResult<ActiveProviderView> {
+        provider_api(self)?.activate(request).await
+    }
+
+    async fn provider_activate_current(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<ActiveProviderView> {
+        provider_api(self)?
+            .activate_current(profile_id, operation_id)
+            .await
+    }
+
+    async fn provider_credential_status(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<CredentialViewStatus> {
+        provider_api(self)?.credential_status(profile_id).await
+    }
+
+    async fn provider_oauth_connection(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<OAuthConnectionView> {
+        provider_api(self)?.oauth_connection(profile_id).await
+    }
+
+    async fn provider_doctor(&self) -> ProviderResult<ProviderDoctorView> {
+        provider_api(self)?.doctor().await
+    }
+
+    async fn cancel_provider_operation(&self, operation_id: OperationId) -> ProviderResult<()> {
+        provider_api(self)?.cancel_operation(operation_id).await
+    }
+
+    async fn provider_start_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<DeviceAuthorizationView> {
+        provider_api(self)?
+            .start_oauth(profile_id, operation_id)
+            .await
+    }
+
+    async fn provider_complete_oauth(
+        &self,
+        operation_id: OperationId,
+    ) -> ProviderResult<OAuthConnectionView> {
+        provider_api(self)?.complete_oauth(operation_id).await
+    }
+
+    async fn provider_refresh_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<OAuthConnectionView> {
+        provider_api(self)?
+            .refresh_oauth(profile_id, operation_id)
+            .await
+    }
+
+    async fn provider_reauthorize_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<DeviceAuthorizationView> {
+        provider_api(self)?
+            .reauthorize_oauth(profile_id, operation_id)
+            .await
+    }
+
+    async fn provider_logout_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<RemoteRevocationOutcome> {
+        provider_api(self)?
+            .logout_oauth(profile_id, operation_id)
+            .await
+    }
+
     async fn export_artifact(
         &self,
         command_id: CommandId,
@@ -260,6 +413,18 @@ pub trait AgentServiceApi: Send + Sync {
         format: ExportFormat,
         access: ArtifactAccessContext,
     ) -> CoreResult<ArtifactMetadata>;
+}
+
+fn provider_api<T: AgentServiceApi + ?Sized>(
+    service: &T,
+) -> ProviderResult<&dyn ProviderManagementApi> {
+    service.provider_management_api().ok_or_else(|| {
+        ProviderManagementError::new(
+            ProviderErrorCode::Internal,
+            Some(ProviderField::Provider),
+            ProviderRemediation::ContactSupport,
+        )
+    })
 }
 
 pub struct InProcessAgentService {
@@ -274,6 +439,7 @@ pub struct InProcessAgentService {
     artifact_retention_days: u32,
     front_door: Option<FrontDoorAgent>,
     run_provider_bindings: Arc<dyn RunProviderBindingSource>,
+    provider_management: Option<Arc<dyn ProviderManagementApi>>,
 }
 
 #[derive(Debug, Default)]
@@ -526,6 +692,7 @@ impl InProcessAgentService {
             artifact_retention_days: options.artifact_retention_days,
             front_door: None,
             run_provider_bindings: Arc::new(UnavailableRunProviderBindingSource),
+            provider_management: None,
         }
     }
 
@@ -554,6 +721,17 @@ impl InProcessAgentService {
         source: Arc<dyn RunProviderBindingSource>,
     ) -> Self {
         self.run_provider_bindings = source;
+        self
+    }
+
+    /// Attaches the single masked Provider-management façade. Composition roots supply this after
+    /// repositories, Vault, adapters, and reconciliation are ready; TUI code never receives any
+    /// of those implementation dependencies.
+    pub fn with_provider_management_api(
+        mut self,
+        provider_management: Arc<dyn ProviderManagementApi>,
+    ) -> Self {
+        self.provider_management = Some(provider_management);
         self
     }
 
@@ -837,6 +1015,10 @@ fn active_snapshot_changed(error: &CoreError) -> bool {
 
 #[async_trait]
 impl AgentServiceApi for InProcessAgentService {
+    fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
+        self.provider_management.as_deref()
+    }
+
     async fn create_session(
         &self,
         command_id: CommandId,

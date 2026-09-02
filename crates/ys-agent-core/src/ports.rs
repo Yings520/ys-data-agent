@@ -436,6 +436,10 @@ pub trait ProviderManagementApi: Send + Sync {
 
     async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>>;
 
+    /// The committed active revision used for offline TUI browsing. `None` is the explicit
+    /// no-active management state; it never asks the caller to infer an active Profile.
+    async fn active_provider(&self) -> ProviderResult<Option<ActiveProviderView>>;
+
     async fn load_profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail>;
 
     async fn save_profile(&self, request: SaveProfileRequest) -> ProviderResult<ProfileDetail>;
@@ -468,6 +472,15 @@ pub trait ProviderManagementApi: Send + Sync {
 
     async fn activate(&self, request: ActivateProfileRequest)
     -> ProviderResult<ActiveProviderView>;
+
+    /// Service-owned activation command for a TUI that only holds a masked Profile view. The
+    /// implementation derives the validation digest and active CAS precondition from the durable
+    /// current revision; callers cannot predict or forge either value.
+    async fn activate_current(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<ActiveProviderView>;
 
     async fn credential_status(
         &self,

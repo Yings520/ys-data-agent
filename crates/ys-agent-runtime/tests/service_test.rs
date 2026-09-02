@@ -239,6 +239,19 @@ impl ServiceFixture {
 }
 
 #[tokio::test]
+async fn provider_management_is_available_only_through_the_service_boundary() {
+    let fixture = ServiceFixture::new().await;
+
+    let error = fixture
+        .service
+        .provider_catalog()
+        .await
+        .expect_err("an uncomposed service must not expose a repository or Vault fallback");
+
+    assert_eq!(error.code(), "provider.internal");
+}
+
+#[tokio::test]
 async fn production_run_creation_rejects_missing_provider_binding_before_persistence() {
     let fixture = ServiceFixture::without_provider_binding().await;
 

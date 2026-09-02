@@ -249,7 +249,7 @@
   - _Requirements: 3.10, 9.7, 11.1, 11.2_
   - _Boundary: SecretSanitizer and Provider telemetry contracts_
   - _Depends: 1.2, 3.8, 5.1_
-- [ ] 6.5 集成 AgentServiceApi 与 TUI 管理闭环
+- [x] 6.5 集成 AgentServiceApi 与 TUI 管理闭环
   - 通过既有 service boundary 暴露 catalog、Profile、Credential、discovery、validation、activation、OAuth 和 cancel commands，TUI 不直接访问 SQLite、Vault 或网络。
   - `/providers` 打开统一管理面，旧 `/model` 只导航到同一 screen 的 Model step；展示 active Profile、Provider、model、非敏感参数、认证和最近 validation。
   - 把 committed operation result、字段错误、retry/cancel 和 no-active 状态连接到 reducer，确保失败不清空非敏感输入或误显示 Active。
