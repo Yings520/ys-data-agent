@@ -9,8 +9,12 @@ async-trait.workspace = true
 bigdecimal.workspace = true
 chrono.workspace = true
 futures.workspace = true
+keyring.workspace = true
+liter-llm.workspace = true
+oauth2.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
@@ -20,7 +24,9 @@ sqlx.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 uuid.workspace = true
+webbrowser.workspace = true
 ys-agent-core = { path = "../ys-agent-core" }
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

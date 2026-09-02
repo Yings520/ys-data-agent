@@ -1,4 +1,8 @@
+pub mod discovery;
 mod fake;
+pub mod liter;
+pub mod liter_chat;
+pub mod liter_responses;
 mod openai_compatible;
 mod replay;
 

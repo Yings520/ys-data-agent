@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod export;
 mod harness;
 mod loop_driver;
+pub mod provider;
 mod recovery;
 mod service;
 
