@@ -242,7 +242,7 @@
   - _Requirements: 9.1, 9.4, 11.1_
   - _Boundary: ProviderDoctorCheck_
   - _Depends: 4.5, 5.1_
-- [ ] 6.4 (P) 扩展 Provider 敏感数据清理边界
+- [x] 6.4 (P) 扩展 Provider 敏感数据清理边界
   - 让 Provider/OAuth/Vault 错误、Telemetry、Run Event、Artifact、TUI snapshot 与 panic/error path 统一经过非敏感白名单或 sanitizer。
   - Telemetry 默认只记录 fingerprint hash，不记录完整 model、Credential locator、request body、tool arguments 或业务数据。
   - 完成后，边界级 canary tests 能证明秘密无法通过 Debug、Serialize、tracing、错误转换或崩溃输出泄露。

@@ -4,9 +4,10 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use ys_agent_core::{RunId, ToolCallId};
+use ys_agent_core::{ProviderId, RunId, ToolCallId};
 use ys_agent_runtime::telemetry::{
-    TelemetryDispatcher, TelemetryError, TelemetryEvent, TelemetrySink,
+    ProviderTelemetryOutcome, SecretSanitizer, TelemetryDispatcher, TelemetryError, TelemetryEvent,
+    TelemetrySink,
 };
 
 #[derive(Debug, Default)]
@@ -27,8 +28,7 @@ struct RecordingTelemetrySink {
 #[async_trait]
 impl TelemetrySink for RecordingTelemetrySink {
     async fn emit(&self, event: TelemetryEvent) -> Result<(), TelemetryError> {
-        let serialized = serde_json::to_string(&event)
-            .map_err(|error| TelemetryError::Encoding(error.to_string()))?;
+        let serialized = serde_json::to_string(&event).map_err(|_| TelemetryError::Encoding)?;
         self.serialized
             .lock()
             .expect("recording telemetry mutex")
@@ -86,16 +86,62 @@ async fn telemetry_does_not_receive_query_result_rows() {
 async fn secret_canaries_never_reach_telemetry() {
     let sink = RecordingTelemetrySink::default();
     let dispatcher = TelemetryDispatcher::new(Arc::new(sink.clone()));
+    const CANARY: &str = "provider-telemetry-canary-must-not-leak";
 
     dispatcher
         .emit_after_commit(TelemetryEvent::ModelUsage {
             run_id: RunId::new(),
-            model_call_id: "model-call-1".to_owned(),
+            model_call_id: CANARY.to_owned(),
             prompt_tokens: Some(100),
             completion_tokens: Some(20),
             milliseconds: 9,
         })
         .await;
+    dispatcher
+        .emit_after_commit(TelemetryEvent::ToolLatency {
+            run_id: RunId::new(),
+            tool_call_id: ToolCallId::new(),
+            tool_name: CANARY.to_owned(),
+            milliseconds: 3,
+            outcome: CANARY.to_owned(),
+        })
+        .await;
 
-    assert!(!sink.all_text().contains("canary-api-key"));
+    assert!(!sink.all_text().contains(CANARY));
+    assert!(sink.all_text().contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn provider_telemetry_allows_only_a_fingerprint_hash() {
+    let sink = RecordingTelemetrySink::default();
+    let dispatcher = TelemetryDispatcher::new(Arc::new(sink.clone()));
+    const CANARY: &str = "provider-request-body-canary-must-not-leak";
+
+    dispatcher
+        .emit_after_commit(TelemetryEvent::ProviderCall {
+            provider: ProviderId::DeepSeek,
+            fingerprint_sha256: CANARY.to_owned(),
+            milliseconds: 17,
+            retry_count: 1,
+            outcome: ProviderTelemetryOutcome::Failed,
+        })
+        .await;
+    let fingerprint_hash = format!("sha256:{}", "a".repeat(64));
+    dispatcher
+        .emit_after_commit(TelemetryEvent::ProviderCall {
+            provider: ProviderId::DeepSeek,
+            fingerprint_sha256: fingerprint_hash.clone(),
+            milliseconds: 12,
+            retry_count: 0,
+            outcome: ProviderTelemetryOutcome::Succeeded,
+        })
+        .await;
+
+    let serialized = sink.all_text();
+    assert!(!serialized.contains(CANARY));
+    assert!(serialized.contains(SecretSanitizer::REDACTED));
+    assert!(serialized.contains(&fingerprint_hash));
+    assert!(serialized.contains("deep_seek"));
+    assert!(!serialized.contains("model"));
+    assert!(!serialized.contains("credential"));
 }
