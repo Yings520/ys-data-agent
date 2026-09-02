@@ -274,6 +274,13 @@ impl RunProviderBindingRepository for FakeRunProviderBindingRepository {
         unavailable()
     }
 
+    async fn credential_status(
+        &self,
+        _credential: CredentialGeneration,
+    ) -> ProviderResult<CredentialViewStatus> {
+        Ok(CredentialViewStatus::Saved)
+    }
+
     async fn has_nonterminal_profile_references(
         &self,
         _profile_id: ProfileId,

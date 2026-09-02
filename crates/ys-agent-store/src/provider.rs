@@ -93,6 +93,29 @@ impl RunProviderBindingRepository for SqliteRunBindingRepository {
             .await
     }
 
+    async fn credential_status(
+        &self,
+        credential: CredentialGeneration,
+    ) -> ProviderResult<CredentialViewStatus> {
+        self.with_connection(move |connection| {
+            let status: Option<String> = connection
+                .query_row(
+                    "SELECT status
+                     FROM provider_credential_generations
+                     WHERE profile_id = ?1 AND generation = ?2",
+                    params![
+                        credential.profile_id().to_string(),
+                        to_i64(credential.number())?
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(provider_storage_error)?;
+            Ok(credential_view_status(status.as_deref()))
+        })
+        .await
+    }
+
     async fn has_nonterminal_profile_references(
         &self,
         profile_id: ProfileId,

@@ -319,6 +319,14 @@ pub trait ProviderProfileRepository:
 pub trait RunProviderBindingRepository: Send + Sync {
     async fn load_run_binding(&self, run_id: RunId) -> ProviderResult<crate::RunProviderBinding>;
 
+    /// Returns the durable lifecycle status for the exact generation referenced by a binding.
+    /// The resolver must reject revoked, expired, deleted, or unreconciled metadata even when a
+    /// platform vault still happens to contain an old retained entry.
+    async fn credential_status(
+        &self,
+        credential: crate::CredentialGeneration,
+    ) -> ProviderResult<CredentialViewStatus>;
+
     async fn has_nonterminal_profile_references(
         &self,
         profile_id: ProfileId,

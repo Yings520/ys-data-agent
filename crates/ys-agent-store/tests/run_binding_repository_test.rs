@@ -3,11 +3,11 @@ use tempfile::TempDir;
 use ys_agent_core::{
     ActivateProfileRequest, ActivationPrecondition, ActiveProviderSnapshot, CommandId,
     CommandReceipt, CommandResultKind, CompatibilityEvidence, CreateRunCommand,
-    CredentialGeneration, CredentialKind, PendingRunEvent, ProfileId, ProfileName, ProfileRevision,
-    ProviderId, ProviderModelId, ProviderParameters, RevisionPrecondition, Run, RunEventKind,
-    RunProviderBinding, RunProviderBindingRepository, RuntimeCommandBatch, RuntimeStore,
-    SaveProfileRevision, Task, ValidationCommit, ValidationCommitPrecondition, ValidationVersions,
-    WorkflowKind, WorkspaceId,
+    CredentialGeneration, CredentialKind, CredentialViewStatus, PendingRunEvent, ProfileId,
+    ProfileName, ProfileRevision, ProviderId, ProviderModelId, ProviderParameters,
+    RevisionPrecondition, Run, RunEventKind, RunProviderBinding, RunProviderBindingRepository,
+    RuntimeCommandBatch, RuntimeStore, SaveProfileRevision, Task, ValidationCommit,
+    ValidationCommitPrecondition, ValidationVersions, WorkflowKind, WorkspaceId,
 };
 use ys_agent_store::SqliteRuntimeStore;
 
@@ -195,6 +195,29 @@ async fn run_binding_is_atomic_insert_only_recoverable_and_tracks_nonterminal_re
             .has_nonterminal_credential_references(active.credential)
             .await
             .expect("query Credential references")
+    );
+    assert_eq!(
+        bindings
+            .credential_status(active.credential)
+            .await
+            .expect("read durable credential status"),
+        CredentialViewStatus::Saved
+    );
+    Connection::open(&database)
+        .expect("open database for durable credential status update")
+        .execute(
+            "UPDATE provider_credential_generations
+             SET status = 'revoked'
+             WHERE profile_id = ?1 AND generation = ?2",
+            [active.credential.profile_id().to_string(), "1".to_owned()],
+        )
+        .expect("mark the exact durable generation revoked");
+    assert_eq!(
+        bindings
+            .credential_status(active.credential)
+            .await
+            .expect("read revoked durable credential status"),
+        CredentialViewStatus::Revoked
     );
     let events = store
         .load_events(&run.id, 0)

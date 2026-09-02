@@ -193,7 +193,7 @@
   - _Depends: 3.3, 4.2, 4.4, 4.5_
 
 - [ ] 5. 把不可变 Provider binding 接入 Query Runtime
-- [ ] 5.1 按 Run binding 解析并缓存 ModelProvider
+- [x] 5.1 按 Run binding 解析并缓存 ModelProvider
   - Resolver 只按 run_id 读取 insert-only binding 和精确 Credential generation，绝不读取 active pointer、当前 Profile 或其他 generation。
   - 用 binding digest 构造并在 Run 生命周期内缓存单一 Provider client；并发构造使用 single-flight，终态释放，不做跨 Profile/Run secret cache。
   - Missing、Expired、Revoked 或不一致 generation 返回明确失败，不尝试当前 key、其他 Profile、其他 Provider 或自由文本降级。
