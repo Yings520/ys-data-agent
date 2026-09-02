@@ -53,7 +53,17 @@ This is the only implementation entry point Ralph may invoke. The arguments are:
 
 ## Ralph Result Protocol
 
-- Only after every applicable gate above succeeds, run `rtk node tools/workflow/cc-sdd-complete.mjs <feature> <task-id>` as the final shell action. The helper independently checks the authoritative checkbox state before emitting Ralph's completion sentinel.
+- Only after every applicable gate above succeeds, review the exact task diff,
+  stage exactly its approved paths, and run:
+  ```text
+  rtk node tools/workflow/cc-sdd-publish.mjs <feature> <task-id> \
+    --path <reviewed-path> [--path <reviewed-path> ...]
+  rtk node tools/workflow/cc-sdd-complete.mjs <feature> <task-id>
+  ```
+  The publisher creates and pushes the atomic task commit and maintains the
+  shared Draft Feature PR. The completion helper must remain the final shell
+  action and independently verifies checkbox and publication state before
+  emitting Ralph's completion sentinel.
 - Never spell, reconstruct, quote, echo, or otherwise include the completion sentinel in Agent prose or tool commands. The completion helper is its only allowed producer.
 - On a blocker, spec conflict, stale projection, rejected review, failed command, `NO-GO`, or missing manual evidence, do not run the completion helper.
 - For a blocker, update `tasks.md` with cc-sdd's `_Blocked: <reason>_` annotation when the owning cc-sdd protocol calls for it, then report a concise `STATUS: BLOCKED`, the evidence, and the required human action.

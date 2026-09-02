@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -29,6 +29,63 @@ async function createFeature(tasks) {
     "utf8",
   );
   return { root, featureDirectory };
+}
+
+function run(root, command, args) {
+  const result = spawnSync(command, args, { cwd: root, encoding: "utf8" });
+  assert.equal(result.status, 0, `${command}: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+async function createPublishedFeature(tasks) {
+  const { root, featureDirectory } = await createFeature(
+    tasks.replaceAll("- [x]", "- [ ]"),
+  );
+  const remote = `${root}-remote.git`;
+  const fakeBin = path.join(root, ".test-bin");
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(
+    path.join(fakeBin, "gh"),
+    `#!/bin/sh
+if [ "$1 $2" = "pr view" ]; then
+  printf '%s\\n' '{"state":"OPEN","isDraft":true,"baseRefName":"master","headRefName":"feat/sample-feature","url":"https://github.example/pull/1"}'
+  exit 0
+fi
+exit 64
+`,
+    "utf8",
+  );
+  await chmod(path.join(fakeBin, "gh"), 0o755);
+
+  run(root, "git", ["init", "-b", "master"]);
+  run(root, "git", ["config", "user.name", "Ralph Test"]);
+  run(root, "git", ["config", "user.email", "ralph@example.test"]);
+  run(root, "git", ["add", ".kiro"]);
+  run(root, "git", ["commit", "-m", "test: initialize feature"]);
+  run(root, "git", ["init", "--bare", remote]);
+  run(root, "git", ["remote", "add", "origin", remote]);
+  run(root, "git", ["push", "-u", "origin", "master"]);
+  run(root, "git", ["switch", "-c", "feat/sample-feature"]);
+  await writeFile(path.join(featureDirectory, "tasks.md"), tasks, "utf8");
+  run(root, "git", ["add", ".kiro/specs/sample-feature/tasks.md"]);
+  run(root, "git", [
+    "commit",
+    "-m",
+    "feat(sample-feature): complete task 1.1",
+    "-m",
+    "CC-SDD-Feature: sample-feature\nCC-SDD-Task: 1.1",
+  ]);
+  run(root, "git", [
+    "push",
+    "origin",
+    "HEAD:refs/heads/feat/sample-feature",
+  ]);
+  return {
+    root,
+    env: {
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+    },
+  };
 }
 
 function runHelper(root, taskId, env = {}) {
@@ -113,7 +170,7 @@ test("completion helper rejects an unchecked authoritative task", async () => {
   assert.match(result.stderr, /completion denied/i);
 });
 
-test("completion helper emits the sentinel for a checked authoritative task", async () => {
+test("completion helper rejects a checked task before publication", async () => {
   const { root } = await createFeature(`- [x] 1.1 Implement the task
   - The behavior exists.
   - _Requirements: 1.1_
@@ -122,6 +179,21 @@ test("completion helper emits the sentinel for a checked authoritative task", as
 `);
 
   const result = runHelper(root, "1.1");
+
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(result.stdout, completionPattern);
+  assert.match(result.stderr, /completion denied/i);
+});
+
+test("completion helper emits the sentinel for a remotely published task", async () => {
+  const { root, env } = await createPublishedFeature(`- [x] 1.1 Implement the task
+  - The behavior exists.
+  - _Requirements: 1.1_
+  - _Boundary: src/task.rs_
+  - _Depends: none_
+`);
+
+  const result = runHelper(root, "1.1", env);
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), expectedSentinel);

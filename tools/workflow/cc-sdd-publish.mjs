@@ -353,6 +353,39 @@ export async function recoverFeature(
   ensureDraftPullRequest(root, feature, env);
 }
 
+export function assertTaskPublished({
+  feature,
+  taskId,
+  root = process.cwd(),
+  env = process.env,
+}) {
+  if (!FEATURE_NAME.test(feature ?? "") || !TASK_ID.test(taskId ?? "")) {
+    throw new PublicationError("invalid published task identity");
+  }
+  const branch = git(root, ["branch", "--show-current"]).trim();
+  if (branch !== expectedBranch(feature)) {
+    throw new PublicationError("published task branch does not match feature");
+  }
+
+  const tasksPath = `.kiro/specs/${feature}/tasks.md`;
+  const committedTasks = validateTasks(
+    parseTasks(git(root, ["show", `HEAD:${tasksPath}`])),
+  );
+  if (!committedTasks.find((task) => task.id === taskId)?.passes) {
+    throw new PublicationError("published task is not committed as complete");
+  }
+  if (!hasTaskCommit(commitBodies(root), feature, taskId)) {
+    throw new PublicationError("published task commit trailers are missing");
+  }
+
+  assertRemoteContainsHead(root, feature);
+  requireExpectedDraftPullRequest(
+    inspectPullRequest(root, feature, env),
+    feature,
+    env,
+  );
+}
+
 export async function runCli(args, root = process.cwd()) {
   if (args[0] === "--recover") {
     if (args.length !== 2) {

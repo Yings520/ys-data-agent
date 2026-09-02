@@ -42,6 +42,7 @@ done
 
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual((await readFile(logPath, "utf8")).trim().split("\n"), [
+    "node tools/workflow/cc-sdd-publish.mjs --recover sample-feature",
     "node tools/workflow/cc-sdd-to-ralph.mjs sample-feature",
     "ralph-tui run --prd .ralph-tui/generated/sample-feature.json --serial",
   ]);
