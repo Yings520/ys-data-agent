@@ -11,6 +11,7 @@ use ys_agent_core::{
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_runtime.sql");
+const MIGRATION_0002: &str = include_str!("../migrations/0002_provider_management.sql");
 
 #[derive(Debug, Clone)]
 pub struct SqliteRuntimeStore {
@@ -90,26 +91,41 @@ fn apply_migrations(connection: &mut Connection) -> CoreResult<()> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(storage_error)?;
-    let applied: bool = transaction
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 1)",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(storage_error)?;
-
-    if !applied {
+    let runtime_applied = migration_is_applied(&transaction, 1)?;
+    if !runtime_applied {
         transaction
             .execute_batch(MIGRATION_0001)
             .map_err(storage_error)?;
+        record_migration(&transaction, 1)?;
+    }
+
+    if !migration_is_applied(&transaction, 2)? {
         transaction
-            .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
-                [Utc::now().to_rfc3339()],
-            )
+            .execute_batch(MIGRATION_0002)
             .map_err(storage_error)?;
+        record_migration(&transaction, 2)?;
     }
     transaction.commit().map_err(storage_error)
+}
+
+fn migration_is_applied(transaction: &Transaction<'_>, version: i64) -> CoreResult<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            [version],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)
+}
+
+fn record_migration(transaction: &Transaction<'_>, version: i64) -> CoreResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![version, Utc::now().to_rfc3339()],
+        )
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 fn storage_error(error: impl std::fmt::Display) -> CoreError {

@@ -1,5 +1,6 @@
-use std::fs;
+use std::{fs, path::Path};
 
+use rusqlite::Connection;
 use tempfile::TempDir;
 use ys_agent_core::{
     ActiveProviderSnapshot, ArtifactKind, ArtifactStore, CommandId, CommandReceipt,
@@ -10,6 +11,644 @@ use ys_agent_core::{
     WorkspaceId,
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
+
+const RUNTIME_MIGRATION: &str = include_str!("../migrations/0001_runtime.sql");
+
+fn legacy_runtime_database(path: &Path) {
+    let connection = Connection::open(path).expect("open legacy database");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );",
+        )
+        .expect("create migration ledger");
+    connection
+        .execute_batch(RUNTIME_MIGRATION)
+        .expect("apply runtime migration");
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'legacy')",
+            [],
+        )
+        .expect("record runtime migration");
+}
+
+#[tokio::test]
+async fn provider_migration_upgrades_legacy_database_and_leaves_no_active_profile() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    legacy_runtime_database(&database);
+
+    let store = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("upgrade legacy runtime database");
+    drop(store);
+
+    let connection = Connection::open(&database).expect("inspect upgraded database");
+    let version: i64 = connection
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE version = 2",
+            [],
+            |row| row.get(0),
+        )
+        .expect("provider migration version");
+    assert_eq!(version, 2);
+
+    for table in [
+        "provider_profiles",
+        "provider_profile_revisions",
+        "provider_credential_generations",
+        "provider_validations",
+        "active_provider",
+        "credential_mutations",
+        "run_provider_bindings",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("query provider table");
+        assert!(exists, "migration must create {table}");
+    }
+
+    let active_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM active_provider", [], |row| row.get(0))
+        .expect("query empty active singleton");
+    assert_eq!(
+        active_count, 0,
+        "a fresh installation has no active Provider"
+    );
+}
+
+#[tokio::test]
+async fn provider_migration_is_idempotent_and_rejects_unknown_parameter_schema() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    SqliteRuntimeStore::open(&database)
+        .await
+        .expect("apply migrations");
+    SqliteRuntimeStore::open(&database)
+        .await
+        .expect("repeat migrations");
+
+    let mut connection = Connection::open(&database).expect("inspect migrated database");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable foreign keys");
+    let transaction = connection.transaction().expect("start test transaction");
+    transaction
+        .execute_batch("PRAGMA defer_foreign_keys = ON")
+        .expect("defer profile revision relationship");
+    transaction
+        .execute(
+            "INSERT INTO provider_profiles(profile_id, name, current_revision, created_at, updated_at)
+             VALUES ('profile-1', 'Primary', 1, 'now', 'now')",
+            [],
+        )
+        .expect("insert profile identity");
+    transaction
+        .execute(
+            "INSERT INTO provider_credential_generations(
+                profile_id, generation, kind, vault_locator, status, created_at, updated_at
+             ) VALUES ('profile-1', 1, 'api_key', 'vault://opaque-locator', 'available', 'now', 'now')",
+            [],
+        )
+        .expect("insert non-sensitive credential metadata");
+    let error = transaction
+        .execute(
+            "INSERT INTO provider_profile_revisions(
+                profile_id, revision, provider, model_id, parameters_json, credential_generation,
+                state, validation_id, created_at
+             ) VALUES ('profile-1', 1, 'deep_seek', 'deepseek/model',
+                       '{\"schema_version\":999}', 1, 'draft', NULL, 'now')",
+            [],
+        )
+        .expect_err("unknown parameter schema must fail closed");
+    assert!(error.to_string().contains("CHECK"));
+}
+
+#[tokio::test]
+async fn provider_migration_rejects_secret_json_and_revision_overwrites() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    SqliteRuntimeStore::open(&database)
+        .await
+        .expect("apply migrations");
+
+    let connection = Connection::open(&database).expect("inspect migrated database");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable foreign keys");
+    connection
+        .execute_batch("PRAGMA defer_foreign_keys = ON; BEGIN")
+        .expect("start deferred fixture transaction");
+    connection
+        .execute(
+            "INSERT INTO provider_profiles(profile_id, name, current_revision, created_at, updated_at)
+             VALUES ('profile-1', 'Primary', 1, 'now', 'now')",
+            [],
+        )
+        .expect("insert profile identity");
+    connection
+        .execute(
+            "INSERT INTO provider_credential_generations(
+                profile_id, generation, kind, vault_locator, status, created_at, updated_at
+             ) VALUES ('profile-1', 1, 'api_key', 'vault://opaque-locator', 'available', 'now', 'now')",
+            [],
+        )
+        .expect("insert non-sensitive credential metadata");
+    let secret_error = connection
+        .execute(
+            "INSERT INTO provider_profile_revisions(
+                profile_id, revision, provider, model_id, parameters_json, credential_generation,
+                state, validation_id, created_at
+             ) VALUES ('profile-1', 1, 'deep_seek', 'deepseek/model',
+                       '{\"schema_version\":1,\"api_key\":\"canary-secret\"}', 1,
+                       'draft', NULL, 'now')",
+            [],
+        )
+        .expect_err("secret-shaped JSON must be rejected");
+    assert!(secret_error.to_string().contains("non-sensitive schema"));
+    let typed_secret_error = connection
+        .execute(
+            "INSERT INTO provider_profile_revisions(
+                profile_id, revision, provider, model_id, parameters_json, credential_generation,
+                state, validation_id, created_at
+             ) VALUES ('profile-1', 1, 'deep_seek', 'deepseek/model',
+                       '{\"schema_version\":1,\"temperature\":\"canary-secret\"}', 1,
+                       'draft', NULL, 'now')",
+            [],
+        )
+        .expect_err("string values are not valid Provider parameters");
+    assert!(
+        typed_secret_error
+            .to_string()
+            .contains("non-sensitive schema")
+    );
+    connection
+        .execute(
+            "INSERT INTO provider_profile_revisions(
+                profile_id, revision, provider, model_id, parameters_json, credential_generation,
+                state, validation_id, created_at
+             ) VALUES ('profile-1', 1, 'deep_seek', 'deepseek/model',
+                       '{\"schema_version\":1}', 1, 'draft', NULL, 'now')",
+            [],
+        )
+        .expect("insert valid draft revision");
+    connection.execute_batch("COMMIT").expect("commit fixture");
+
+    let overwrite_error = connection
+        .execute(
+            "UPDATE provider_profile_revisions SET model_id = 'xai/overwritten'
+             WHERE profile_id = 'profile-1' AND revision = 1",
+            [],
+        )
+        .expect_err("revision configuration must be insert-only");
+    assert!(overwrite_error.to_string().contains("immutable"));
+    let revision_delete_error = connection
+        .execute(
+            "DELETE FROM provider_profile_revisions WHERE profile_id = 'profile-1' AND revision = 1",
+            [],
+        )
+        .expect_err("revision history must be retained");
+    assert!(
+        revision_delete_error
+            .to_string()
+            .contains("revisions are insert-only")
+    );
+    let credential_delete_error = connection
+        .execute(
+            "DELETE FROM provider_credential_generations WHERE profile_id = 'profile-1' AND generation = 1",
+            [],
+        )
+        .expect_err("credential generation metadata must be retained");
+    assert!(
+        credential_delete_error
+            .to_string()
+            .contains("credential generations are insert-only")
+    );
+}
+
+#[tokio::test]
+async fn provider_migration_rejects_ready_revision_without_matching_validation() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    SqliteRuntimeStore::open(&database)
+        .await
+        .expect("apply migrations");
+
+    let mut connection = Connection::open(&database).expect("inspect migrated database");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable foreign keys");
+    let transaction = connection
+        .transaction()
+        .expect("start deferred transaction");
+    transaction
+        .execute_batch("PRAGMA defer_foreign_keys = ON")
+        .expect("defer cyclic foreign keys");
+    transaction
+        .execute(
+            "INSERT INTO provider_profiles(profile_id, name, current_revision, created_at, updated_at)
+             VALUES ('profile-1', 'Primary', 1, 'now', 'now')",
+            [],
+        )
+        .expect("insert profile identity");
+    transaction
+        .execute(
+            "INSERT INTO provider_credential_generations(
+                profile_id, generation, kind, vault_locator, status, created_at, updated_at
+             ) VALUES ('profile-1', 1, 'api_key', 'vault://opaque-locator', 'available', 'now', 'now')",
+            [],
+        )
+        .expect("insert non-sensitive credential metadata");
+    let capability_error = transaction
+        .execute(
+            "INSERT INTO provider_validations(
+                validation_id, profile_id, revision, credential_generation, validation_digest,
+                tool_calls_supported, non_empty_tool_call_ids, multi_turn_tool_results,
+                context_limit, outcome, error_code, evidence_schema_version, checked_at
+             ) VALUES ('incomplete-validation', 'profile-1', 1, 1, 'incomplete-digest',
+                       0, 0, 0, 1, 'passed', NULL, 1, 'now')",
+            [],
+        )
+        .expect_err("passing validation requires every required capability");
+    assert!(capability_error.to_string().contains("CHECK"));
+    let error = transaction
+        .execute(
+            "INSERT INTO provider_profile_revisions(
+                profile_id, revision, provider, model_id, parameters_json, credential_generation,
+                state, validation_id, created_at
+             ) VALUES ('profile-1', 1, 'deep_seek', 'deepseek/model',
+                       '{\"schema_version\":1}', 1, 'ready', 'missing-validation', 'now')",
+            [],
+        )
+        .expect_err("Ready revisions require a matching passing validation");
+    assert!(error.to_string().contains("matching passing validation"));
+}
+
+#[tokio::test]
+async fn provider_migration_rejects_ready_revision_with_failed_validation() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    SqliteRuntimeStore::open(&database)
+        .await
+        .expect("apply migrations");
+
+    let connection = Connection::open(&database).expect("inspect migrated database");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable foreign keys");
+    connection
+        .execute_batch("PRAGMA defer_foreign_keys = ON; BEGIN")
+        .expect("start deferred fixture transaction");
+    connection
+        .execute_batch(
+            "INSERT INTO provider_profiles(profile_id, name, current_revision, created_at, updated_at)
+             VALUES ('profile-1', 'Primary', 1, 'now', 'now');
+             INSERT INTO provider_credential_generations(
+                profile_id, generation, kind, vault_locator, status, created_at, updated_at
+             ) VALUES ('profile-1', 1, 'api_key', 'vault://opaque-locator', 'available', 'now', 'now');
+             INSERT INTO provider_profile_revisions(
+                profile_id, revision, provider, model_id, parameters_json, credential_generation,
+                state, validation_id, created_at
+             ) VALUES ('profile-1', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1}', 1,
+                       'draft', NULL, 'now');
+             INSERT INTO provider_validations(
+                validation_id, profile_id, revision, credential_generation, validation_digest,
+                tool_calls_supported, non_empty_tool_call_ids, multi_turn_tool_results,
+                context_limit, outcome, error_code, evidence_schema_version, checked_at
+             ) VALUES ('validation-1', 'profile-1', 1, 1, 'digest-1', 0, 0, 0, 1,
+                       'failed', 'provider.model.incompatible', 1, 'now');",
+        )
+        .expect("seed failed validation");
+    let error = connection
+        .execute(
+            "UPDATE provider_profile_revisions
+             SET state = 'ready', validation_id = 'validation-1'
+             WHERE profile_id = 'profile-1' AND revision = 1",
+            [],
+        )
+        .expect_err("failed validation must not make a revision Ready");
+    assert!(error.to_string().contains("matching passing validation"));
+    connection
+        .execute_batch("ROLLBACK")
+        .expect("discard fixture");
+}
+
+#[tokio::test]
+async fn provider_migration_rejects_ready_revision_without_credential() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    SqliteRuntimeStore::open(&database)
+        .await
+        .expect("apply migrations");
+
+    let connection = Connection::open(&database).expect("inspect migrated database");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable foreign keys");
+    connection
+        .execute_batch("PRAGMA defer_foreign_keys = ON; BEGIN")
+        .expect("start deferred fixture transaction");
+    connection
+        .execute_batch(
+            "INSERT INTO provider_profiles(profile_id, name, current_revision, created_at, updated_at)
+             VALUES ('profile-1', 'Primary', 1, 'now', 'now');
+             INSERT INTO provider_profile_revisions(
+                profile_id, revision, provider, model_id, parameters_json, credential_generation,
+                state, validation_id, created_at
+             ) VALUES ('profile-1', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1}',
+                       NULL, 'draft', NULL, 'now');
+             INSERT INTO provider_validations(
+                validation_id, profile_id, revision, credential_generation, validation_digest,
+                tool_calls_supported, non_empty_tool_call_ids, multi_turn_tool_results,
+                context_limit, outcome, error_code, evidence_schema_version, checked_at
+             ) VALUES ('validation-1', 'profile-1', 1, NULL, 'digest-1', 1, 1, 1, 1,
+                       'passed', NULL, 1, 'now');",
+        )
+        .expect("seed credential-less draft and validation");
+    let error = connection
+        .execute(
+            "UPDATE provider_profile_revisions
+             SET state = 'ready', validation_id = 'validation-1'
+             WHERE profile_id = 'profile-1' AND revision = 1",
+            [],
+        )
+        .expect_err("a Ready revision requires a credential generation");
+    assert!(error.to_string().contains("matching passing validation"));
+    connection
+        .execute_batch("ROLLBACK")
+        .expect("discard fixture");
+}
+
+#[tokio::test]
+async fn provider_migration_rejects_secret_fingerprints_and_cross_profile_validations() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    SqliteRuntimeStore::open(&database)
+        .await
+        .expect("apply migrations");
+
+    let connection = Connection::open(&database).expect("inspect migrated database");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable foreign keys");
+    connection
+        .execute_batch("PRAGMA defer_foreign_keys = ON; BEGIN")
+        .expect("start deferred fixture transaction");
+    connection
+        .execute_batch(
+            "INSERT INTO tasks(task_id, workspace_id, status, payload_json, created_at, updated_at)
+             VALUES ('task-1', 'workspace-1', 'queued', '{}', 'now', 'now');
+             INSERT INTO runs(run_id, task_id, status, version, snapshot_json, created_at, updated_at)
+             VALUES ('run-1', 'task-1', 'queued', 1, '{}', 'now', 'now');
+             INSERT INTO runs(run_id, task_id, status, version, snapshot_json, created_at, updated_at)
+             VALUES ('run-2', 'task-1', 'queued', 1, '{}', 'now', 'now');
+             INSERT INTO provider_profiles(profile_id, name, current_revision, created_at, updated_at)
+             VALUES
+                ('profile-1', 'Primary', 1, 'now', 'now'),
+                ('profile-2', 'Secondary', 1, 'now', 'now');
+             INSERT INTO provider_credential_generations(
+                profile_id, generation, kind, vault_locator, status, created_at, updated_at
+             ) VALUES
+                ('profile-1', 1, 'api_key', 'vault://opaque-1', 'available', 'now', 'now'),
+                ('profile-2', 1, 'api_key', 'vault://opaque-2', 'available', 'now', 'now');
+             INSERT INTO provider_profile_revisions(
+                profile_id, revision, provider, model_id, parameters_json, credential_generation,
+                state, validation_id, created_at
+             ) VALUES
+                ('profile-1', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1,\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}', 1,
+                 'draft', NULL, 'now'),
+                ('profile-2', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1,\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}', 1,
+                 'draft', NULL, 'now');
+             INSERT INTO provider_validations(
+                validation_id, profile_id, revision, credential_generation, validation_digest,
+                tool_calls_supported, non_empty_tool_call_ids, multi_turn_tool_results,
+                context_limit, outcome, error_code, evidence_schema_version, checked_at
+             ) VALUES
+                ('validation-1', 'profile-1', 1, 1, 'digest-1', 1, 1, 1, 1, 'passed', NULL, 1, 'now'),
+                ('validation-2', 'profile-2', 1, 1, 'digest-2', 1, 1, 1, 1, 'passed', NULL, 1, 'now');
+             UPDATE provider_profile_revisions
+             SET state = 'ready', validation_id = 'validation-2'
+             WHERE profile_id = 'profile-2' AND revision = 1;",
+        )
+        .expect("seed ready revisions and matching validations");
+
+    let draft_binding_error = connection
+        .execute(
+            "INSERT INTO run_provider_bindings(
+                run_id, profile_id, revision, provider, model_id, parameters_json,
+                credential_generation, validation_id, validation_digest,
+                fingerprint_json, fingerprint_hash, created_at
+             ) VALUES (
+                'run-2', 'profile-1', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1,\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}',
+                1, 'validation-1', 'digest-1',
+                '{\"schema_version\":1,\"profile_id\":\"profile-1\",\"profile_revision\":1,\"provider\":\"deep_seek\",\"model\":{\"provider\":\"deep_seek\",\"value\":\"deepseek/model\"},\"parameters\":{\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}}',
+                '0000000000000000000000000000000000000000000000000000000000000000', 'now'
+             )",
+            [],
+        )
+        .expect_err("a Draft revision must not be snapshotted into a Run binding");
+    assert!(
+        draft_binding_error
+            .to_string()
+            .contains("Run Provider binding")
+    );
+    connection
+        .execute(
+            "UPDATE provider_profile_revisions
+             SET state = 'ready', validation_id = 'validation-1'
+             WHERE profile_id = 'profile-1' AND revision = 1",
+            [],
+        )
+        .expect("promote profile-1 only after passing validation");
+    connection
+        .execute(
+            "INSERT INTO active_provider(
+                singleton, profile_id, revision, validation_id, credential_generation,
+                validation_digest, activation_revision, activated_at
+             ) VALUES (1, 'profile-1', 1, 'validation-1', 1, 'digest-1', 1, 'now')",
+            [],
+        )
+        .expect("activate the matching ready revision");
+
+    let incomplete_fingerprint_error = connection
+        .execute(
+            "INSERT INTO run_provider_bindings(
+                run_id, profile_id, revision, provider, model_id, parameters_json,
+                credential_generation, validation_id, validation_digest,
+                fingerprint_json, fingerprint_hash, created_at
+             ) VALUES (
+                'run-2', 'profile-1', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1,\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}',
+                1, 'validation-1', 'digest-1',
+                '{\"schema_version\":1,\"profile_id\":\"profile-1\",\"profile_revision\":1,\"provider\":\"deep_seek\",\"model\":{\"provider\":\"deep_seek\",\"value\":\"deepseek/model\"},\"parameters\":{\"timeout_seconds\":30}}',
+                '0000000000000000000000000000000000000000000000000000000000000000', 'now'
+             )",
+            [],
+        )
+        .expect_err("fingerprints must include every canonical parameter");
+    assert!(
+        incomplete_fingerprint_error
+            .to_string()
+            .contains("non-sensitive schema")
+    );
+    let invalid_hash_error = connection
+        .execute(
+            "INSERT INTO run_provider_bindings(
+                run_id, profile_id, revision, provider, model_id, parameters_json,
+                credential_generation, validation_id, validation_digest,
+                fingerprint_json, fingerprint_hash, created_at
+             ) VALUES (
+                'run-2', 'profile-1', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1,\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}',
+                1, 'validation-1', 'digest-1',
+                '{\"schema_version\":1,\"profile_id\":\"profile-1\",\"profile_revision\":1,\"provider\":\"deep_seek\",\"model\":{\"provider\":\"deep_seek\",\"value\":\"deepseek/model\"},\"parameters\":{\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}}',
+                'not-a-sha256', 'now'
+             )",
+            [],
+        )
+        .expect_err("fingerprint hashes must use SHA-256 hexadecimal form");
+    assert!(invalid_hash_error.to_string().contains("CHECK"));
+
+    let fingerprint_error = connection
+        .execute(
+            "INSERT INTO run_provider_bindings(
+                run_id, profile_id, revision, provider, model_id, parameters_json,
+                credential_generation, validation_id, validation_digest,
+                fingerprint_json, fingerprint_hash, created_at
+             ) VALUES (
+                'run-1', 'profile-1', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1,\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}',
+                1, 'validation-1', 'digest-1',
+                '{\"schema_version\":1,\"profile_id\":\"profile-1\",\"profile_revision\":1,\"provider\":\"deep_seek\",\"model\":{\"provider\":\"deep_seek\",\"value\":\"deepseek/model\"},\"parameters\":{\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0,\"api_key\":\"canary-secret\"}}',
+                '0000000000000000000000000000000000000000000000000000000000000000', 'now'
+             )",
+            [],
+        )
+        .expect_err("fingerprint parameters must reject secret-shaped fields");
+    assert!(
+        fingerprint_error
+            .to_string()
+            .contains("non-sensitive schema")
+    );
+
+    let validation_error = connection
+        .execute(
+            "INSERT INTO run_provider_bindings(
+                run_id, profile_id, revision, provider, model_id, parameters_json,
+                credential_generation, validation_id, validation_digest,
+                fingerprint_json, fingerprint_hash, created_at
+             ) VALUES (
+                'run-1', 'profile-1', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1,\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}',
+                1, 'validation-2', 'digest-2',
+                '{\"schema_version\":1,\"profile_id\":\"profile-1\",\"profile_revision\":1,\"provider\":\"deep_seek\",\"model\":{\"provider\":\"deep_seek\",\"value\":\"deepseek/model\"},\"parameters\":{\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}}',
+                '0000000000000000000000000000000000000000000000000000000000000000', 'now'
+             )",
+            [],
+        )
+        .expect_err("run binding must not reference another Profile validation");
+    assert!(
+        validation_error
+            .to_string()
+            .contains("Run Provider binding")
+    );
+    let fingerprint_identity_error = connection
+        .execute(
+            "INSERT INTO run_provider_bindings(
+                run_id, profile_id, revision, provider, model_id, parameters_json,
+                credential_generation, validation_id, validation_digest,
+                fingerprint_json, fingerprint_hash, created_at
+             ) VALUES (
+                'run-1', 'profile-1', 1, 'deep_seek', 'deepseek/model', '{\"schema_version\":1,\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}',
+                1, 'validation-1', 'digest-1',
+                '{\"schema_version\":1,\"profile_id\":\"profile-1\",\"profile_revision\":2,\"provider\":\"deep_seek\",\"model\":{\"provider\":\"deep_seek\",\"value\":\"deepseek/model\"},\"parameters\":{\"temperature\":null,\"max_tokens\":null,\"timeout_seconds\":30,\"retry_count\":0}}',
+                '0000000000000000000000000000000000000000000000000000000000000000', 'now'
+             )",
+            [],
+        )
+        .expect_err("fingerprint identity must match the Run binding snapshot");
+    assert!(
+        fingerprint_identity_error
+            .to_string()
+            .contains("non-sensitive schema")
+    );
+    let validation_mutation_error = connection
+        .execute(
+            "UPDATE provider_validations SET outcome = 'failed', error_code = 'provider.model.incompatible'
+             WHERE validation_id = 'validation-1'",
+            [],
+        )
+        .expect_err("validation evidence must remain immutable after activation");
+    assert!(
+        validation_mutation_error
+            .to_string()
+            .contains("validations are insert-only")
+    );
+    let credential_mutation_error = connection
+        .execute(
+            "UPDATE provider_credential_generations SET vault_locator = 'vault://replaced'
+             WHERE profile_id = 'profile-1' AND generation = 1",
+            [],
+        )
+        .expect_err("credential generation identity must be immutable");
+    assert!(
+        credential_mutation_error
+            .to_string()
+            .contains("credential generations are immutable")
+    );
+    connection
+        .execute_batch("ROLLBACK")
+        .expect("discard fixture");
+}
+
+#[tokio::test]
+async fn failed_provider_migration_does_not_leave_partial_schema() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    let connection = Connection::open(&database).expect("open database");
+    connection
+        .execute_batch(
+            "CREATE TABLE provider_profiles (unexpected TEXT);
+             CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+             );",
+        )
+        .expect("seed incompatible schema");
+    drop(connection);
+
+    let error = SqliteRuntimeStore::open(&database)
+        .await
+        .expect_err("incompatible provider schema must reject migration");
+    assert!(error.to_string().contains("provider_profiles"));
+
+    let connection = Connection::open(&database).expect("inspect rejected migration");
+    let created_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN (
+                   'provider_profile_revisions', 'provider_credential_generations',
+                   'provider_validations', 'active_provider', 'credential_mutations',
+                   'run_provider_bindings'
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query partial provider schema");
+    assert_eq!(created_tables, 0);
+    let version_two: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = 2",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query rejected migration version");
+    assert_eq!(version_two, 0);
+}
 
 struct StoreFixture {
     _directory: TempDir,

@@ -34,7 +34,7 @@
   - _Depends: 1.2, 1.3_
 
 - [ ] 2. 建立 SQLite 持久化与跨存储一致性基础
-- [ ] 2.1 创建 Provider 管理 schema 与迁移约束
+- [x] 2.1 创建 Provider 管理 schema 与迁移约束
   - 在既有 runtime migration 之后原子创建 Profile identity/revision、Credential metadata、Validation evidence、Active singleton、Credential journal 与 Run binding 表和索引。
   - 用 foreign key、枚举/check、唯一名称、schema version 和 insert-only 规则表达设计中的所有持久化不变量；SQLite 不存任何秘密。
   - 增加从既有数据库升级、重复迁移、未知 JSON schema fail-closed 与空初始 active 状态测试。
