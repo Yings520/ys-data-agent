@@ -135,7 +135,7 @@
   - _Depends: 3.7_
 
 - [ ] 4. 实现 Provider 管理应用服务与兼容性门禁
-- [ ] 4.1 实现纯本地 Profile 与参数校验
+- [x] 4.1 实现纯本地 Profile 与参数校验
   - 校验唯一名称、必填字段、精确 allowlist/prefix、Credential 状态、五个通用参数的类型/范围/组合和 provider-specific 参数适用性。
   - 禁止 Profile 中出现 Base URL、auth origin 或 redirect 覆盖；Unsupported/Conditional 参数必须给出字段级可修复结果，不得静默忽略。
   - 任何本地错误必须在调用 Vault、model discovery 或网络 probe 前返回，并使已有 validation 在关键输入变化时失效。
