@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -275,4 +275,22 @@ test("direct implementation requires both repository execution policies", async 
     assert.match(contents, /read completely|完整读取/i);
     assert.match(contents, /blocked|stop|阻塞/i);
   }
+});
+
+test("repository has no Ralph runtime or compatibility assets", async () => {
+  for (const relativePath of [
+    ".ralph-tui",
+    ".ralph-tui-prompt.hbs",
+    "scripts/ralph-cc-sdd.sh",
+    "scripts/codex-ralph",
+    "tools/workflow/ralph-cc-sdd-launcher.test.mjs",
+  ]) {
+    await assert.rejects(stat(path.join(projectRoot, relativePath)), {
+      code: "ENOENT",
+    });
+  }
+  assert.doesNotMatch(
+    await readFile(path.join(projectRoot, ".gitignore"), "utf8"),
+    /ralph/i,
+  );
 });
