@@ -12,7 +12,7 @@ fn welcome_is_minimal_and_shows_safe_header_labels() {
         "ecommerce",
         "postgres-prod",
         "read-only",
-        "openai-compatible/test-model",
+        "Provider Profile",
     );
     let rendered = render_to_string(&app, 100, 28);
 
@@ -66,7 +66,7 @@ fn default_view_hides_internal_runtime_identifiers() {
         "ecommerce",
         "postgres-prod",
         "read-only",
-        "openai-compatible/test-model",
+        "Provider Profile",
     );
     let rendered = render_to_string(&app, 100, 28);
 

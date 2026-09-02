@@ -8,7 +8,7 @@ import { parseTasks, validateTasks } from "./cc-sdd-task-state.mjs";
 const FEATURE_NAME = /^[a-z0-9][a-z0-9._-]*$/;
 const TASK_ID = /^\d+(?:\.\d+)*$/;
 const DENIED_STAGED_PATH =
-  /^(?:\.env(?:\.|$))|(?:^|\/)(?:id_rsa|[^/]+\.(?:pem|key|p12))$/i;
+  /^(?:\.env(?!(?:\.example)$)(?:\.|$))|(?:^|\/)(?:id_rsa|[^/]+\.(?:pem|key|p12))$/i;
 
 export class PublicationError extends Error {
   constructor(message) {

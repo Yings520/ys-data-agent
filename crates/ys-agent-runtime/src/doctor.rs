@@ -311,7 +311,7 @@ impl WorkspaceDoctor {
         {
             blockers.push("model_protocol_incompatible".to_owned());
             repairs.push(
-                "Configure a reachable OpenAI-compatible model with tool calls, tool call IDs, multi-turn tool results, and a known context limit"
+                "Configure and validate a reachable Provider Profile with tool calls, tool call IDs, multi-turn tool results, and a known context limit"
                     .to_owned(),
             );
         }

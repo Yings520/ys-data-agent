@@ -257,7 +257,7 @@
   - _Requirements: 1.3, 2.1, 2.4, 2.7, 3.1, 3.4, 4.1, 4.2, 6.3, 6.4, 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7_
   - _Boundary: AgentServiceApi and TUI Provider management integration_
   - _Depends: 4.6, 4.7, 6.1, 6.2_
-- [ ] 6.6 切换 bootstrap 到唯一 Provider 管理生产路径
+- [x] 6.6 切换 bootstrap 到唯一 Provider 管理生产路径
   - 组装 repository、Vault、OAuth、catalog/evidence、factory、management service、resolver、Doctor 与 TUI，并在处理 journal 后才允许新 Query。
   - 删除 `YSDA_LLM_BASE_URL`、`YSDA_LLM_API_KEY`、`YSDA_LLM_MODEL` 读取和旧 OpenAI-compatible production export，不导入、迁移、回写或保留 feature flag。
   - 保留 Fake/Replay 测试入口和现有 Query 产品边界，生产模型调用全部穿过同一 core ModelProvider 契约。

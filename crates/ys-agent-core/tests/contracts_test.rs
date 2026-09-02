@@ -46,9 +46,9 @@ fn core_serializes_a_credential_reference_not_a_secret() {
 
 #[test]
 fn credential_reference_exposes_only_its_environment_variable_name() {
-    let reference = CredentialReference::new("env:YSDA_LLM_API_KEY").expect("valid ref");
+    let reference = CredentialReference::new("env:TEST_CREDENTIAL").expect("valid ref");
 
-    assert_eq!(reference.environment_variable_name(), "YSDA_LLM_API_KEY");
+    assert_eq!(reference.environment_variable_name(), "TEST_CREDENTIAL");
 }
 
 #[test]

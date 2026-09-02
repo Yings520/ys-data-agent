@@ -486,6 +486,19 @@ test("denies dotenv and private-key files even when declared", async () => {
   }
 });
 
+test("permits the repository's non-secret dotenv example file", async () => {
+  const { root } = await createRepository();
+  const examplePath = ".env.example";
+  await writeFile(path.join(root, examplePath), "EXAMPLE_VALUE=replace-me\n", "utf8");
+  run(root, "git", ["add", "-f", examplePath]);
+
+  const result = publish(root, {
+    paths: [tasksPath, sourcePath, examplePath],
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test("denies an empty staged diff", async () => {
   const { root } = await createRepository();
   run(root, "git", ["restore", "--staged", tasksPath, sourcePath]);
