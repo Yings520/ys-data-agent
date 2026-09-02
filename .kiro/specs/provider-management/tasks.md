@@ -16,7 +16,7 @@
   - _Requirements: 1.1, 1.2, 2.2, 2.3, 2.8, 3.4, 3.5, 3.10, 4.4, 4.7, 5.6, 6.5, 9.5, 9.6, 9.7, 11.2_
   - _Boundary: Core Provider types and domain invariants_
   - _Depends: 1.1_
-- [ ] 1.3 定义 Provider 管理 ports 与遮蔽视图契约
+- [x] 1.3 定义 Provider 管理 ports 与遮蔽视图契约
   - 为 Profile repository、Credential Vault、Provider client factory、model discovery、Run resolver、OAuth connection 和 Provider management service 建立厂商无关 ports。
   - 规定 compare-and-swap 前置条件、稳定错误 code/field/remediation、取消 operation ID，以及只含 Credential 状态的 TUI/Doctor view types。
   - 保持第三方 crate、Keyring 与 OAuth HTTP 类型不越过 adapter 边界，TUI 只通过既有 service API 访问能力。

@@ -503,6 +503,26 @@ impl ProfileRevision {
         self.state
     }
 
+    pub fn provider(&self) -> ProviderId {
+        self.provider
+    }
+
+    pub fn model(&self) -> &ProviderModelId {
+        &self.model
+    }
+
+    pub fn parameters(&self) -> &ProviderParameters {
+        &self.parameters
+    }
+
+    pub fn credential_generation(&self) -> Option<CredentialGeneration> {
+        self.credential_generation
+    }
+
+    pub fn validation(&self) -> Option<&CompatibilityEvidence> {
+        self.validation.as_ref()
+    }
+
     pub fn validation_inputs(&self, versions: ValidationVersions) -> ValidationInputs {
         ValidationInputs {
             profile_id: self.profile_id,
@@ -636,6 +656,7 @@ impl ProfileHistory {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ActiveProviderSnapshot {
+    activation_revision: u64,
     profile_id: ProfileId,
     profile_revision: u64,
     provider: ProviderId,
@@ -647,7 +668,7 @@ pub struct ActiveProviderSnapshot {
 }
 
 impl ActiveProviderSnapshot {
-    pub fn from_ready(revision: &ProfileRevision) -> CoreResult<Self> {
+    fn from_ready(revision: &ProfileRevision, activation_revision: u64) -> CoreResult<Self> {
         let evidence = revision.ready_evidence()?;
         let credential_generation = revision.credential_generation.ok_or_else(|| {
             CoreError::validation(
@@ -656,6 +677,7 @@ impl ActiveProviderSnapshot {
             )
         })?;
         Ok(Self {
+            activation_revision,
             profile_id: revision.profile_id,
             profile_revision: revision.revision,
             provider: revision.provider,
@@ -671,6 +693,10 @@ impl ActiveProviderSnapshot {
         self.profile_id
     }
 
+    pub fn activation_revision(&self) -> u64 {
+        self.activation_revision
+    }
+
     pub fn profile_revision(&self) -> u64 {
         self.profile_revision
     }
@@ -682,20 +708,36 @@ impl ActiveProviderSnapshot {
 
 /// A singleton active pointer. `None` is the explicit no-active management state.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub struct ActiveProviderSlot(Option<ActiveProviderSnapshot>);
+pub struct ActiveProviderSlot {
+    current: Option<ActiveProviderSnapshot>,
+    activation_revision: u64,
+}
 
 impl ActiveProviderSlot {
     pub const fn empty() -> Self {
-        Self(None)
+        Self {
+            current: None,
+            activation_revision: 0,
+        }
     }
 
     pub fn activate(&mut self, revision: &ProfileRevision) -> CoreResult<()> {
-        self.0 = Some(ActiveProviderSnapshot::from_ready(revision)?);
+        let activation_revision = self.activation_revision.checked_add(1).ok_or_else(|| {
+            CoreError::validation(
+                "activation_revision_overflow",
+                "activation revision cannot advance",
+            )
+        })?;
+        self.current = Some(ActiveProviderSnapshot::from_ready(
+            revision,
+            activation_revision,
+        )?);
+        self.activation_revision = activation_revision;
         Ok(())
     }
 
     pub fn current(&self) -> Option<&ActiveProviderSnapshot> {
-        self.0.as_ref()
+        self.current.as_ref()
     }
 }
 
@@ -882,13 +924,79 @@ pub enum ProviderRemediation {
     ContactSupport,
 }
 
-/// Closed set of Provider-management failure codes. Adapter implementations map external errors
-/// into this type before they leave their boundary.
+/// Stable broad classification for Provider failures. Callers render this alongside the error
+/// code instead of interpreting adapter-specific messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ProviderErrorCategory {
+    Authentication,
+    Model,
+    Capability,
+    RateLimit,
+    Timeout,
+    Network,
+    Server,
+    Protocol,
+    Credential,
+    OAuth,
+    Operation,
+    Storage,
+    Internal,
+}
+
+impl ProviderErrorCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Model => "model",
+            Self::Capability => "capability",
+            Self::RateLimit => "rate_limit",
+            Self::Timeout => "timeout",
+            Self::Network => "network",
+            Self::Server => "server",
+            Self::Protocol => "protocol",
+            Self::Credential => "credential",
+            Self::OAuth => "oauth",
+            Self::Operation => "operation",
+            Self::Storage => "storage",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Retry policy that is safe for a normalized Provider failure. `Bounded` always means the
+/// profile's configured retry bound; it never permits model or Provider fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRetryability {
+    Never,
+    Bounded,
+}
+
+impl ProviderRetryability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Bounded => "bounded",
+        }
+    }
+}
+
+/// Closed set of Provider-management failure codes. Adapter implementations map external errors
+/// into this type before they leave their boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderErrorCode {
     ProfileNameConflict,
     InvalidModelPrefix,
+    AuthenticationInvalid,
+    ModelNotFound,
+    ModelIncompatible,
+    RateLimited,
+    Timeout,
+    Network,
+    Server,
+    ProtocolInvalidResponse,
+    ProtocolInvalidToolCallId,
     CredentialMissing,
     CredentialProtectionUnavailable,
     OAuthNotConnected,
@@ -909,6 +1017,15 @@ impl ProviderErrorCode {
         match self {
             Self::ProfileNameConflict => "provider.profile.name_conflict",
             Self::InvalidModelPrefix => "provider.model.prefix_mismatch",
+            Self::AuthenticationInvalid => "provider.auth.invalid",
+            Self::ModelNotFound => "provider.model.not_found",
+            Self::ModelIncompatible => "provider.model.incompatible",
+            Self::RateLimited => "provider.rate_limited",
+            Self::Timeout => "provider.timeout",
+            Self::Network => "provider.network",
+            Self::Server => "provider.server",
+            Self::ProtocolInvalidResponse => "provider.protocol.invalid_response",
+            Self::ProtocolInvalidToolCallId => "provider.protocol.invalid_tool_call_id",
             Self::CredentialMissing => "provider.credential.missing",
             Self::CredentialProtectionUnavailable => "provider.credential.protection_unavailable",
             Self::OAuthNotConnected => "provider.oauth.not_connected",
@@ -923,6 +1040,91 @@ impl ProviderErrorCode {
             Self::StorageConflict => "provider.storage.conflict",
             Self::Internal => "provider.internal",
         }
+    }
+
+    pub const fn category(self) -> ProviderErrorCategory {
+        match self {
+            Self::ProfileNameConflict | Self::InvalidModelPrefix | Self::ModelNotFound => {
+                ProviderErrorCategory::Model
+            }
+            Self::AuthenticationInvalid => ProviderErrorCategory::Authentication,
+            Self::ModelIncompatible | Self::ProtocolIncompatible => {
+                ProviderErrorCategory::Capability
+            }
+            Self::RateLimited => ProviderErrorCategory::RateLimit,
+            Self::Timeout => ProviderErrorCategory::Timeout,
+            Self::Network | Self::DiscoveryFailed => ProviderErrorCategory::Network,
+            Self::Server => ProviderErrorCategory::Server,
+            Self::ProtocolInvalidResponse | Self::ProtocolInvalidToolCallId => {
+                ProviderErrorCategory::Protocol
+            }
+            Self::CredentialMissing | Self::CredentialProtectionUnavailable => {
+                ProviderErrorCategory::Credential
+            }
+            Self::OAuthNotConnected | Self::RemoteRevokeFailed => ProviderErrorCategory::OAuth,
+            Self::ValidationStale
+            | Self::ActivationPreconditionFailed
+            | Self::NoActiveProfile
+            | Self::OperationCancelled
+            | Self::OperationStale => ProviderErrorCategory::Operation,
+            Self::StorageConflict => ProviderErrorCategory::Storage,
+            Self::Internal => ProviderErrorCategory::Internal,
+        }
+    }
+
+    pub const fn retryability(self) -> ProviderRetryability {
+        match self {
+            Self::RateLimited | Self::Timeout | Self::Network | Self::Server => {
+                ProviderRetryability::Bounded
+            }
+            _ => ProviderRetryability::Never,
+        }
+    }
+}
+
+impl Serialize for ProviderErrorCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderErrorCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let code = match value.as_str() {
+            "provider.profile.name_conflict" => Self::ProfileNameConflict,
+            "provider.model.prefix_mismatch" => Self::InvalidModelPrefix,
+            "provider.auth.invalid" => Self::AuthenticationInvalid,
+            "provider.model.not_found" => Self::ModelNotFound,
+            "provider.model.incompatible" => Self::ModelIncompatible,
+            "provider.rate_limited" => Self::RateLimited,
+            "provider.timeout" => Self::Timeout,
+            "provider.network" => Self::Network,
+            "provider.server" => Self::Server,
+            "provider.protocol.invalid_response" => Self::ProtocolInvalidResponse,
+            "provider.protocol.invalid_tool_call_id" => Self::ProtocolInvalidToolCallId,
+            "provider.credential.missing" => Self::CredentialMissing,
+            "provider.credential.protection_unavailable" => Self::CredentialProtectionUnavailable,
+            "provider.oauth.not_connected" => Self::OAuthNotConnected,
+            "provider.validation.stale" => Self::ValidationStale,
+            "provider.activation.precondition_failed" => Self::ActivationPreconditionFailed,
+            "provider.no_active_profile" => Self::NoActiveProfile,
+            "provider.operation.cancelled" => Self::OperationCancelled,
+            "provider.operation.stale" => Self::OperationStale,
+            "provider.discovery.failed" => Self::DiscoveryFailed,
+            "provider.protocol.incompatible" => Self::ProtocolIncompatible,
+            "provider.oauth.remote_revoke_failed" => Self::RemoteRevokeFailed,
+            "provider.storage.conflict" => Self::StorageConflict,
+            "provider.internal" => Self::Internal,
+            _ => return Err(serde::de::Error::custom("unknown Provider error code")),
+        };
+        Ok(code)
     }
 }
 
@@ -950,6 +1152,14 @@ impl ProviderManagementError {
 
     pub const fn code(&self) -> &'static str {
         self.code.as_str()
+    }
+
+    pub const fn category(&self) -> ProviderErrorCategory {
+        self.code.category()
+    }
+
+    pub const fn retryability(&self) -> ProviderRetryability {
+        self.code.retryability()
     }
 
     pub fn field(&self) -> Option<&ProviderField> {
@@ -985,6 +1195,8 @@ pub struct ProfileSummary {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProfileDetail {
     pub summary: ProfileSummary,
+    pub revision: u64,
+    pub credential_generation: Option<CredentialGeneration>,
     pub model: ProviderModelId,
     pub parameters: ProviderParameters,
     pub validation_id: Option<ValidationId>,
@@ -1016,6 +1228,7 @@ pub struct CompatibilityEvidenceView {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ActiveProviderView {
+    pub activation_revision: u64,
     pub profile_id: ProfileId,
     pub profile_revision: u64,
     pub provider: ProviderId,
@@ -1026,6 +1239,7 @@ pub struct ActiveProviderView {
 impl From<&ActiveProviderSnapshot> for ActiveProviderView {
     fn from(snapshot: &ActiveProviderSnapshot) -> Self {
         Self {
+            activation_revision: snapshot.activation_revision,
             profile_id: snapshot.profile_id,
             profile_revision: snapshot.profile_revision,
             provider: snapshot.provider,
@@ -1093,7 +1307,7 @@ pub struct CredentialPointerCommit {
     pub mutation_id: OperationId,
     pub profile_id: ProfileId,
     pub expected_revision: u64,
-    pub new_generation: CredentialGeneration,
+    pub new_generation: Option<CredentialGeneration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1132,14 +1346,51 @@ impl CredentialLease {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderClientBinding {
-    pub run_binding: RunProviderBinding,
+    pub profile_id: ProfileId,
+    pub profile_revision: u64,
+    pub provider: ProviderId,
+    pub model: ProviderModelId,
+    pub parameters: ProviderParameters,
+    pub credential_generation: CredentialGeneration,
+}
+
+impl ProviderClientBinding {
+    pub fn from_revision(revision: &ProfileRevision) -> CoreResult<Self> {
+        let credential_generation = revision.credential_generation().ok_or_else(|| {
+            CoreError::validation(
+                "credential_missing",
+                "a Provider client requires a credential generation",
+            )
+        })?;
+        Ok(Self {
+            profile_id: revision.profile_id(),
+            profile_revision: revision.revision(),
+            provider: revision.provider(),
+            model: revision.model().clone(),
+            parameters: revision.parameters().clone(),
+            credential_generation,
+        })
+    }
+
+    pub fn from_run_binding(binding: &RunProviderBinding) -> Self {
+        Self {
+            profile_id: binding.active.profile_id,
+            profile_revision: binding.active.profile_revision,
+            provider: binding.active.provider,
+            model: binding.active.model.clone(),
+            parameters: binding.active.parameters.clone(),
+            credential_generation: binding.active.credential_generation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscoverModelsRequest {
     pub operation_id: OperationId,
     pub profile_id: ProfileId,
-    pub binding: ProviderClientBinding,
+    pub profile_revision: u64,
+    pub provider: ProviderId,
+    pub credential_generation: CredentialGeneration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1161,15 +1412,31 @@ pub struct SaveProfileRequest {
     pub revision: SaveProfileRevision,
 }
 
+/// The only two Credential mutations supported by the service boundary. A deletion carries no
+/// secret value, which makes it safe to issue from a masked TUI command.
+pub enum CredentialMutation {
+    Replace(ProtectedCredentialWrite),
+    Delete,
+}
+
 pub struct CredentialMutationRequest {
     pub intent: CredentialMutationIntent,
-    pub write: ProtectedCredentialWrite,
+    pub mutation: CredentialMutation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveRevisionPrecondition {
+    pub profile_id: ProfileId,
+    pub revision: u64,
+    pub activation_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteProfileRequest {
     pub operation_id: OperationId,
     pub profile_id: ProfileId,
+    pub expected_revision: u64,
+    pub expected_active: Option<ActiveRevisionPrecondition>,
     pub enter_no_active_provider: bool,
 }
 

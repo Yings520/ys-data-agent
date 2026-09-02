@@ -1,13 +1,23 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::{
-    AllowedDataScope, ArtifactAccessContext, ArtifactMetadata, ArtifactRef, CommandId,
-    CommandReceipt, ContextEvidence, CoreResult, EventEnvelope, FreshnessObservation,
-    MetricDefinition, ModelCapabilities, ModelRequest, ModelResponse, ObservedSchema,
-    PendingRunEvent, Principal, PutArtifact, QueryBudget, QueryPreflight, QueryRequest,
-    QueryResult, RunId, RunSnapshot, Session, SessionId, SourceId, Task, TaskId, ToolCallId,
-    ToolOutcome, ToolSpec, WorkspaceId,
+    ActivateProfileRequest, ActiveProviderSnapshot, ActiveProviderView, AllowedDataScope,
+    ArtifactAccessContext, ArtifactMetadata, ArtifactRef, CommandId, CommandReceipt,
+    CompatibilityEvidenceView, ContextEvidence, CoreResult, CredentialLease,
+    CredentialMutationIntent, CredentialMutationRequest, CredentialPointerCommit,
+    CredentialProtectionStatus, CredentialViewStatus, DeleteProfileRequest,
+    DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, EventEnvelope,
+    FreshnessObservation, MetricDefinition, ModelCapabilities, ModelRequest, ModelResponse,
+    OAuthConnectionView, ObservedSchema, OperationId, PendingRunEvent, Principal, ProfileDetail,
+    ProfileId, ProfileRevision, ProfileSummary, ProtectedCredentialWrite, ProviderCatalogView,
+    ProviderClientBinding, ProviderCredentialReference, ProviderDoctorView, ProviderResult,
+    PutArtifact, QueryBudget, QueryPreflight, QueryRequest, QueryResult, RemoteRevocationOutcome,
+    ResolvedRunProvider, RunId, RunSnapshot, SaveProfileRequest, SaveProfileRevision, Session,
+    SessionId, SourceId, Task, TaskId, ToolCallId, ToolOutcome, ToolSpec, ValidateProfileRequest,
+    ValidationCommit, WorkspaceId,
 };
 
 /// Atomic control-plane mutation unit for RuntimeStore::commit_command.
@@ -137,4 +147,214 @@ pub trait MetricProvider: Send + Sync {
 #[async_trait]
 pub trait QueryContextProvider: Send + Sync {
     async fn load_evidence(&self, query: &str) -> CoreResult<Vec<ContextEvidence>>;
+}
+
+/// Durable Provider profile state. Every mutation includes an explicit compare-and-swap
+/// precondition so a late operation cannot replace a newer revision or active selection.
+#[async_trait]
+pub trait ProviderProfileRepository: Send + Sync {
+    async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>>;
+
+    async fn load_revision(
+        &self,
+        profile_id: ProfileId,
+        revision: u64,
+    ) -> ProviderResult<ProfileRevision>;
+
+    async fn save_revision(&self, request: SaveProfileRevision) -> ProviderResult<ProfileRevision>;
+
+    async fn save_validation(&self, commit: ValidationCommit) -> ProviderResult<ProfileRevision>;
+
+    async fn activate(
+        &self,
+        request: ActivateProfileRequest,
+    ) -> ProviderResult<ActiveProviderSnapshot>;
+
+    async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>>;
+
+    async fn begin_credential_mutation(
+        &self,
+        intent: CredentialMutationIntent,
+    ) -> ProviderResult<OperationId>;
+
+    async fn commit_credential_pointer(
+        &self,
+        commit: CredentialPointerCommit,
+    ) -> ProviderResult<()>;
+
+    async fn pending_credential_mutations(&self) -> ProviderResult<Vec<CredentialMutationIntent>>;
+
+    async fn delete_profile(&self, request: DeleteProfileRequest) -> ProviderResult<()>;
+}
+
+/// Immutable binding persistence is separate from Profile management so the runtime can resolve
+/// a Run without reading the mutable active pointer.
+#[async_trait]
+pub trait RunProviderBindingRepository: Send + Sync {
+    async fn load_run_binding(&self, run_id: RunId) -> ProviderResult<crate::RunProviderBinding>;
+}
+
+/// OS-backed credential boundary. The only data that reaches a caller is a short-lived opaque
+/// lease; locator and secret text never enter Profile, TUI, Doctor, or runtime view types.
+#[async_trait]
+pub trait CredentialVault: Send + Sync {
+    async fn protection_status(&self) -> ProviderResult<CredentialProtectionStatus>;
+
+    async fn credential_status(
+        &self,
+        reference: ProviderCredentialReference,
+    ) -> ProviderResult<CredentialViewStatus>;
+
+    async fn write_generation(&self, input: ProtectedCredentialWrite) -> ProviderResult<()>;
+
+    async fn read_generation(
+        &self,
+        reference: ProviderCredentialReference,
+    ) -> ProviderResult<CredentialLease>;
+
+    async fn delete_generation(&self, reference: ProviderCredentialReference)
+    -> ProviderResult<()>;
+}
+
+/// Factory contract shared by production adapters and deterministic Fake/Replay implementations.
+/// Provider-specific client, HTTP, and `liter-llm` types must not appear in this signature.
+#[async_trait]
+pub trait ProviderClientFactory: Send + Sync {
+    async fn build(
+        &self,
+        binding: ProviderClientBinding,
+        credential: CredentialLease,
+    ) -> ProviderResult<Arc<dyn ModelProvider>>;
+}
+
+/// Discovery is independent from client construction so discovery failures remain recoverable and
+/// a caller can retain a Draft for manual model entry.
+#[async_trait]
+pub trait ModelDiscovery: Send + Sync {
+    async fn discover(
+        &self,
+        request: DiscoverModelsRequest,
+        credential: CredentialLease,
+    ) -> ProviderResult<Vec<DiscoveredModel>>;
+}
+
+#[async_trait]
+pub trait RunModelProviderResolver: Send + Sync {
+    async fn resolve(&self, run_id: RunId) -> ProviderResult<ResolvedRunProvider>;
+}
+
+#[async_trait]
+pub trait OAuthConnectionService: Send + Sync {
+    /// Returns only the masked OAuth connection state and its safe remediation.
+    async fn view(&self, profile_id: ProfileId) -> ProviderResult<OAuthConnectionView>;
+
+    async fn start(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<DeviceAuthorizationView>;
+
+    async fn complete(&self, operation_id: OperationId) -> ProviderResult<OAuthConnectionView>;
+
+    async fn refresh(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<OAuthConnectionView>;
+
+    async fn reauthorize(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<DeviceAuthorizationView>;
+
+    async fn logout(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<RemoteRevocationOutcome>;
+}
+
+/// The service-facing, vendor-neutral capability boundary. TUI and Doctor depend on these masked
+/// types only; they never receive a repository, Vault, OAuth transport, or HTTP client.
+#[async_trait]
+pub trait ProviderManagementApi: Send + Sync {
+    async fn catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>>;
+
+    async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>>;
+
+    async fn load_profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail>;
+
+    async fn save_profile(&self, request: SaveProfileRequest) -> ProviderResult<ProfileDetail>;
+
+    /// Copies non-sensitive, applicable configuration into a new Draft without sharing a
+    /// Credential or validation result with the source Profile.
+    async fn copy_profile(
+        &self,
+        source: ProfileId,
+        name: crate::ProfileName,
+    ) -> ProviderResult<ProfileDetail>;
+
+    /// Replaces or deletes one Profile-exclusive Credential. Deletion has no secret payload.
+    async fn mutate_credential(
+        &self,
+        request: CredentialMutationRequest,
+    ) -> ProviderResult<ProfileDetail>;
+
+    async fn delete_profile(&self, request: DeleteProfileRequest) -> ProviderResult<()>;
+
+    async fn discover_models(
+        &self,
+        request: DiscoverModelsRequest,
+    ) -> ProviderResult<Vec<DiscoveredModel>>;
+
+    async fn validate_profile(
+        &self,
+        request: ValidateProfileRequest,
+    ) -> ProviderResult<CompatibilityEvidenceView>;
+
+    async fn activate(&self, request: ActivateProfileRequest)
+    -> ProviderResult<ActiveProviderView>;
+
+    async fn credential_status(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<CredentialViewStatus>;
+
+    /// Returns the masked OAuth connection state for one Profile.
+    async fn oauth_connection(&self, profile_id: ProfileId) -> ProviderResult<OAuthConnectionView>;
+
+    /// Returns the Provider-related Doctor findings without accessing Credential contents.
+    async fn doctor(&self) -> ProviderResult<ProviderDoctorView>;
+
+    async fn cancel_operation(&self, operation_id: OperationId) -> ProviderResult<()>;
+
+    async fn start_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<DeviceAuthorizationView>;
+
+    async fn complete_oauth(
+        &self,
+        operation_id: OperationId,
+    ) -> ProviderResult<OAuthConnectionView>;
+
+    async fn refresh_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<OAuthConnectionView>;
+
+    async fn reauthorize_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<DeviceAuthorizationView>;
+
+    async fn logout_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<RemoteRevocationOutcome>;
 }

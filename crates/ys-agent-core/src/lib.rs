@@ -58,19 +58,20 @@ pub use ports::{
 };
 pub use provider::{
     ActivateProfileRequest, ActivationPrecondition, ActiveProviderSlot, ActiveProviderSnapshot,
-    ActiveProviderView, CompatibilityEvidence, CompatibilityEvidenceView, CredentialGeneration,
-    CredentialKind, CredentialLease, CredentialMutationIntent, CredentialMutationRequest,
+    ActiveProviderView, ActiveRevisionPrecondition, CompatibilityEvidence,
+    CompatibilityEvidenceView, CredentialGeneration, CredentialKind, CredentialLease,
+    CredentialMutation, CredentialMutationIntent, CredentialMutationRequest,
     CredentialPointerCommit, CredentialProtectionStatus, CredentialViewStatus,
     DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
     OAuthConnectionStatus, OAuthConnectionView, ParameterApplicability, ParameterValue,
     ProfileDetail, ProfileHistory, ProfileName, ProfileRevision, ProfileState, ProfileSummary,
     ProtectedCredentialWrite, ProviderCatalogView, ProviderClientBinding,
-    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField,
-    ProviderFingerprint, ProviderId, ProviderManagementError, ProviderModelId,
+    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCategory, ProviderErrorCode,
+    ProviderField, ProviderFingerprint, ProviderId, ProviderManagementError, ProviderModelId,
     ProviderParameterKey, ProviderParameters, ProviderProfile, ProviderProfileRevision,
-    ProviderRemediation, ProviderResult, ProviderSupportStatus, RemoteRevocationOutcome,
-    ResolvedRunProvider, RevisionPrecondition, RunProviderBinding, SaveProfileRequest,
-    SaveProfileRevision, SecretValue, ValidateProfileRequest, ValidationCommit,
+    ProviderRemediation, ProviderResult, ProviderRetryability, ProviderSupportStatus,
+    RemoteRevocationOutcome, ResolvedRunProvider, RevisionPrecondition, RunProviderBinding,
+    SaveProfileRequest, SaveProfileRevision, SecretValue, ValidateProfileRequest, ValidationCommit,
     ValidationCommitPrecondition, ValidationDigest, ValidationInputs, ValidationVersions,
 };
 
