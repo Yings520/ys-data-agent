@@ -290,7 +290,7 @@
   - _Requirements: 3.5, 3.6, 6.5, 6.6, 6.7, 9.5, 9.6, 9.7_
   - _Boundary: Runtime Provider binding concurrency tests_
   - _Depends: 5.3, 6.6_
-- [ ] 7.4 (P) 建立跨输出面的 Credential canary 扫描
+- [x] 7.4 (P) 建立跨输出面的 Credential canary 扫描
   - 将唯一 canary secret 注入 API key、OAuth token、Provider 回显与失败路径，扫描 tracing、errors、SQLite、events、artifacts、TUI snapshots、evidence fixtures 和 panic output。
   - 同时验证普通配置、环境变量回写、clipboard/reveal 与 crash report 均不是秘密出口。
   - 完成后，任一 canary 命中都会稳定使测试失败，正常全路径命中数为零。
