@@ -378,3 +378,7 @@ fn parameter_incompatible(key: ProviderParameterKey) -> ProviderManagementError 
 #[cfg(test)]
 #[path = "liter_tests.rs"]
 mod liter_tests;
+
+#[cfg(test)]
+#[path = "liter_http_tests.rs"]
+mod liter_http_tests;

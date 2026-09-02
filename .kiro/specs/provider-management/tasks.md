@@ -267,7 +267,7 @@
   - _Depends: 3.2, 3.3, 3.7, 4.7, 5.3, 6.3, 6.4, 6.5_
 
 - [ ] 7. 完成跨边界自动化验证与发布证据门禁
-- [ ] 7.1 (P) 建立九 Provider 本地 transport contract fixtures
+- [x] 7.1 (P) 建立九 Provider 本地 transport contract fixtures
   - 使用本地 HTTP fixture server 驱动真实 `liter-llm` client 路径，覆盖八个 Chat codec、ChatGPT Responses、多轮 tool ID、context、参数与稳定错误矩阵。
   - 断言 `load_env(false)`、固定 endpoint、无 custom URL、无 fallback feature、无秘密/raw body 泄露，并验证 bounded retry 分类。
   - 完成后，九类 transport contract tests 可在无真实 Credential、无外网和无客户数据的环境中确定性通过。
