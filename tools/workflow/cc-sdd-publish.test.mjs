@@ -98,7 +98,7 @@ printf '%s\\n' "$*" >> "$RTK_CALL_LOG"
 if [ "$1 $2" = "proxy git" ]; then
   shift 2
   if [ "\${RTK_PROXY_WRITES_DENIED:-}" = "1" ] && { [ "$1" = "commit" ] || [ "$1" = "push" ]; }; then
-    printf '%s\\n' 'proxy git writes are denied by the Ralph sandbox' >&2
+    printf '%s\\n' 'proxy git writes are denied' >&2
     exit 126
   fi
   exec "$REAL_GIT" "$@"
@@ -121,8 +121,8 @@ exit 64
   await chmod(path.join(fakeBin, "rtk"), 0o755);
 
   run(root, "git", ["init", "-b", "master"]);
-  run(root, "git", ["config", "user.name", "Ralph Test"]);
-  run(root, "git", ["config", "user.email", "ralph@example.test"]);
+  run(root, "git", ["config", "user.name", "cc-sdd Test"]);
+  run(root, "git", ["config", "user.email", "cc-sdd@example.test"]);
   await writeFile(path.join(root, "README.md"), "fixture\n", "utf8");
   await writeFile(path.join(root, tasksPath), uncheckedTasks, "utf8");
   await writeFile(
@@ -176,8 +176,6 @@ function publish(root, options = {}) {
       GH_PR_STATE: path.join(root, ".gh-pr-state"),
       REAL_GIT: "/usr/bin/git",
       RTK_CALL_LOG: path.join(root, ".rtk-calls"),
-      CC_SDD_DISPATCH_FEATURE: feature,
-      CC_SDD_DISPATCH_TASK_ID: selectedTaskId,
       ...options.env,
     },
   });
@@ -194,8 +192,6 @@ function validateFeature(root, options = {}) {
       GH_PR_STATE: path.join(root, ".gh-pr-state"),
       REAL_GIT: "/usr/bin/git",
       RTK_CALL_LOG: path.join(root, ".rtk-calls"),
-      CC_SDD_DISPATCH_FEATURE: feature,
-      CC_SDD_DISPATCH_TASK_ID: "VALIDATE",
       ...options.env,
     },
   });
@@ -286,7 +282,7 @@ test("uses raw RTK proxy output for machine-readable Git commands", async () => 
   );
 });
 
-test("routes Git mutations through the Ralph sandbox-compatible RTK command", async () => {
+test("routes Git mutations through the writable RTK command", async () => {
   const { root } = await createRepository();
 
   const result = publish(root, {
@@ -460,11 +456,9 @@ test("VALIDATE retry is idempotent after the PR is already Ready", async () => {
   assert.equal(run(root, "git", ["rev-parse", "HEAD"]), validationHead);
 });
 
-test("denies publication when dispatch identity does not match", async () => {
+test("denies a task ID that does not match the staged checkbox delta", async () => {
   const { root } = await createRepository();
-  assertDenied(
-    publish(root, { env: { CC_SDD_DISPATCH_TASK_ID: "1.2" } }),
-  );
+  assertDenied(publish(root, { taskId: "1.2" }));
 });
 
 test("denies publication from any branch except the exact feature branch", async () => {
@@ -480,8 +474,8 @@ test("denies staged paths that were not declared", async () => {
   assertDenied(publish(root));
 });
 
-test("denies Ralph runtime state and dotenv files even when declared", async () => {
-  for (const deniedPath of [".ralph-tui/session.json", ".env"]) {
+test("denies dotenv and private-key files even when declared", async () => {
+  for (const deniedPath of [".env", "secrets/id_rsa"]) {
     const { root } = await createRepository();
     await mkdir(path.dirname(path.join(root, deniedPath)), { recursive: true });
     await writeFile(path.join(root, deniedPath), "secret\n", "utf8");
@@ -504,7 +498,7 @@ test("denies a task commit without the staged authoritative tasks file", async (
   assertDenied(publish(root, { paths: [sourcePath] }));
 });
 
-test("denies a tasks diff that completes any task other than the dispatch", async () => {
+test("denies a tasks diff that completes more than the selected task", async () => {
   const { root } = await createRepository();
   await writeFile(
     path.join(root, tasksPath),

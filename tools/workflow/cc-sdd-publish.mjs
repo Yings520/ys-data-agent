@@ -8,7 +8,7 @@ import { parseTasks, validateTasks } from "./cc-sdd-task-state.mjs";
 const FEATURE_NAME = /^[a-z0-9][a-z0-9._-]*$/;
 const TASK_ID = /^\d+(?:\.\d+)*$/;
 const DENIED_STAGED_PATH =
-  /^(?:\.ralph-tui\/|\.env(?:\.|$))|(?:^|\/)(?:id_rsa|[^/]+\.(?:pem|key|p12))$/i;
+  /^(?:\.env(?:\.|$))|(?:^|\/)(?:id_rsa|[^/]+\.(?:pem|key|p12))$/i;
 
 export class PublicationError extends Error {
   constructor(message) {
@@ -65,8 +65,7 @@ function git(root, args) {
 }
 
 function mutateGit(root, args) {
-  // Ralph's workspace permission profile authorizes the dedicated RTK Git command to mutate
-  // `.git`; the generic raw proxy is read-only in that sandbox.
+  // Use RTK's Git command for repository mutation and its raw proxy only for reads.
   return runRtkGit(root, ["git"], args);
 }
 
@@ -275,19 +274,13 @@ function requireSelectedTaskDelta(root, taskId, tasksPath) {
   }
 
   if (passStateDelta.length !== 1 || passStateDelta[0] !== taskId) {
-    throw new PublicationError("task completion delta does not match dispatch");
+    throw new PublicationError("task completion delta does not match task ID");
   }
 }
 
 export async function publishTask(feature, taskId, paths, root = process.cwd()) {
   if (!FEATURE_NAME.test(feature ?? "") || !TASK_ID.test(taskId ?? "")) {
     throw new PublicationError("invalid feature or task identity");
-  }
-  if (
-    process.env.CC_SDD_DISPATCH_FEATURE !== feature ||
-    process.env.CC_SDD_DISPATCH_TASK_ID !== taskId
-  ) {
-    throw new PublicationError("publication does not match dispatch");
   }
   if (paths.length === 0 || new Set(paths).size !== paths.length) {
     throw new PublicationError("publication paths must be unique and nonempty");
@@ -419,12 +412,6 @@ export async function publishValidation(
 ) {
   if (!FEATURE_NAME.test(feature ?? "")) {
     throw new PublicationError("invalid validation feature identity");
-  }
-  if (
-    env.CC_SDD_DISPATCH_FEATURE !== feature ||
-    env.CC_SDD_DISPATCH_TASK_ID !== "VALIDATE"
-  ) {
-    throw new PublicationError("validation does not match dispatch");
   }
   const branch = git(root, ["branch", "--show-current"]).trim();
   if (branch !== expectedBranch(feature)) {
