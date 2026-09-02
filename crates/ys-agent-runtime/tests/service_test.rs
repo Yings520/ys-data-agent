@@ -19,6 +19,9 @@ use ys_agent_runtime::{
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
+#[path = "support/provider_fixture.rs"]
+mod provider_fixture;
+
 #[derive(Default)]
 struct CountingScheduler {
     scheduled: Mutex<Vec<RunId>>,
@@ -86,7 +89,9 @@ impl ServiceFixture {
         );
         if bind_runs {
             service = service.with_run_provider_binding_source(Arc::new(
-                StaticRunProviderBindingSource::for_test(),
+                StaticRunProviderBindingSource::from_active(
+                    provider_fixture::persisted_test_active_provider(store.as_ref()).await,
+                ),
             ));
         }
         if let Some(model) = model {

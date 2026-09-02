@@ -295,6 +295,10 @@ pub struct StaticRunProviderBindingSource {
 }
 
 impl StaticRunProviderBindingSource {
+    pub fn from_active(active: ys_agent_core::ActiveProviderSnapshot) -> Self {
+        Self { active }
+    }
+
     pub fn for_test() -> Self {
         let profile_id = ProfileId::new();
         let versions =
@@ -315,10 +319,10 @@ impl StaticRunProviderBindingSource {
         revision
             .accept_validation(evidence, versions)
             .expect("test validation evidence matches");
-        Self {
-            active: ys_agent_core::ActiveProviderSnapshot::from_ready(&revision, 1)
+        Self::from_active(
+            ys_agent_core::ActiveProviderSnapshot::from_ready(&revision, 1)
                 .expect("test active snapshot is valid"),
-        }
+        )
     }
 }
 

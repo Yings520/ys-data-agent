@@ -13,6 +13,8 @@ use ys_agent_core::{
     QueryExecutionPlan, QueryPlan, RuntimeStore, SourceId, ToolCall, ToolCallId,
 };
 
+mod provider_fixture;
+
 #[derive(Debug, Clone)]
 pub enum ScriptedAction {
     Response(ModelResponse),
@@ -295,6 +297,8 @@ impl QueryWorkflowFixture {
                 .await
                 .expect("runtime store"),
         );
+        let active_provider =
+            provider_fixture::persisted_test_active_provider(runtime.as_ref()).await;
         let artifacts = Arc::new(
             ys_agent_store::LocalArtifactStore::new(directory.path()).expect("artifact store"),
         );
@@ -308,7 +312,7 @@ impl QueryWorkflowFixture {
                 Arc::new(ys_agent_runtime::NoopRunScheduler),
             )
             .with_run_provider_binding_source(Arc::new(
-                ys_agent_runtime::StaticRunProviderBindingSource::for_test(),
+                ys_agent_runtime::StaticRunProviderBindingSource::from_active(active_provider),
             )),
         );
         let session = ys_agent_runtime::AgentServiceApi::create_session(
@@ -1308,6 +1312,7 @@ async fn open_runtime_components(
 ) -> ys_agent_core::CoreResult<RuntimeComponents> {
     let runtime =
         Arc::new(ys_agent_store::SqliteRuntimeStore::open(database_path.to_path_buf()).await?);
+    let active_provider = provider_fixture::persisted_test_active_provider(runtime.as_ref()).await;
     let artifacts = Arc::new(ys_agent_store::LocalArtifactStore::new(artifact_root)?);
     let model: Arc<dyn ys_agent_core::ModelProvider> =
         Arc::new(ys_agent_adapters::model::FakeModelProvider::new({
@@ -1361,7 +1366,7 @@ async fn open_runtime_components(
             Arc::new(ys_agent_runtime::NoopRunScheduler),
         )
         .with_run_provider_binding_source(Arc::new(
-            ys_agent_runtime::StaticRunProviderBindingSource::for_test(),
+            ys_agent_runtime::StaticRunProviderBindingSource::from_active(active_provider),
         )),
     );
     let recovery = Arc::new(ys_agent_runtime::RecoveryManager::new(runtime.clone()));

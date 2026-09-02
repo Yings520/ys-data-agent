@@ -68,14 +68,15 @@
   - _Depends: 1.4, 2.2, 2.3_
 
 - [ ] 3. 实现可独立推进的 Provider 与安全 adapters
-- [ ] 3.1 (P) 实现受治理 Catalog 与证据派生状态
+- [x] 3.1 (P) 实现受治理 Catalog 与证据派生状态
   - 定义且仅定义九个 Provider 的名称、prefix、认证类型、固定 endpoint key、参数规则、发现能力和 RequiredEvidence。
   - 从 catalog/model/codec/`liter-llm` 版本 digest 与批准 evidence hashes 派生 Supported、Candidate 或 Blocked；静态 registry 声明不能直接产生 Supported。
   - 返回每个非 Supported 条目的具体 EvidenceGap，并排除目录外 Provider 和 `openai/`。
+  - 修复已发布 2.4 的下游 Fake/Replay runtime 测试夹具，使内存 binding 与 SQLite active snapshot 同源，不放宽生产校验。
   - 完成后，离线 catalog 测试精确得到九项，任何证据缺失或 digest 变化都会降级支持状态并说明原因。
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 4.6, 4.7, 5.4, 5.8, 11.4, 11.5, 11.6_
-  - _Boundary: GovernedProviderCatalog and EvidenceRegistry_
-  - _Depends: 1.2_
+  - _Boundary: GovernedProviderCatalog, EvidenceRegistry, and Runtime Fake/Replay active-binding test fixture reconciliation_
+  - _Depends: 1.2, 2.4_
 - [ ] 3.2 (P) 实现 OS 原生 Credential Vault
   - 使用固定 service 和不可猜测 profile UUID/generation locator，把 API key 或 OAuth bundle 作为版本化 envelope 仅写入原生 Credential Store。
   - 启动时执行不回显秘密的 create/read/delete protection probe；无法确认 native protection 时拒绝写入，不提供文件、env 或明文 fallback。

@@ -1284,6 +1284,7 @@ pub async fn assemble_deterministic_query_runtime(
     let source_id = SourceId::new("sqlite_demo");
     let query_budget = QueryBudget::default();
     let runtime = Arc::new(ys_agent_store::SqliteRuntimeStore::open(&config.runtime_path).await?);
+    let active_provider = seed_deterministic_active_provider(runtime.as_ref()).await?;
     let artifacts = Arc::new(ys_agent_store::LocalArtifactStore::new(
         &config.artifact_path,
     )?);
@@ -1387,7 +1388,9 @@ pub async fn assemble_deterministic_query_runtime(
     });
     let service: Arc<dyn AgentServiceApi> = Arc::new(
         InProcessAgentService::new(workspace_id, runtime_store, artifact_store, scheduler)
-            .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::for_test())),
+            .with_run_provider_binding_source(Arc::new(
+                StaticRunProviderBindingSource::from_active(active_provider),
+            )),
     );
     Ok(DeterministicRuntimeAssembly {
         service,
@@ -1395,6 +1398,118 @@ pub async fn assemble_deterministic_query_runtime(
         principal,
         phase_tool_view_hashes,
     })
+}
+
+async fn seed_deterministic_active_provider(
+    runtime: &ys_agent_store::SqliteRuntimeStore,
+) -> CoreResult<ys_agent_core::ActiveProviderSnapshot> {
+    fn fixture_error(error: ys_agent_core::ProviderManagementError) -> CoreError {
+        CoreError::validation("deterministic_provider_fixture_failed", error.code())
+    }
+
+    let repository = runtime.provider_repository();
+    let profile_id = ys_agent_core::ProfileId::new();
+    let name = ys_agent_core::ProfileName::new("Deterministic Replay Provider")?;
+    let model = ys_agent_core::ProviderModelId::new(
+        ys_agent_core::ProviderId::DeepSeek,
+        "deepseek/deterministic-replay",
+    )?;
+    repository
+        .save_revision(ys_agent_core::SaveProfileRevision {
+            precondition: ys_agent_core::RevisionPrecondition {
+                profile_id,
+                expected_current_revision: None,
+            },
+            name,
+            revision: ys_agent_core::ProfileRevision::draft(
+                profile_id,
+                1,
+                ys_agent_core::ProviderId::DeepSeek,
+                model.clone(),
+                ys_agent_core::ProviderParameters::default(),
+                None,
+            )?,
+        })
+        .await
+        .map_err(fixture_error)?;
+
+    let credential = ys_agent_core::CredentialGeneration::new(
+        profile_id,
+        1,
+        ys_agent_core::CredentialKind::ApiKey,
+    )?;
+    let mutation_id = ys_agent_core::OperationId::new();
+    repository
+        .begin_credential_mutation(ys_agent_core::CredentialMutationIntent::create(
+            mutation_id,
+            profile_id,
+            1,
+            credential,
+        )?)
+        .await
+        .map_err(fixture_error)?;
+    repository
+        .record_credential_vault_write(mutation_id)
+        .await
+        .map_err(fixture_error)?;
+    let candidate = ys_agent_core::ProfileRevision::draft(
+        profile_id,
+        2,
+        ys_agent_core::ProviderId::DeepSeek,
+        model,
+        ys_agent_core::ProviderParameters::default(),
+        Some(credential),
+    )?;
+    repository
+        .commit_credential_pointer(ys_agent_core::CredentialPointerCommit::new(
+            mutation_id,
+            profile_id,
+            1,
+            candidate.clone(),
+        )?)
+        .await
+        .map_err(fixture_error)?;
+    repository
+        .complete_credential_mutation(mutation_id)
+        .await
+        .map_err(fixture_error)?;
+
+    let evidence = ys_agent_core::CompatibilityEvidence::passing(candidate.validation_inputs(
+        ys_agent_core::ValidationVersions::new(
+            "deterministic-catalog",
+            "deterministic-probe",
+            "deterministic-liter",
+            "deterministic-codec",
+        ),
+    ));
+    let validation_id = evidence.id();
+    let validation_digest = evidence.digest();
+    repository
+        .save_validation(ys_agent_core::ValidationCommit {
+            precondition: ys_agent_core::ValidationCommitPrecondition {
+                operation_id: ys_agent_core::OperationId::new(),
+                profile_id,
+                revision: 2,
+                credential_generation: credential,
+                validation_digest: validation_digest.clone(),
+            },
+            evidence,
+        })
+        .await
+        .map_err(fixture_error)?;
+    repository
+        .activate(ys_agent_core::ActivateProfileRequest {
+            operation_id: ys_agent_core::OperationId::new(),
+            precondition: ys_agent_core::ActivationPrecondition {
+                profile_id,
+                revision: 2,
+                validation_id,
+                validation_digest,
+                expected_activation_revision: None,
+            },
+        })
+        .await
+        .map_err(fixture_error)
 }
 
 fn query_phase_tool_view_hashes(
