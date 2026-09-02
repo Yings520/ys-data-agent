@@ -356,6 +356,14 @@ impl OAuthConnectionService for FakeOAuthConnectionService {
         unavailable()
     }
 
+    async fn restore(
+        &self,
+        _profile_id: ProfileId,
+        _generation: CredentialGeneration,
+    ) -> ProviderResult<OAuthConnectionView> {
+        unavailable()
+    }
+
     async fn start(
         &self,
         _profile_id: ProfileId,

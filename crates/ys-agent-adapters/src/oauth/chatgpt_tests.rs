@@ -219,7 +219,7 @@ async fn device_flow_opens_fixed_verification_and_writes_one_masked_bundle() {
     drop(bundle);
 
     let restarted = ChatGptOAuthManager::with_endpoints_for_test(
-        vault,
+        vault.clone(),
         OAuthEndpoints::for_test(&server.uri()),
         Arc::new(RecordingBrowser::default()),
     )
@@ -231,6 +231,21 @@ async fn device_flow_opens_fixed_verification_and_writes_one_masked_bundle() {
             .expect("restore exact Vault generation")
             .status,
         OAuthConnectionStatus::Connected
+    );
+    vault
+        .delete_generation(ys_agent_core::ProviderCredentialReference {
+            profile_id,
+            generation,
+        })
+        .await
+        .expect("remove the local OAuth bundle");
+    assert_eq!(
+        restarted
+            .restore_connection(profile_id, generation)
+            .await
+            .expect("missing bundle is represented as a safe status")
+            .status,
+        OAuthConnectionStatus::Revoked
     );
 
     let rendered = format!("{connected:?} {manager:?}");

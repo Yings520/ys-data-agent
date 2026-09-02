@@ -384,6 +384,15 @@ pub trait OAuthConnectionService: Send + Sync {
     /// Returns only the masked OAuth connection state and its safe remediation.
     async fn view(&self, profile_id: ProfileId) -> ProviderResult<OAuthConnectionView>;
 
+    /// Rehydrates a connection only from the Profile's durable, typed OAuth generation. The
+    /// adapter may read the protected bundle, but returns a masked status and never a token.
+    /// A missing or unusable bundle must become a fail-closed non-Connected view.
+    async fn restore(
+        &self,
+        profile_id: ProfileId,
+        generation: CredentialGeneration,
+    ) -> ProviderResult<OAuthConnectionView>;
+
     async fn start(
         &self,
         profile_id: ProfileId,

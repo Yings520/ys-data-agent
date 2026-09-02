@@ -102,13 +102,28 @@ impl ChatGptOAuthManager {
         generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
         validate_oauth_generation(profile_id, generation)?;
-        let lease = self
+        let lease = match self
             .vault
             .read_generation(ProviderCredentialReference {
                 profile_id,
                 generation,
             })
-            .await?;
+            .await
+        {
+            Ok(lease) => lease,
+            Err(_) => {
+                self.lock_state().profiles.insert(
+                    profile_id,
+                    ProfileConnection {
+                        status: OAuthConnectionStatus::Revoked,
+                        generation: None,
+                        expires_at_epoch_seconds: None,
+                        active_operation: None,
+                    },
+                );
+                return Ok(connection_view(profile_id, OAuthConnectionStatus::Revoked));
+            }
+        };
         let bundle = decode_token_bundle(&lease)?;
         let status = if bundle.expires_at_epoch_seconds <= now_epoch_seconds()? {
             OAuthConnectionStatus::Expired
@@ -651,6 +666,14 @@ impl OAuthConnectionService for ChatGptOAuthManager {
             connection.status = OAuthConnectionStatus::Expired;
         }
         Ok(connection_view(profile_id, connection.status))
+    }
+
+    async fn restore(
+        &self,
+        profile_id: ProfileId,
+        generation: CredentialGeneration,
+    ) -> ProviderResult<OAuthConnectionView> {
+        self.restore_connection(profile_id, generation).await
     }
 
     async fn start(

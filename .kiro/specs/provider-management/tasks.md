@@ -183,7 +183,7 @@
   - _Requirements: 2.7, 3.7, 3.9, 6.3, 8.6, 8.7_
   - _Boundary: ProviderManagementService deletion and credential retirement flow_
   - _Depends: 2.4, 3.3, 4.4, 4.5_
-- [ ] 4.7 编排 ChatGPT OAuth Connection 生命周期
+- [x] 4.7 编排 ChatGPT OAuth Connection 生命周期
   - 将 start/complete/view/refresh/reauthorize/logout 接入 Profile 与 Credential generation，普通状态只返回安全 view。
   - 非 Connected 状态阻止 probe 与 activation；refresh 成功写新 generation、重跑当前模型 probe 并形成新 revision，旧 active 在显式激活前不变。
   - refresh/token 失效时立即 fail closed；logout 先封锁/删除本地 generation，再报告 remote revoke outcome。
