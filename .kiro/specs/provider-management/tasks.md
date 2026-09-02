@@ -101,7 +101,7 @@
   - _Requirements: 1.2, 4.4, 4.6, 5.3, 5.5, 6.7, 9.2, 10.4, 11.1, 11.9_
   - _Boundary: Liter Chat request and response codec_
   - _Depends: 1.1, 1.3_
-- [ ] 3.5 实现 allowlist 约束的模型发现
+- [x] 3.5 实现 allowlist 约束的模型发现
   - 仅通过 catalog 固定 endpoint 和显式绑定 Credential 调用目标 Provider 的模型目录，不接受用户 URL 或目录外路由。
   - 将发现失败、空结果和不完整结果归一化为可恢复状态，使调用方仍可保留 Draft 并手工输入模型。
   - 过滤错前缀和目录外结果，且发现请求与诊断不包含业务 Query 数据。
