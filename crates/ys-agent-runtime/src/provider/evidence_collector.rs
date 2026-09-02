@@ -5,7 +5,10 @@
 //! prevents tokens, raw prompts, raw responses, account identity, and customer data from ever
 //! becoming evidence-schema values.
 
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -105,6 +108,20 @@ impl SanitizedProviderEvidenceDocument {
         let canonical = serde_json::to_vec(self)
             .expect("sanitized evidence document serialization is infallible");
         hex::encode(Sha256::digest(canonical))
+    }
+
+    /// Produces the four immutable category hashes consumed by the support registry. The hashes
+    /// bind each required category to this already sanitized document; neither raw probes nor a
+    /// credential can become part of the release manifest.
+    pub fn evidence_hashes(&self) -> BTreeMap<EvidenceKind, String> {
+        EvidenceKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let canonical = serde_json::to_vec(&(self, kind))
+                    .expect("sanitized evidence category serialization is infallible");
+                (kind, hex::encode(Sha256::digest(canonical)))
+            })
+            .collect()
     }
 
     pub fn to_json(&self) -> EvidenceCollectionResult<String> {

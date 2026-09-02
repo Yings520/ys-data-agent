@@ -7,6 +7,7 @@ pub mod api;
 pub mod catalog;
 pub mod evidence;
 pub mod evidence_collector;
+pub mod evidence_gate;
 pub mod resolver;
 pub mod service;
 pub mod validation;

@@ -41,7 +41,9 @@ use ys_agent_runtime::{
     provider::{
         api::InProcessProviderManagementApi,
         catalog::GovernedProviderCatalog,
-        evidence::{EvidenceBaseline, EvidenceRegistry, GOVERNED_LITER_LLM_VERSION},
+        evidence::{
+            EvidenceBaseline, EvidenceRegistry, GOVERNED_CODEC_DIGEST, GOVERNED_LITER_LLM_VERSION,
+        },
         service::{CredentialService, ProviderManagementService},
         validation::COMPATIBILITY_PROBE_SCHEMA_VERSION,
     },
@@ -926,7 +928,7 @@ async fn compose_provider_runtime(
     let evidence = EvidenceRegistry::new(EvidenceBaseline::for_catalog(
         &catalog,
         COMPATIBILITY_PROBE_SCHEMA_VERSION,
-        "liter-codec-v1",
+        GOVERNED_CODEC_DIGEST,
         GOVERNED_LITER_LLM_VERSION,
     ));
     let factory: Arc<dyn ProviderClientFactory> = Arc::new(LiterProviderFactory::new());

@@ -305,7 +305,7 @@
   - _Requirements: 1.5, 1.6, 1.7, 5.3, 5.4, 5.5, 11.4, 11.5, 11.6_
   - _Boundary: Live compatibility evidence schema and collector_
   - _Depends: 3.1, 3.3, 3.7, 4.2_
-- [ ] 7.6 实现 Provider evidence 与发布声明门禁
+- [x] 7.6 实现 Provider evidence 与发布声明门禁
   - 校验 catalog 精确九项、每个 Supported 条目的四类 evidence、代表模型、schema/version/hash/digest 和九 Provider aggregate verdict。
   - 基线升级或任一证据缺失时强制重新验证并阻止 9/9 声明；Candidate/Blocked 仍可发布管理能力但必须显示 EvidenceGap。
   - 将 Provider、Doctor、secret canary 与显式错误指标纳入非零退出 gate，并保持 evidence/诊断输出无秘密。

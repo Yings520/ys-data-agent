@@ -9,6 +9,12 @@ use ys_agent_core::{
 use super::catalog::GovernedProviderCatalog;
 
 pub const GOVERNED_LITER_LLM_VERSION: &str = "1.19.1";
+/// SHA-256 of the governed Liter codec contract identifier (`liter-codec-v1`).
+///
+/// Evidence documents carry a digest rather than a mutable display/version label so a codec
+/// baseline upgrade always invalidates prior release evidence.
+pub const GOVERNED_CODEC_DIGEST: &str =
+    "68c43396fcc413377b975e93fd16b972c0e258c13693ca4288f5fdeca7f48d09";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
