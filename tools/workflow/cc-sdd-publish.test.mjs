@@ -94,8 +94,18 @@ esac
   await writeFile(
     path.join(fakeBin, "rtk"),
     `#!/bin/sh
+printf '%s\\n' "$*" >> "$RTK_CALL_LOG"
+if [ "$1 $2" = "proxy git" ]; then
+  shift 2
+  exec "$REAL_GIT" "$@"
+fi
 if [ "$1" = "git" ]; then
   shift
+  if [ "\${RTK_COMPACT_MARKERS:-}" = "1" ] && [ "$1 $2 $3 $4" = "diff --cached --name-only -z" ]; then
+    "$REAL_GIT" "$@"
+    printf '\\n\\n--- Changes ---\\n\\n'
+    exit 0
+  fi
   exec "$REAL_GIT" "$@"
 fi
 exit 64
@@ -140,6 +150,7 @@ exit 64
       GH_CALL_LOG: ghCallLog,
       GH_PR_STATE: ghPrState,
       REAL_GIT: "/usr/bin/git",
+      RTK_CALL_LOG: path.join(root, ".rtk-calls"),
     },
   };
 }
@@ -160,6 +171,7 @@ function publish(root, options = {}) {
       GH_CALL_LOG: path.join(root, ".gh-calls"),
       GH_PR_STATE: path.join(root, ".gh-pr-state"),
       REAL_GIT: "/usr/bin/git",
+      RTK_CALL_LOG: path.join(root, ".rtk-calls"),
       CC_SDD_DISPATCH_FEATURE: feature,
       CC_SDD_DISPATCH_TASK_ID: selectedTaskId,
       ...options.env,
@@ -177,6 +189,7 @@ function validateFeature(root, options = {}) {
       GH_CALL_LOG: path.join(root, ".gh-calls"),
       GH_PR_STATE: path.join(root, ".gh-pr-state"),
       REAL_GIT: "/usr/bin/git",
+      RTK_CALL_LOG: path.join(root, ".rtk-calls"),
       CC_SDD_DISPATCH_FEATURE: feature,
       CC_SDD_DISPATCH_TASK_ID: "VALIDATE",
       ...options.env,
@@ -208,6 +221,7 @@ function recover(root, options = {}) {
       GH_CALL_LOG: path.join(root, ".gh-calls"),
       GH_PR_STATE: path.join(root, ".gh-pr-state"),
       REAL_GIT: "/usr/bin/git",
+      RTK_CALL_LOG: path.join(root, ".rtk-calls"),
       ...options.env,
     },
   });
@@ -254,6 +268,18 @@ test("publishes one atomic task commit to its exact feature branch", async () =>
     "",
   );
   assert.match(await readFile(ghCallLog, "utf8"), /pr create .*--draft/);
+});
+
+test("uses raw RTK proxy output for machine-readable Git commands", async () => {
+  const { root } = await createRepository();
+
+  const result = publish(root, { env: { RTK_COMPACT_MARKERS: "1" } });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(
+    await readFile(path.join(root, ".rtk-calls"), "utf8"),
+    /^proxy git diff --cached --name-only -z$/m,
+  );
 });
 
 test("reuses the one open Draft PR for the expected head and base", async () => {

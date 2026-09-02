@@ -46,7 +46,10 @@ export function expectedBase(env = process.env) {
 }
 
 function git(root, args) {
-  const result = spawnSync("rtk", ["git", ...args], {
+  // Publication consumes exact, machine-readable Git output (including NUL-delimited paths).
+  // `rtk git` is intentionally human-oriented and may append compact diff markers, so use
+  // RTK's raw tracked proxy while still routing every Git operation through RTK.
+  const result = spawnSync("rtk", ["proxy", "git", ...args], {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
