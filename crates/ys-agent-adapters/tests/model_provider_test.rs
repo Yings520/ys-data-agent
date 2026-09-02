@@ -565,17 +565,16 @@ async fn secret_canary_never_appears_in_debug_errors_or_telemetry() {
         .expect("request recording is enabled");
     assert_eq!(requests.len(), 1, "authentication failures are not retried");
 
-    let telemetry = ProviderCallTelemetry {
-        provider: "openai_compatible",
-        model: "test-model".to_owned(),
-        latency_ms: 10,
-        prompt_tokens: None,
-        completion_tokens: None,
-        total_tokens: None,
-        attempts: 1,
-        outcome: "provider_authentication",
-    };
-    assert!(!format!("{telemetry:?}").contains(CANARY));
+    let telemetry = ProviderCallTelemetry::new(
+        "openai_compatible",
+        CANARY,
+        10,
+        1,
+        "provider_authentication",
+    );
+    let rendered = format!("{telemetry:?}");
+    assert!(!rendered.contains(CANARY));
+    assert!(rendered.contains("model_sha256"));
 }
 
 #[tokio::test]

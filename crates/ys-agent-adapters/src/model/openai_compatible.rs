@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use ys_agent_core::{
     AgentAction, CoreError, CoreResult, ModelCapabilities, ModelMessage, ModelProvider,
     ModelRequest, ModelResponse, ModelRole, ModelUsage, ToolCall, ToolCallId, ToolSpec,
@@ -24,25 +25,35 @@ pub struct OpenAiCompatibleProvider {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderCallTelemetry {
     pub provider: &'static str,
-    pub model: String,
+    pub model_sha256: String,
     pub latency_ms: u64,
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
-    pub total_tokens: Option<u32>,
-    pub attempts: u32,
+    pub retry_count: u32,
     pub outcome: &'static str,
 }
 
 impl ProviderCallTelemetry {
+    pub fn new(
+        provider: &'static str,
+        model: &str,
+        latency_ms: u64,
+        retry_count: u32,
+        outcome: &'static str,
+    ) -> Self {
+        Self {
+            provider,
+            model_sha256: format!("sha256:{:x}", Sha256::digest(model.as_bytes())),
+            latency_ms,
+            retry_count,
+            outcome,
+        }
+    }
+
     fn record(&self) {
         tracing::info!(
             provider = self.provider,
-            model = %self.model,
+            model_sha256 = %self.model_sha256,
             latency_ms = self.latency_ms,
-            prompt_tokens = ?self.prompt_tokens,
-            completion_tokens = ?self.completion_tokens,
-            total_tokens = ?self.total_tokens,
-            attempts = self.attempts,
+            retry_count = self.retry_count,
             outcome = self.outcome,
             "model provider call completed"
         );
@@ -256,23 +267,14 @@ impl OpenAiCompatibleProvider {
             })
     }
 
-    fn record_telemetry(
-        &self,
-        started_at: Instant,
-        usage: Option<ApiUsage>,
-        attempts: u32,
-        outcome: &'static str,
-    ) {
-        ProviderCallTelemetry {
-            provider: PROVIDER_NAME,
-            model: self.config.model.clone(),
-            latency_ms: started_at.elapsed().as_millis() as u64,
-            prompt_tokens: usage.map(|value| value.prompt_tokens),
-            completion_tokens: usage.map(|value| value.completion_tokens),
-            total_tokens: usage.map(|value| value.total_tokens),
-            attempts,
+    fn record_telemetry(&self, started_at: Instant, attempts: u32, outcome: &'static str) {
+        ProviderCallTelemetry::new(
+            PROVIDER_NAME,
+            &self.config.model,
+            started_at.elapsed().as_millis() as u64,
+            attempts.saturating_sub(1),
             outcome,
-        }
+        )
         .record();
     }
 }
@@ -629,11 +631,9 @@ impl OpenAiCompatibleProvider {
             let attempts = retry_index + 1 + protocol_corrections;
             match self.send_once(body).await {
                 Ok(wire_response) => {
-                    let usage = wire_response.usage;
                     let parsed = self.parse_response(wire_response, request);
                     self.record_telemetry(
                         started_at,
-                        usage,
                         attempts,
                         if parsed.is_ok() {
                             "succeeded"
@@ -653,7 +653,7 @@ impl OpenAiCompatibleProvider {
                     tokio::time::sleep(delay).await;
                 }
                 Err(failure) => {
-                    self.record_telemetry(started_at, None, attempts, failure.code);
+                    self.record_telemetry(started_at, attempts, failure.code);
                     return Err(failure.into_core_error());
                 }
             }

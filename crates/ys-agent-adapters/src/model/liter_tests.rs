@@ -1,14 +1,16 @@
 use std::time::Duration;
 
+use liter_llm::error::LiterLlmError;
 use secrecy::ExposeSecret;
 use serde_json::json;
 use ys_agent_core::{
     CredentialGeneration, CredentialLease, ProfileId, ProviderClientBinding, ProviderClientFactory,
-    ProviderErrorCode, ProviderField, ProviderId, ProviderModelId, ProviderParameterKey,
-    ProviderParameters, SecretValue,
+    ProviderErrorCategory, ProviderErrorCode, ProviderField, ProviderId, ProviderModelId,
+    ProviderParameterKey, ProviderParameters, ProviderRemediation, ProviderRetryability,
+    SecretValue,
 };
 
-use super::{ClientPlan, LiterProviderFactory};
+use super::{ClientPlan, LiterProviderFactory, ProviderErrorNormalizer};
 
 const FIXTURE_ACCESS_TOKEN: &str = "fixture-access-token";
 const FIXTURE_ACCOUNT_ID: &str = "fixture-account";
@@ -274,6 +276,257 @@ fn credential_kind_and_profile_generation_mismatches_cannot_construct_a_client()
         Ok(_) => panic!("ChatGPT requires a connected OAuth bundle"),
     };
     assert_eq!(error.code(), ProviderErrorCode::OAuthNotConnected.as_str());
+}
+
+#[test]
+fn provider_error_normalizer_classifies_known_liter_failures_without_echoing_canaries() {
+    const CANARY: &str = "provider-echo-canary-must-not-leak";
+    let cases = [
+        (
+            LiterLlmError::Authentication {
+                message: CANARY.to_owned(),
+                status: 401,
+            },
+            ProviderErrorCode::AuthenticationInvalid,
+            ProviderErrorCategory::Authentication,
+            ProviderRetryability::Never,
+            Some(ProviderField::Credential),
+            ProviderRemediation::ReturnToEdit,
+        ),
+        (
+            LiterLlmError::NotFound {
+                message: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ModelNotFound,
+            ProviderErrorCategory::Model,
+            ProviderRetryability::Never,
+            Some(ProviderField::Model),
+            ProviderRemediation::ReturnToEdit,
+        ),
+        (
+            LiterLlmError::RateLimited {
+                message: CANARY.to_owned(),
+                retry_after: None,
+            },
+            ProviderErrorCode::RateLimited,
+            ProviderErrorCategory::RateLimit,
+            ProviderRetryability::Bounded,
+            Some(ProviderField::Model),
+            ProviderRemediation::Retry,
+        ),
+        (
+            LiterLlmError::Timeout,
+            ProviderErrorCode::Timeout,
+            ProviderErrorCategory::Timeout,
+            ProviderRetryability::Bounded,
+            Some(ProviderField::Model),
+            ProviderRemediation::Retry,
+        ),
+        (
+            LiterLlmError::ServerError {
+                message: CANARY.to_owned(),
+                status: 500,
+            },
+            ProviderErrorCode::Server,
+            ProviderErrorCategory::Server,
+            ProviderRetryability::Bounded,
+            Some(ProviderField::Model),
+            ProviderRemediation::Retry,
+        ),
+        (
+            LiterLlmError::ServiceUnavailable {
+                message: CANARY.to_owned(),
+                status: 503,
+            },
+            ProviderErrorCode::Server,
+            ProviderErrorCategory::Server,
+            ProviderRetryability::Bounded,
+            Some(ProviderField::Model),
+            ProviderRemediation::Retry,
+        ),
+        (
+            LiterLlmError::BadRequest {
+                message: CANARY.to_owned(),
+                status: 422,
+            },
+            ProviderErrorCode::ModelIncompatible,
+            ProviderErrorCategory::Capability,
+            ProviderRetryability::Never,
+            Some(ProviderField::Model),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::ContextWindowExceeded {
+                message: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ModelIncompatible,
+            ProviderErrorCategory::Capability,
+            ProviderRetryability::Never,
+            Some(ProviderField::Model),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::ContentPolicy {
+                message: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ModelIncompatible,
+            ProviderErrorCategory::Capability,
+            ProviderRetryability::Never,
+            Some(ProviderField::Model),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::EndpointNotSupported {
+                endpoint: CANARY.to_owned(),
+                provider: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ModelIncompatible,
+            ProviderErrorCategory::Capability,
+            ProviderRetryability::Never,
+            Some(ProviderField::Model),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::BudgetExceeded {
+                message: CANARY.to_owned(),
+                model: Some(CANARY.to_owned()),
+            },
+            ProviderErrorCode::ModelIncompatible,
+            ProviderErrorCategory::Capability,
+            ProviderRetryability::Never,
+            Some(ProviderField::Model),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::Streaming {
+                message: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ProtocolInvalidResponse,
+            ProviderErrorCategory::Protocol,
+            ProviderRetryability::Never,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::InvalidHeader {
+                name: CANARY.to_owned(),
+                reason: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ProtocolInvalidResponse,
+            ProviderErrorCategory::Protocol,
+            ProviderRetryability::Never,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::HookRejected {
+                message: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ProtocolInvalidResponse,
+            ProviderErrorCategory::Protocol,
+            ProviderRetryability::Never,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::InternalError {
+                message: CANARY.to_owned(),
+            },
+            ProviderErrorCode::Internal,
+            ProviderErrorCategory::Internal,
+            ProviderRetryability::Never,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ContactSupport,
+        ),
+        (
+            LiterLlmError::OutboundForbidden {
+                url: CANARY.to_owned(),
+                reason: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ProtocolInvalidResponse,
+            ProviderErrorCategory::Protocol,
+            ProviderRetryability::Never,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::IdempotencyConflict {
+                key: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ProtocolInvalidResponse,
+            ProviderErrorCategory::Protocol,
+            ProviderRetryability::Never,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ValidateProfile,
+        ),
+        (
+            LiterLlmError::IdempotencyInFlight {
+                key: CANARY.to_owned(),
+            },
+            ProviderErrorCode::ProtocolInvalidResponse,
+            ProviderErrorCategory::Protocol,
+            ProviderRetryability::Never,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ValidateProfile,
+        ),
+    ];
+
+    for (source, code, category, retryability, field, remediation) in cases {
+        let normalized = ProviderErrorNormalizer::from_liter(source);
+        assert_eq!(normalized.code(), code.as_str());
+        assert_eq!(normalized.category(), category);
+        assert_eq!(normalized.retryability(), retryability);
+        assert_eq!(normalized.field(), field.as_ref());
+        assert_eq!(normalized.remediation(), remediation);
+        assert!(!format!("{normalized:?}").contains(CANARY));
+
+        let core = ProviderErrorNormalizer::into_core(normalized);
+        assert_eq!(core.code(), code.as_str());
+        assert!(!format!("{core:?}").contains(CANARY));
+        assert!(!core.to_string().contains(CANARY));
+    }
+}
+
+#[test]
+fn provider_error_normalizer_drops_network_and_serialization_details() {
+    const CANARY: &str = "network-and-serialization-canary-must-not-leak";
+    let network = reqwest::Client::new()
+        .get("http://[::1")
+        .build()
+        .expect_err("malformed URL must not build");
+    let serialization =
+        serde_json::from_str::<serde_json::Value>("{").expect_err("malformed JSON fixture");
+    let cases = [
+        (LiterLlmError::Network(network), ProviderErrorCode::Network),
+        (
+            LiterLlmError::Serialization(serialization),
+            ProviderErrorCode::ProtocolInvalidResponse,
+        ),
+    ];
+
+    for (source, code) in cases {
+        let normalized = ProviderErrorNormalizer::from_liter(source);
+        assert_eq!(normalized.code(), code.as_str());
+        assert!(!format!("{normalized:?}").contains(CANARY));
+    }
+}
+
+#[test]
+fn provider_error_normalizer_cancellation_is_non_retryable_and_never_succeeds() {
+    let cancelled = ProviderErrorNormalizer::cancelled();
+
+    assert_eq!(
+        cancelled.code(),
+        ProviderErrorCode::OperationCancelled.as_str()
+    );
+    assert_eq!(cancelled.category(), ProviderErrorCategory::Operation);
+    assert_eq!(cancelled.retryability(), ProviderRetryability::Never);
+    assert_eq!(cancelled.field(), None);
+    assert_eq!(cancelled.remediation(), ProviderRemediation::ReturnToEdit);
+    assert_eq!(
+        ProviderErrorNormalizer::into_core(cancelled).code(),
+        ProviderErrorCode::OperationCancelled.as_str()
+    );
 }
 
 fn base64_url_encode(input: &[u8]) -> String {

@@ -125,7 +125,7 @@
   - _Requirements: 1.2, 3.6, 4.3, 4.4, 4.6, 4.7, 4.8, 5.3, 5.7, 5.8, 6.7, 9.2, 10.4, 11.2, 11.9_
   - _Boundary: LiterProviderFactory and LiterModelProvider_
   - _Depends: 3.1, 3.4, 3.5, 3.6_
-- [ ] 3.8 归一化 Provider 错误并限制可观测数据
+- [x] 3.8 归一化 Provider 错误并限制可观测数据
   - 将认证、模型不存在、能力、限流、超时、网络、服务端、协议和取消错误映射为固定 code、retryability 与可执行 remediation。
   - 在 adapter 内丢弃 raw request/response、headers、token、account ID、tool arguments 与业务内容，仅允许非敏感 Provider enum、hashed model、operation/run ID、latency 和 retry count。
   - 用恶意 Provider 回显和 canary 值验证清理行为，确保错误归一化本身不会触发重试、fallback 或 silent success。

@@ -262,64 +262,101 @@ fn validate_binding(binding: &ProviderClientBinding) -> ProviderResult<()> {
 }
 
 fn map_client_construction_error(error: LiterLlmError) -> ProviderManagementError {
-    map_liter_error(error)
+    ProviderErrorNormalizer::from_liter(error)
 }
 
 fn liter_to_core(error: LiterLlmError) -> CoreError {
-    provider_to_core(map_liter_error(error))
+    ProviderErrorNormalizer::into_core(ProviderErrorNormalizer::from_liter(error))
 }
 
 fn provider_to_core(error: ProviderManagementError) -> CoreError {
-    CoreError::validation(error.code(), "Provider transport rejected the request")
+    ProviderErrorNormalizer::into_core(error)
 }
 
-fn map_liter_error(error: LiterLlmError) -> ProviderManagementError {
-    let (code, field, remediation) = match error {
-        LiterLlmError::Authentication { .. } => (
-            ProviderErrorCode::AuthenticationInvalid,
-            ProviderField::Credential,
+/// Converts third-party failures into the closed core surface before they can be returned,
+/// rendered, or observed. It deliberately consumes every external payload without formatting or
+/// retaining it; retry decisions remain solely in the fixed client configuration.
+#[derive(Debug, Default, Clone, Copy)]
+struct ProviderErrorNormalizer;
+
+impl ProviderErrorNormalizer {
+    fn from_liter(error: LiterLlmError) -> ProviderManagementError {
+        let (code, field, remediation) = match error {
+            LiterLlmError::Authentication { .. } => (
+                ProviderErrorCode::AuthenticationInvalid,
+                Some(ProviderField::Credential),
+                ProviderRemediation::ReturnToEdit,
+            ),
+            LiterLlmError::NotFound { .. } => (
+                ProviderErrorCode::ModelNotFound,
+                Some(ProviderField::Model),
+                ProviderRemediation::ReturnToEdit,
+            ),
+            LiterLlmError::RateLimited { .. } => (
+                ProviderErrorCode::RateLimited,
+                Some(ProviderField::Model),
+                ProviderRemediation::Retry,
+            ),
+            LiterLlmError::Timeout => (
+                ProviderErrorCode::Timeout,
+                Some(ProviderField::Model),
+                ProviderRemediation::Retry,
+            ),
+            LiterLlmError::Network(_) => (
+                ProviderErrorCode::Network,
+                Some(ProviderField::Model),
+                ProviderRemediation::Retry,
+            ),
+            LiterLlmError::ServerError { .. } | LiterLlmError::ServiceUnavailable { .. } => (
+                ProviderErrorCode::Server,
+                Some(ProviderField::Model),
+                ProviderRemediation::Retry,
+            ),
+            LiterLlmError::BadRequest { .. }
+            | LiterLlmError::ContextWindowExceeded { .. }
+            | LiterLlmError::ContentPolicy { .. }
+            | LiterLlmError::EndpointNotSupported { .. }
+            | LiterLlmError::BudgetExceeded { .. } => (
+                ProviderErrorCode::ModelIncompatible,
+                Some(ProviderField::Model),
+                ProviderRemediation::ValidateProfile,
+            ),
+            LiterLlmError::InternalError { .. } => (
+                ProviderErrorCode::Internal,
+                Some(ProviderField::Validation),
+                ProviderRemediation::ContactSupport,
+            ),
+            LiterLlmError::Streaming { .. }
+            | LiterLlmError::InvalidHeader { .. }
+            | LiterLlmError::Serialization(_)
+            | LiterLlmError::HookRejected { .. }
+            | LiterLlmError::OutboundForbidden { .. }
+            | LiterLlmError::IdempotencyConflict { .. }
+            | LiterLlmError::IdempotencyInFlight { .. }
+            | _ => (
+                ProviderErrorCode::ProtocolInvalidResponse,
+                Some(ProviderField::Validation),
+                ProviderRemediation::ValidateProfile,
+            ),
+        };
+        ProviderManagementError::new(code, field, remediation)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the Provider-management service routes explicit cancellation through this stable mapping"
+    )]
+    fn cancelled() -> ProviderManagementError {
+        ProviderManagementError::new(
+            ProviderErrorCode::OperationCancelled,
+            None,
             ProviderRemediation::ReturnToEdit,
-        ),
-        LiterLlmError::NotFound { .. } => (
-            ProviderErrorCode::ModelNotFound,
-            ProviderField::Model,
-            ProviderRemediation::ReturnToEdit,
-        ),
-        LiterLlmError::RateLimited { .. } => (
-            ProviderErrorCode::RateLimited,
-            ProviderField::Model,
-            ProviderRemediation::Retry,
-        ),
-        LiterLlmError::Timeout => (
-            ProviderErrorCode::Timeout,
-            ProviderField::Model,
-            ProviderRemediation::Retry,
-        ),
-        LiterLlmError::Network(_) => (
-            ProviderErrorCode::Network,
-            ProviderField::Model,
-            ProviderRemediation::Retry,
-        ),
-        LiterLlmError::ServerError { .. } | LiterLlmError::ServiceUnavailable { .. } => (
-            ProviderErrorCode::Server,
-            ProviderField::Model,
-            ProviderRemediation::Retry,
-        ),
-        LiterLlmError::BadRequest { .. }
-        | LiterLlmError::ContextWindowExceeded { .. }
-        | LiterLlmError::ContentPolicy { .. }
-        | LiterLlmError::EndpointNotSupported { .. } => (
-            ProviderErrorCode::ModelIncompatible,
-            ProviderField::Model,
-            ProviderRemediation::ValidateProfile,
-        ),
-        _ => (
-            ProviderErrorCode::ProtocolInvalidResponse,
-            ProviderField::Validation,
-            ProviderRemediation::ValidateProfile,
-        ),
-    };
-    ProviderManagementError::new(code, Some(field), remediation)
+        )
+    }
+
+    fn into_core(error: ProviderManagementError) -> CoreError {
+        CoreError::validation(error.code(), "Provider transport rejected the request")
+    }
 }
 
 fn authentication_invalid() -> ProviderManagementError {
