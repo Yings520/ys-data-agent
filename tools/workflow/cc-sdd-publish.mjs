@@ -46,7 +46,7 @@ export function expectedBase(env = process.env) {
 }
 
 function git(root, args) {
-  const result = spawnSync("git", args, {
+  const result = spawnSync("rtk", ["git", ...args], {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,

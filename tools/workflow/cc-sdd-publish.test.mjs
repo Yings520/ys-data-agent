@@ -86,7 +86,25 @@ esac
 `,
     "utf8",
   );
+  await writeFile(
+    path.join(fakeBin, "git"),
+    "#!/bin/sh\nprintf '%s\\n' 'direct git is unavailable' >&2\nexit 126\n",
+    "utf8",
+  );
+  await writeFile(
+    path.join(fakeBin, "rtk"),
+    `#!/bin/sh
+if [ "$1" = "git" ]; then
+  shift
+  exec "$REAL_GIT" "$@"
+fi
+exit 64
+`,
+    "utf8",
+  );
   await chmod(path.join(fakeBin, "gh"), 0o755);
+  await chmod(path.join(fakeBin, "git"), 0o755);
+  await chmod(path.join(fakeBin, "rtk"), 0o755);
 
   run(root, "git", ["init", "-b", "master"]);
   run(root, "git", ["config", "user.name", "Ralph Test"]);
@@ -121,6 +139,7 @@ esac
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
       GH_CALL_LOG: ghCallLog,
       GH_PR_STATE: ghPrState,
+      REAL_GIT: "/usr/bin/git",
     },
   };
 }
@@ -140,6 +159,7 @@ function publish(root, options = {}) {
       PATH: `${path.join(root, ".test-bin")}${path.delimiter}${process.env.PATH}`,
       GH_CALL_LOG: path.join(root, ".gh-calls"),
       GH_PR_STATE: path.join(root, ".gh-pr-state"),
+      REAL_GIT: "/usr/bin/git",
       CC_SDD_DISPATCH_FEATURE: feature,
       CC_SDD_DISPATCH_TASK_ID: selectedTaskId,
       ...options.env,
@@ -156,6 +176,7 @@ function validateFeature(root, options = {}) {
       PATH: `${path.join(root, ".test-bin")}${path.delimiter}${process.env.PATH}`,
       GH_CALL_LOG: path.join(root, ".gh-calls"),
       GH_PR_STATE: path.join(root, ".gh-pr-state"),
+      REAL_GIT: "/usr/bin/git",
       CC_SDD_DISPATCH_FEATURE: feature,
       CC_SDD_DISPATCH_TASK_ID: "VALIDATE",
       ...options.env,
@@ -186,6 +207,7 @@ function recover(root, options = {}) {
       PATH: `${path.join(root, ".test-bin")}${path.delimiter}${process.env.PATH}`,
       GH_CALL_LOG: path.join(root, ".gh-calls"),
       GH_PR_STATE: path.join(root, ".gh-pr-state"),
+      REAL_GIT: "/usr/bin/git",
       ...options.env,
     },
   });
