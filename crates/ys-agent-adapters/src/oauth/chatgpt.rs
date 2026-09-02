@@ -1044,6 +1044,27 @@ fn decode_token_bundle(lease: &CredentialLease) -> ProviderResult<TokenBundle> {
     Ok(bundle)
 }
 
+/// Exposes a connected ChatGPT OAuth bundle only while an adapter constructs a fixed Responses
+/// client. The token and account identifier cannot be returned to application code or views.
+#[allow(
+    dead_code,
+    reason = "The dependency-ordered Liter factory consumes this bridge in task 3.7."
+)]
+pub(crate) fn with_connected_chatgpt_responses_auth<T>(
+    lease: &CredentialLease,
+    use_auth: impl FnOnce(&str, &str) -> ProviderResult<T>,
+) -> ProviderResult<T> {
+    let bundle = decode_token_bundle(lease).map_err(|_| oauth_not_connected())?;
+    if bundle.expires_at_epoch_seconds <= now_epoch_seconds().map_err(|_| oauth_not_connected())?
+        || bundle.access_token.expose().trim() != bundle.access_token.expose()
+        || bundle.account_id.expose().trim().is_empty()
+        || bundle.account_id.expose().trim() != bundle.account_id.expose()
+    {
+        return Err(oauth_not_connected());
+    }
+    use_auth(bundle.access_token.expose(), bundle.account_id.expose())
+}
+
 async fn decode_response<T>(response: reqwest::Response) -> ProviderResult<T>
 where
     T: for<'de> Deserialize<'de>,

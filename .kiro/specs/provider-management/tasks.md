@@ -109,7 +109,7 @@
   - _Requirements: 4.1, 4.2, 4.3, 5.5, 5.8_
   - _Boundary: ModelDiscovery adapter_
   - _Depends: 1.1, 1.3, 3.1_
-- [ ] 3.6 (P) 实现 ChatGPT Responses codec
+- [x] 3.6 (P) 实现 ChatGPT Responses codec
   - 使用固定 ChatGPT backend、Bearer token、account header 与 originator，把 core 消息映射到 Responses items。
   - 将 `function_call.call_id` 原样映射为 core Provider call ID，并用相同 ID 生成 `function_call_output`；空、缺失或冲突 ID 一律 fail closed。
   - 对非 Connected OAuth、模型/协议错误与不兼容能力返回稳定失败，不回退到 OpenAI API 或 Chat codec。
