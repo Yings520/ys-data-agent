@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ys_agent_core::{
     CredentialKind, ProviderCatalogView, ProviderId, ProviderModelId, ProviderSupportStatus,
@@ -10,7 +10,7 @@ use super::catalog::GovernedProviderCatalog;
 
 pub const GOVERNED_LITER_LLM_VERSION: &str = "1.19.1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     Authentication,

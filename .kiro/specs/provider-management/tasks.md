@@ -297,7 +297,7 @@
   - _Requirements: 3.4, 3.10, 9.7, 11.1, 11.2, 11.8_
   - _Boundary: Cross-surface Provider secret leak test harness_
   - _Depends: 6.4, 6.6_
-- [ ] 7.5 (P) 实现受控真实 Provider 证据采集器
+- [x] 7.5 (P) 实现受控真实 Provider 证据采集器
   - 为批准环境提供九 Provider 代表模型的认证、tool/ID/multi-turn、context、参数和错误行为探测入口；普通 CI 不读取个人 Credential。
   - 只输出 schema-validated sanitized JSON，记录环境类别、模型、时间和 catalog/codec/`liter-llm` digests，不保存 token、raw prompt/response 或客户数据。
   - ChatGPT 证据必须单独覆盖 OAuth 与固定 Responses backend；静态 catalog 或 `liter-llm` registry 记录不能替代实际结果。
