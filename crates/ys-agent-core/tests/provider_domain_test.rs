@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use ys_agent_core::{
     ActiveProviderSlot, CompatibilityEvidence, CredentialGeneration, CredentialKind,
-    ParameterApplicability, ProfileHistory, ProfileId, ProfileName, ProfileRevision, ProfileState,
-    ProviderFingerprint, ProviderId, ProviderModelId, ProviderParameterKey, ProviderParameters,
-    RunId, RunProviderBinding, ValidationVersions,
+    ParameterApplicability, PersistedCompatibilityEvidence, PersistedProfileRevision,
+    ProfileHistory, ProfileId, ProfileName, ProfileRevision, ProfileState, ProviderFingerprint,
+    ProviderId, ProviderModelId, ProviderParameterKey, ProviderParameters, RunId,
+    RunProviderBinding, ValidationVersions,
 };
 
 fn profile_name(value: &str) -> ProfileName {
@@ -42,6 +43,35 @@ fn ready(mut revision: ProfileRevision) -> ProfileRevision {
         .accept_validation(evidence, validation_versions())
         .expect("matching evidence");
     revision
+}
+
+#[test]
+fn persisted_ready_revision_hydrates_only_matching_passing_evidence() {
+    let profile_id = ProfileId::new();
+    let original = draft(
+        profile_id,
+        1,
+        ProviderId::DeepSeek,
+        ProviderParameters::default(),
+    );
+    let evidence =
+        CompatibilityEvidence::passing(original.validation_inputs(validation_versions()));
+    let persisted_evidence = PersistedCompatibilityEvidence::from_evidence(&evidence);
+
+    let restored = ProfileRevision::hydrate(PersistedProfileRevision {
+        profile_id,
+        revision: 1,
+        provider: ProviderId::DeepSeek,
+        model: ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-a").expect("valid model"),
+        parameters: ProviderParameters::default(),
+        credential_generation: original.credential_generation(),
+        state: ProfileState::Ready,
+        validation: Some(persisted_evidence),
+    })
+    .expect("matching persisted evidence restores a ready revision");
+
+    assert_eq!(restored.state(), ProfileState::Ready);
+    assert_eq!(restored.validation(), Some(&evidence));
 }
 
 #[test]

@@ -3,16 +3,157 @@ use std::{fs, path::Path};
 use rusqlite::Connection;
 use tempfile::TempDir;
 use ys_agent_core::{
-    ActiveProviderSnapshot, ArtifactKind, ArtifactStore, CommandId, CommandReceipt,
-    CommandResultKind, CompatibilityEvidence, CoreError, CreateRunCommand, CredentialGeneration,
-    CredentialKind, PendingRunEvent, ProfileId, ProfileRevision, ProviderId, ProviderModelId,
-    ProviderParameters, PutArtifact, Run, RunEventKind, RunProviderBinding, RunSnapshot, RunStatus,
-    RuntimeCommandBatch, RuntimeStore, Sensitivity, Task, ValidationVersions, WorkflowKind,
+    ActivateProfileRequest, ActivationPrecondition, ActiveProviderSnapshot, ArtifactKind,
+    ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CompatibilityEvidence, CoreError,
+    CreateRunCommand, CredentialGeneration, CredentialKind, OperationId, PendingRunEvent,
+    ProfileId, ProfileName, ProfileRevision, ProfileState, ProviderId, ProviderModelId,
+    ProviderParameters, PutArtifact, RevisionPrecondition, Run, RunEventKind, RunProviderBinding,
+    RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, SaveProfileRevision, Sensitivity,
+    Task, ValidationCommit, ValidationCommitPrecondition, ValidationVersions, WorkflowKind,
     WorkspaceId,
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
 const RUNTIME_MIGRATION: &str = include_str!("../migrations/0001_runtime.sql");
+
+#[tokio::test]
+async fn provider_repository_keeps_active_ready_revision_when_a_new_draft_is_saved() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    let store = SqliteRuntimeStore::open(&database)
+        .await
+        .expect("open migrated runtime store");
+    let repository = store.provider_repository();
+    let profile_id = ProfileId::new();
+    let profile_name = ProfileName::new("Primary").expect("valid profile name");
+
+    let initial = ProfileRevision::draft(
+        profile_id,
+        1,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-a").expect("valid model"),
+        ProviderParameters::default(),
+        None,
+    )
+    .expect("initial draft");
+    repository
+        .save_revision(SaveProfileRevision {
+            precondition: RevisionPrecondition {
+                profile_id,
+                expected_current_revision: None,
+            },
+            name: profile_name.clone(),
+            revision: initial,
+        })
+        .await
+        .expect("save initial draft");
+
+    let credential = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+        .expect("credential generation");
+    let connection =
+        Connection::open(&database).expect("open database to seed credential metadata");
+    connection
+        .execute(
+            "INSERT INTO provider_credential_generations(
+                profile_id, generation, kind, vault_locator, status, created_at, updated_at
+             ) VALUES (?1, ?2, 'api_key', 'vault://opaque-locator', 'available', 'now', 'now')",
+            [profile_id.to_string(), credential.number().to_string()],
+        )
+        .expect("seed credential metadata owned by the profile");
+
+    let candidate = ProfileRevision::draft(
+        profile_id,
+        2,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-a").expect("valid model"),
+        ProviderParameters::default(),
+        Some(credential),
+    )
+    .expect("credential-backed draft");
+    repository
+        .save_revision(SaveProfileRevision {
+            precondition: RevisionPrecondition {
+                profile_id,
+                expected_current_revision: Some(1),
+            },
+            name: profile_name.clone(),
+            revision: candidate.clone(),
+        })
+        .await
+        .expect("save candidate revision");
+
+    let evidence = CompatibilityEvidence::passing(candidate.validation_inputs(
+        ValidationVersions::new("catalog-v1", "probe-v1", "liter-v1", "codec-v1"),
+    ));
+    let validation_digest = evidence.digest();
+    let validation_id = evidence.id();
+    repository
+        .save_validation(ValidationCommit {
+            precondition: ValidationCommitPrecondition {
+                operation_id: OperationId::new(),
+                profile_id,
+                revision: 2,
+                credential_generation: credential,
+                validation_digest: validation_digest.clone(),
+            },
+            evidence,
+        })
+        .await
+        .expect("commit matching passing validation");
+    let active = repository
+        .activate(ActivateProfileRequest {
+            operation_id: OperationId::new(),
+            precondition: ActivationPrecondition {
+                profile_id,
+                revision: 2,
+                validation_id,
+                validation_digest,
+                expected_activation_revision: None,
+            },
+        })
+        .await
+        .expect("activate ready revision");
+
+    let edited = ProfileRevision::draft(
+        profile_id,
+        3,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/model-b").expect("valid model"),
+        ProviderParameters::default(),
+        Some(credential),
+    )
+    .expect("edited draft");
+    repository
+        .save_revision(SaveProfileRevision {
+            precondition: RevisionPrecondition {
+                profile_id,
+                expected_current_revision: Some(2),
+            },
+            name: profile_name,
+            revision: edited,
+        })
+        .await
+        .expect("save newer draft without moving active profile");
+
+    assert_eq!(active.profile_revision(), 2);
+    assert_eq!(
+        repository
+            .active()
+            .await
+            .expect("read active snapshot")
+            .expect("active snapshot")
+            .profile_revision(),
+        2
+    );
+    let summary = repository
+        .list_profiles()
+        .await
+        .expect("list profile summaries")
+        .pop()
+        .expect("one profile");
+    assert_eq!(summary.state, ProfileState::Draft);
+    assert!(summary.is_active);
+}
 
 fn legacy_runtime_database(path: &Path) {
     let connection = Connection::open(path).expect("open legacy database");

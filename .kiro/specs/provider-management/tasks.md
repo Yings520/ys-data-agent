@@ -42,13 +42,13 @@
   - _Requirements: 2.2, 2.8, 3.3, 3.5, 3.7, 5.6, 6.1, 6.5, 9.5, 9.6, 9.7_
   - _Boundary: Provider management SQLite migration_
   - _Depends: 1.2, 1.4_
-- [ ] 2.2 实现 Profile revision、Validation 与 Active repository
+- [x] 2.2 实现 Profile revision、Validation 与 Active repository
   - 实现 Profile list/load/save、不可覆盖 revision、validation evidence 条件提交和全局 active singleton compare-and-swap。
   - 保证编辑 active Profile 只产生 newer Draft，旧 Ready revision 持续 active，直到相同 revision/generation/digest 被显式激活。
   - 失败、名称冲突、迟到 validation 或 activation race 必须回滚并返回稳定、可修复结果。
   - 完成后，repository tests 能观察到 CRUD、Draft/Ready/Invalid、单一 active 与失败时上一完整状态不变。
   - _Requirements: 2.1, 2.2, 2.3, 2.6, 2.7, 2.8, 5.6, 6.1, 6.2, 6.3, 6.6_
-  - _Boundary: SqliteProviderRepository profile, validation, and active state_
+  - _Boundary: Validated core Provider persistence hydration contracts and SqliteProviderRepository profile, validation, and active state_
   - _Depends: 1.3, 2.1_
 - [ ] 2.3 实现 Credential mutation journal 与启动恢复
   - 持久化 intent、old/new/rollback generation、phase 和稳定错误，不保存 secret；实现 pointer commit、cleanup pending、rollback 与 fail-closed reconciliation 状态机。

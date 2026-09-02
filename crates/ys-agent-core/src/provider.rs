@@ -421,6 +421,79 @@ impl CompatibilityEvidence {
     pub fn id(&self) -> ValidationId {
         self.id
     }
+
+    pub fn digest(&self) -> ValidationDigest {
+        self.digest.clone()
+    }
+
+    pub const fn passed(&self) -> bool {
+        self.passed
+    }
+
+    pub fn persisted(&self) -> PersistedCompatibilityEvidence {
+        PersistedCompatibilityEvidence::from_evidence(self)
+    }
+}
+
+/// A validated compatibility record read from durable storage. It carries no request, response,
+/// credential, or customer data. Repositories must construct it only from the validation row
+/// joined to the exact persisted Profile revision and credential generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedCompatibilityEvidence {
+    id: ValidationId,
+    digest: ValidationDigest,
+    passed: bool,
+}
+
+/// A non-sensitive revision row assembled by a persistence adapter. `ProfileRevision::hydrate`
+/// validates its lifecycle shape before exposing it to the rest of the application.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedProfileRevision {
+    pub profile_id: ProfileId,
+    pub revision: u64,
+    pub provider: ProviderId,
+    pub model: ProviderModelId,
+    pub parameters: ProviderParameters,
+    pub credential_generation: Option<CredentialGeneration>,
+    pub state: ProfileState,
+    pub validation: Option<PersistedCompatibilityEvidence>,
+}
+
+impl PersistedCompatibilityEvidence {
+    pub fn new(id: ValidationId, digest: impl Into<String>, passed: bool) -> CoreResult<Self> {
+        let digest = digest.into();
+        if digest.len() != 64
+            || digest
+                .bytes()
+                .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+        {
+            return Err(CoreError::validation(
+                "invalid_validation_digest",
+                "persisted validation digests must be lowercase SHA-256 hex",
+            ));
+        }
+        Ok(Self {
+            id,
+            digest: ValidationDigest(digest),
+            passed,
+        })
+    }
+
+    pub fn from_evidence(evidence: &CompatibilityEvidence) -> Self {
+        Self {
+            id: evidence.id,
+            digest: evidence.digest.clone(),
+            passed: evidence.passed,
+        }
+    }
+
+    fn into_evidence(self) -> CompatibilityEvidence {
+        CompatibilityEvidence {
+            id: self.id,
+            digest: self.digest,
+            passed: self.passed,
+        }
+    }
 }
 
 /// An immutable configuration snapshot. State changes are limited to attaching a matching
@@ -489,6 +562,44 @@ impl ProfileRevision {
             state: ProfileState::Draft,
             validation: None,
         })
+    }
+
+    /// Rebuilds a revision that was previously accepted by the repository's persistence query.
+    /// This is intentionally separate from `accept_validation`: a load must preserve the original
+    /// validation identifier and digest without treating stored evidence as a new validation.
+    pub fn hydrate(persisted: PersistedProfileRevision) -> CoreResult<Self> {
+        let mut revision = Self::draft(
+            persisted.profile_id,
+            persisted.revision,
+            persisted.provider,
+            persisted.model,
+            persisted.parameters,
+            persisted.credential_generation,
+        )?;
+
+        match (persisted.state, persisted.validation) {
+            (ProfileState::Draft, None) => Ok(revision),
+            (ProfileState::Ready, Some(validation)) if validation.passed => {
+                if revision.credential_generation.is_none() {
+                    return Err(CoreError::validation(
+                        "credential_missing",
+                        "a persisted ready revision requires a credential generation",
+                    ));
+                }
+                revision.state = ProfileState::Ready;
+                revision.validation = Some(validation.into_evidence());
+                Ok(revision)
+            }
+            (ProfileState::Invalid, Some(validation)) if !validation.passed => {
+                revision.state = ProfileState::Invalid;
+                revision.validation = Some(validation.into_evidence());
+                Ok(revision)
+            }
+            _ => Err(CoreError::validation(
+                "invalid_persisted_profile_revision",
+                "persisted Profile state and validation outcome must match",
+            )),
+        }
     }
 
     pub fn profile_id(&self) -> ProfileId {

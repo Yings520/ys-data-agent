@@ -60,7 +60,7 @@ impl SqliteRuntimeStore {
     }
 }
 
-fn open_connection(database: &Path) -> CoreResult<Connection> {
+pub(crate) fn open_connection(database: &Path) -> CoreResult<Connection> {
     if let Some(parent) = database.parent() {
         std::fs::create_dir_all(parent).map_err(storage_error)?;
     }
