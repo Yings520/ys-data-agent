@@ -13,6 +13,7 @@ use ys_agent_core::{
 const MIGRATION_0001: &str = include_str!("../migrations/0001_runtime.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_provider_management.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_credential_journal_recovery.sql");
+const MIGRATION_0004: &str = include_str!("../migrations/0004_run_binding_activation_revision.sql");
 
 #[derive(Debug, Clone)]
 pub struct SqliteRuntimeStore {
@@ -111,6 +112,12 @@ fn apply_migrations(connection: &mut Connection) -> CoreResult<()> {
             .execute_batch(MIGRATION_0003)
             .map_err(storage_error)?;
         record_migration(&transaction, 3)?;
+    }
+    if !migration_is_applied(&transaction, 4)? {
+        transaction
+            .execute_batch(MIGRATION_0004)
+            .map_err(storage_error)?;
+        record_migration(&transaction, 4)?;
     }
     transaction.commit().map_err(storage_error)
 }
@@ -224,6 +231,48 @@ fn insert_run(transaction: &Transaction<'_>, snapshot: &RunSnapshot) -> CoreResu
                 i64::try_from(snapshot.version).map_err(storage_error)?,
                 to_json(snapshot)?,
                 now,
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+fn provider_parameters_json(parameters: &ys_agent_core::ProviderParameters) -> CoreResult<String> {
+    let mut value = serde_json::to_value(parameters).map_err(storage_error)?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| CoreError::Storage {
+            message: "Provider parameters must serialize as an object".to_owned(),
+        })?
+        .insert("schema_version".to_owned(), serde_json::Value::from(1));
+    serde_json::to_string(&value).map_err(storage_error)
+}
+
+fn insert_run_provider_binding(
+    transaction: &Transaction<'_>,
+    binding: &ys_agent_core::RunProviderBinding,
+) -> CoreResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO run_provider_bindings(
+                run_id, profile_id, revision, provider, model_id, parameters_json,
+                credential_generation, validation_id, validation_digest,
+                fingerprint_json, fingerprint_hash, created_at, activation_revision
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                binding.run_id().to_string(),
+                binding.profile_id().to_string(),
+                i64::try_from(binding.profile_revision()).map_err(storage_error)?,
+                serialized_name(&binding.provider())?,
+                binding.model().as_str(),
+                provider_parameters_json(binding.parameters())?,
+                i64::try_from(binding.credential_generation().number()).map_err(storage_error)?,
+                binding.validation_id().to_string(),
+                binding.validation_digest().as_str(),
+                binding.fingerprint().canonical_json(),
+                binding.fingerprint().digest(),
+                Utc::now().to_rfc3339(),
+                i64::try_from(binding.activation_revision()).map_err(storage_error)?,
             ],
         )
         .map_err(storage_error)?;
@@ -480,6 +529,7 @@ fn commit_command_on_connection(
     }
     if let Some(command) = &batch.create_run {
         insert_run(&transaction, command.snapshot())?;
+        insert_run_provider_binding(&transaction, command.provider_binding())?;
     }
     if let Some(metadata) = &batch.new_artifact {
         insert_artifact(&transaction, metadata)?;

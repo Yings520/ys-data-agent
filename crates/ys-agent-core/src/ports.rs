@@ -284,6 +284,16 @@ pub trait ProviderProfileRepository: Send + Sync {
 #[async_trait]
 pub trait RunProviderBindingRepository: Send + Sync {
     async fn load_run_binding(&self, run_id: RunId) -> ProviderResult<crate::RunProviderBinding>;
+
+    async fn has_nonterminal_profile_references(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<bool>;
+
+    async fn has_nonterminal_credential_references(
+        &self,
+        credential: crate::CredentialGeneration,
+    ) -> ProviderResult<bool>;
 }
 
 /// OS-backed credential boundary. The only data that reaches a caller is a short-lived opaque

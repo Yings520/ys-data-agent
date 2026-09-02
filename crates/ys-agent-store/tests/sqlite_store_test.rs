@@ -3,15 +3,14 @@ use std::{fs, path::Path};
 use rusqlite::Connection;
 use tempfile::TempDir;
 use ys_agent_core::{
-    ActivateProfileRequest, ActivationPrecondition, ActiveProviderSnapshot, ArtifactKind,
-    ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CompatibilityEvidence, CoreError,
-    CreateRunCommand, CredentialGeneration, CredentialKind, CredentialMutationIntent,
-    CredentialMutationPhase, CredentialPointerCommit, OperationId, PendingRunEvent, ProfileId,
-    ProfileName, ProfileRevision, ProfileState, ProviderErrorCode, ProviderId, ProviderModelId,
-    ProviderParameters, PutArtifact, RevisionPrecondition, Run, RunEventKind, RunProviderBinding,
-    RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, SaveProfileRevision, Sensitivity,
-    Task, ValidationCommit, ValidationCommitPrecondition, ValidationVersions, WorkflowKind,
-    WorkspaceId,
+    ActivateProfileRequest, ActivationPrecondition, ArtifactKind, ArtifactStore, CommandId,
+    CommandReceipt, CommandResultKind, CompatibilityEvidence, CoreError, CreateRunCommand,
+    CredentialGeneration, CredentialKind, CredentialMutationIntent, CredentialMutationPhase,
+    CredentialPointerCommit, OperationId, PendingRunEvent, ProfileId, ProfileName, ProfileRevision,
+    ProfileState, ProviderErrorCode, ProviderId, ProviderModelId, ProviderParameters, PutArtifact,
+    RevisionPrecondition, Run, RunEventKind, RunProviderBinding, RunSnapshot, RunStatus,
+    RuntimeCommandBatch, RuntimeStore, SaveProfileRevision, Sensitivity, Task, ValidationCommit,
+    ValidationCommitPrecondition, ValidationVersions, WorkflowKind, WorkspaceId,
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
@@ -1428,27 +1427,97 @@ struct StoreFixture {
     store: SqliteRuntimeStore,
 }
 
-fn create_run(snapshot: RunSnapshot) -> CreateRunCommand {
+async fn create_run(store: &SqliteRuntimeStore, snapshot: RunSnapshot) -> CreateRunCommand {
     let profile_id = ProfileId::new();
-    let versions =
-        ValidationVersions::new("test-catalog", "test-probe", "test-liter", "test-codec");
+    let repository = store.provider_repository();
+    let model = ProviderModelId::new(ProviderId::DeepSeek, "deepseek/test-model")
+        .expect("test model prefix");
+    repository
+        .save_revision(SaveProfileRevision {
+            precondition: RevisionPrecondition {
+                profile_id,
+                expected_current_revision: None,
+            },
+            name: ProfileName::new(format!("Runtime test {profile_id}"))
+                .expect("test Profile name"),
+            revision: ProfileRevision::draft(
+                profile_id,
+                1,
+                ProviderId::DeepSeek,
+                model.clone(),
+                ProviderParameters::default(),
+                None,
+            )
+            .expect("initial test Profile revision"),
+        })
+        .await
+        .expect("save initial test Profile");
     let credential = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
         .expect("test credential generation");
-    let mut revision = ProfileRevision::draft(
+    Connection::open(store.database_path())
+        .expect("open test database")
+        .execute(
+            "INSERT INTO provider_credential_generations(
+                profile_id, generation, kind, vault_locator, status, created_at, updated_at
+             ) VALUES (?1, 1, 'api_key', ?2, 'available', 'now', 'now')",
+            [
+                profile_id.to_string(),
+                format!("io.ysda.runtime-test://{profile_id}:1"),
+            ],
+        )
+        .expect("seed test Credential metadata");
+    let revision = ProfileRevision::draft(
         profile_id,
-        1,
+        2,
         ProviderId::DeepSeek,
-        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/test-model")
-            .expect("test model prefix"),
+        model,
         ProviderParameters::default(),
         Some(credential),
     )
     .expect("test provider revision");
+    repository
+        .save_revision(SaveProfileRevision {
+            precondition: RevisionPrecondition {
+                profile_id,
+                expected_current_revision: Some(1),
+            },
+            name: ProfileName::new(format!("Runtime test {profile_id}"))
+                .expect("test Profile name"),
+            revision: revision.clone(),
+        })
+        .await
+        .expect("save test Provider revision");
+    let versions =
+        ValidationVersions::new("test-catalog", "test-probe", "test-liter", "test-codec");
     let evidence = CompatibilityEvidence::passing(revision.validation_inputs(versions.clone()));
-    revision
-        .accept_validation(evidence, versions)
-        .expect("test validation evidence");
-    let active = ActiveProviderSnapshot::from_ready(&revision, 1).expect("active test Provider");
+    let validation_id = evidence.id();
+    let validation_digest = evidence.digest();
+    repository
+        .save_validation(ValidationCommit {
+            precondition: ValidationCommitPrecondition {
+                operation_id: OperationId::new(),
+                profile_id,
+                revision: 2,
+                credential_generation: credential,
+                validation_digest: validation_digest.clone(),
+            },
+            evidence,
+        })
+        .await
+        .expect("save test Provider validation");
+    let active = repository
+        .activate(ActivateProfileRequest {
+            operation_id: OperationId::new(),
+            precondition: ActivationPrecondition {
+                profile_id,
+                revision: 2,
+                validation_id,
+                validation_digest,
+                expected_activation_revision: None,
+            },
+        })
+        .await
+        .expect("activate test Provider");
     let run_id = snapshot.run_id;
     CreateRunCommand::new(
         snapshot,
@@ -1496,7 +1565,7 @@ impl StoreFixture {
                 receipt,
                 new_session: None,
                 new_task: Some(task),
-                create_run: Some(create_run(snapshot.clone())),
+                create_run: Some(create_run(&self.store, snapshot.clone()).await),
                 new_artifact: None,
                 pending_events: vec![],
                 snapshot_update: None,
@@ -1596,7 +1665,7 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
             },
             new_session: None,
             new_task: Some(task),
-            create_run: Some(create_run(initial.clone())),
+            create_run: Some(create_run(&store, initial.clone()).await),
             new_artifact: None,
             pending_events: vec![],
             snapshot_update: None,
@@ -1717,7 +1786,7 @@ async fn duplicate_command_id_returns_the_origianl_recepit() {
         },
         new_session: None,
         new_task: Some(task),
-        create_run: Some(create_run(snapshot)),
+        create_run: Some(create_run(&fixture.store, snapshot).await),
         new_artifact: None,
         pending_events: vec![],
         snapshot_update: None,

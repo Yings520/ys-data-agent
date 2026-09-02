@@ -249,6 +249,20 @@ impl RunProviderBindingRepository for FakeRunProviderBindingRepository {
     ) -> ProviderResult<ys_agent_core::RunProviderBinding> {
         unavailable()
     }
+
+    async fn has_nonterminal_profile_references(
+        &self,
+        _profile_id: ProfileId,
+    ) -> ProviderResult<bool> {
+        Ok(false)
+    }
+
+    async fn has_nonterminal_credential_references(
+        &self,
+        _credential: CredentialGeneration,
+    ) -> ProviderResult<bool> {
+        Ok(false)
+    }
 }
 
 #[async_trait::async_trait]

@@ -1,5 +1,6 @@
 use std::{path::PathBuf, str::FromStr};
 
+use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -10,7 +11,8 @@ use ys_agent_core::{
     PersistedCompatibilityEvidence, PersistedCredentialMutationRecord, PersistedProfileRevision,
     ProfileId, ProfileRevision, ProfileState, ProfileSummary, ProviderErrorCode, ProviderField,
     ProviderId, ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
-    ProviderResult, RevisionPrecondition, SaveProfileRevision, ValidationCommit,
+    ProviderResult, RevisionPrecondition, RunId, RunProviderBinding, RunProviderBindingRepository,
+    SaveProfileRevision, ValidationCommit,
 };
 
 use crate::{SqliteRuntimeStore, sqlite::open_connection};
@@ -46,11 +48,95 @@ pub struct SqliteProviderRepository {
     database: PathBuf,
 }
 
+/// Read-only access to immutable Run bindings and their nonterminal retention guards.
+#[derive(Debug, Clone)]
+pub struct SqliteRunBindingRepository {
+    database: PathBuf,
+}
+
 impl SqliteRuntimeStore {
     pub fn provider_repository(&self) -> SqliteProviderRepository {
         SqliteProviderRepository {
             database: self.database_path().to_path_buf(),
         }
+    }
+
+    pub fn run_binding_repository(&self) -> SqliteRunBindingRepository {
+        SqliteRunBindingRepository {
+            database: self.database_path().to_path_buf(),
+        }
+    }
+}
+
+impl SqliteRunBindingRepository {
+    async fn with_connection<T, F>(&self, operation: F) -> ProviderResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> ProviderResult<T> + Send + 'static,
+    {
+        let database = self.database.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&database).map_err(|_| internal_error())?;
+            operation(&connection)
+        })
+        .await
+        .map_err(|_| internal_error())?
+    }
+}
+
+#[async_trait]
+impl RunProviderBindingRepository for SqliteRunBindingRepository {
+    async fn load_run_binding(&self, run_id: RunId) -> ProviderResult<RunProviderBinding> {
+        self.with_connection(move |connection| load_run_binding(connection, run_id))
+            .await
+    }
+
+    async fn has_nonterminal_profile_references(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<bool> {
+        self.with_connection(move |connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM run_provider_bindings AS binding
+                        JOIN runs AS run ON run.run_id = binding.run_id
+                        WHERE binding.profile_id = ?1
+                          AND run.status NOT IN ('Succeeded', 'Failed', 'Cancelled')
+                     )",
+                    [profile_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(provider_storage_error)
+        })
+        .await
+    }
+
+    async fn has_nonterminal_credential_references(
+        &self,
+        credential: CredentialGeneration,
+    ) -> ProviderResult<bool> {
+        self.with_connection(move |connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM run_provider_bindings AS binding
+                        JOIN runs AS run ON run.run_id = binding.run_id
+                        WHERE binding.profile_id = ?1
+                          AND binding.credential_generation = ?2
+                          AND run.status NOT IN ('Succeeded', 'Failed', 'Cancelled')
+                     )",
+                    params![
+                        credential.profile_id().to_string(),
+                        to_i64(credential.number())?
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(provider_storage_error)
+        })
+        .await
     }
 }
 
@@ -1224,6 +1310,110 @@ fn load_revision(
         validation,
     })
     .map_err(|_| internal_error())
+}
+
+fn load_run_binding(connection: &Connection, run_id: RunId) -> ProviderResult<RunProviderBinding> {
+    type RunBindingRow = (
+        String,
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        i64,
+    );
+    let row: Option<RunBindingRow> = connection
+        .query_row(
+            "SELECT binding.profile_id, binding.revision, binding.provider,
+                    binding.model_id, binding.parameters_json,
+                    binding.credential_generation, binding.validation_id,
+                    binding.validation_digest, binding.fingerprint_json,
+                    binding.fingerprint_hash, binding.activation_revision
+             FROM run_provider_bindings AS binding
+             WHERE binding.run_id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(provider_storage_error)?;
+    let (
+        profile_id,
+        revision,
+        provider,
+        model,
+        parameters,
+        credential_generation,
+        validation_id,
+        validation_digest,
+        fingerprint_json,
+        fingerprint_hash,
+        activation_revision,
+    ) = row.ok_or_else(internal_error)?;
+    let profile_id = parse_id(&profile_id)?;
+    let revision = u64::try_from(revision).map_err(|_| internal_error())?;
+    let provider: ProviderId = parse_enum(&provider)?;
+    let credential_kind: String = connection
+        .query_row(
+            "SELECT kind FROM provider_credential_generations
+             WHERE profile_id = ?1 AND generation = ?2",
+            params![profile_id.to_string(), credential_generation],
+            |row| row.get(0),
+        )
+        .map_err(provider_storage_error)?;
+    let credential_generation = CredentialGeneration::new(
+        profile_id,
+        u64::try_from(credential_generation).map_err(|_| internal_error())?,
+        parse_enum(&credential_kind)?,
+    )
+    .map_err(|_| internal_error())?;
+    let revision = ProfileRevision::hydrate(PersistedProfileRevision {
+        profile_id,
+        revision,
+        provider,
+        model: ProviderModelId::new(provider, model).map_err(|_| internal_error())?,
+        parameters: parse_parameters(&parameters)?,
+        credential_generation: Some(credential_generation),
+        state: ProfileState::Ready,
+        validation: Some(
+            PersistedCompatibilityEvidence::new(
+                validation_id.parse().map_err(|_| internal_error())?,
+                validation_digest,
+                true,
+            )
+            .map_err(|_| internal_error())?,
+        ),
+    })
+    .map_err(|_| internal_error())?;
+    let active = ActiveProviderSnapshot::from_ready(
+        &revision,
+        u64::try_from(activation_revision).map_err(|_| internal_error())?,
+    )
+    .map_err(|_| internal_error())?;
+    let binding = RunProviderBinding::from_active(run_id, active).map_err(|_| internal_error())?;
+    if binding.fingerprint().canonical_json() != fingerprint_json
+        || binding.fingerprint().digest() != fingerprint_hash
+    {
+        return Err(internal_error());
+    }
+    Ok(binding)
 }
 
 fn parameters_json(parameters: &ProviderParameters) -> ProviderResult<String> {

@@ -3,5 +3,5 @@ mod provider;
 mod sqlite;
 
 pub use local_artifacts::LocalArtifactStore;
-pub use provider::SqliteProviderRepository;
+pub use provider::{SqliteProviderRepository, SqliteRunBindingRepository};
 pub use sqlite::SqliteRuntimeStore;

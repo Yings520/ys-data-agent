@@ -58,7 +58,7 @@
   - _Requirements: 3.3, 3.5, 3.7, 3.8, 3.9, 8.4, 8.5, 8.6, 11.2_
   - _Boundary: Validated core credential journal contracts and Credential mutation journal and reconciliation repository_
   - _Depends: 1.3, 2.1, 2.2_
-- [ ] 2.4 实现不可变 Run binding repository 与原子写入
+- [x] 2.4 实现不可变 Run binding repository 与原子写入
   - 在同一 SQLite transaction 中验证 expected active snapshot，并写入 Run、Run provider binding 与首批 lifecycle events。
   - 提供按 Run 读取 binding、按 profile/generation 查询非终态引用和终态 retirement 支持，禁止更新既有 binding。
   - 用 race、rollback、恢复与历史 Profile 删除测试证明没有半个 Run、binding 后补写或历史解释丢失。

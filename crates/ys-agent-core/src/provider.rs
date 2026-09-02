@@ -854,6 +854,7 @@ impl ActiveProviderSlot {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct FingerprintFields<'a> {
+    schema_version: u32,
     profile_id: ProfileId,
     profile_revision: u64,
     provider: ProviderId,
@@ -895,6 +896,7 @@ impl ProviderFingerprint {
     pub fn from_revision(revision: &ProfileRevision) -> CoreResult<Self> {
         revision.ready_evidence()?;
         let canonical_json = serde_json::to_string(&FingerprintFields {
+            schema_version: 1,
             profile_id: revision.profile_id,
             profile_revision: revision.revision,
             provider: revision.provider,
@@ -973,6 +975,30 @@ impl RunProviderBinding {
 
     pub fn validation_id(&self) -> ValidationId {
         self.active.validation_id()
+    }
+
+    pub fn activation_revision(&self) -> u64 {
+        self.active.activation_revision()
+    }
+
+    pub fn provider(&self) -> ProviderId {
+        self.active.provider
+    }
+
+    pub fn model(&self) -> &ProviderModelId {
+        &self.active.model
+    }
+
+    pub fn parameters(&self) -> &ProviderParameters {
+        &self.active.parameters
+    }
+
+    pub fn credential_generation(&self) -> CredentialGeneration {
+        self.active.credential_generation
+    }
+
+    pub fn validation_digest(&self) -> &ValidationDigest {
+        &self.active.validation_digest
     }
 }
 
