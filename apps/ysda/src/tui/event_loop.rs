@@ -416,7 +416,7 @@ mod tests {
     use ys_agent_adapters::model::FakeModelProvider;
     use ys_agent_core::{AgentAction, ModelResponse, Principal, WorkspaceId};
     use ys_agent_runtime::{
-        InProcessAgentService, NoopRunScheduler,
+        InProcessAgentService, NoopRunScheduler, StaticRunProviderBindingSource,
         doctor::{DoctorReport, QueryCapability},
     };
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
@@ -452,12 +452,12 @@ mod tests {
             LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
         );
         let workspace_id = WorkspaceId::new();
-        let service = Arc::new(InProcessAgentService::new(
-            workspace_id,
-            store,
-            artifacts,
-            Arc::new(NoopRunScheduler),
-        ));
+        let service = Arc::new(
+            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_run_provider_binding_source(Arc::new(
+                    StaticRunProviderBindingSource::for_test(),
+                )),
+        );
         let principal = Principal::local_operator("test-operator");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());
         let mut app = TuiApp::for_principal(principal);
@@ -510,6 +510,9 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
             InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_run_provider_binding_source(Arc::new(
+                    StaticRunProviderBindingSource::for_test(),
+                ))
                 .with_conversation_model(model, "delayed-test-model"),
         );
         let principal = Principal::local_operator("test-operator");
@@ -609,6 +612,9 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
             InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_run_provider_binding_source(Arc::new(
+                    StaticRunProviderBindingSource::for_test(),
+                ))
                 .with_conversation_model(model, "timeout-test-model"),
         );
         let principal = Principal::local_operator("test-operator");

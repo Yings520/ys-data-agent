@@ -630,3 +630,16 @@ fn all_providers_report_the_required_v0_2_capabilities() {
         assert!(capabilities.max_context_tokens > 0);
     }
 }
+
+#[test]
+fn fake_and_replay_remain_interchangeable_model_provider_ports() {
+    fn accepts_model_provider(_: &dyn ModelProvider) {}
+
+    let fake = FakeModelProvider::new(|_request| async {
+        Err::<ModelResponse, CoreError>(CoreError::ReplayExhausted)
+    });
+    let replay = ReplayModelProvider::from_responses(Vec::new());
+
+    accepts_model_provider(&fake);
+    accepts_model_provider(&replay);
+}

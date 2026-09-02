@@ -436,10 +436,16 @@ fn commit_command_on_connection(
         });
     }
 
-    if batch.new_run_snapshot.is_some() && batch.snapshot_update.is_some() {
+    if batch.create_run.is_some() && batch.snapshot_update.is_some() {
         return Err(CoreError::Validation {
             code: "ambiguous_snapshot_mutation",
             message: "one command cannot create and update a run snapshot".to_owned(),
+        });
+    }
+    if batch.create_run.is_some() && !batch.pending_events.is_empty() {
+        return Err(CoreError::Validation {
+            code: "run_creation_events_outside_command",
+            message: "Run creation lifecycle events must be carried by CreateRunCommand".to_owned(),
         });
     }
 
@@ -449,16 +455,17 @@ fn commit_command_on_connection(
     if let Some(task) = &batch.new_task {
         insert_task(&transaction, task)?;
     }
-    if let Some(snapshot) = &batch.new_run_snapshot {
-        insert_run(&transaction, snapshot)?;
+    if let Some(command) = &batch.create_run {
+        insert_run(&transaction, command.snapshot())?;
     }
     if let Some(metadata) = &batch.new_artifact {
         insert_artifact(&transaction, metadata)?;
     }
 
-    match (&batch.new_run_snapshot, &batch.snapshot_update) {
-        (Some(snapshot), None) => {
-            let mut events = batch.pending_events;
+    match (&batch.create_run, &batch.snapshot_update) {
+        (Some(command), None) => {
+            let snapshot = command.snapshot();
+            let mut events = command.initial_events().to_vec();
             events.push(projection_event(snapshot));
             insert_events(&transaction, &snapshot.run_id, events)?;
         }

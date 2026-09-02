@@ -2,15 +2,48 @@ use std::fs;
 
 use tempfile::TempDir;
 use ys_agent_core::{
-    ArtifactKind, ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CoreError,
-    PendingRunEvent, PutArtifact, Run, RunEventKind, RunSnapshot, RunStatus, RuntimeCommandBatch,
-    RuntimeStore, Sensitivity, Task, WorkflowKind, WorkspaceId,
+    ActiveProviderSnapshot, ArtifactKind, ArtifactStore, CommandId, CommandReceipt,
+    CommandResultKind, CompatibilityEvidence, CoreError, CreateRunCommand, CredentialGeneration,
+    CredentialKind, PendingRunEvent, ProfileId, ProfileRevision, ProviderId, ProviderModelId,
+    ProviderParameters, PutArtifact, Run, RunEventKind, RunProviderBinding, RunSnapshot, RunStatus,
+    RuntimeCommandBatch, RuntimeStore, Sensitivity, Task, ValidationVersions, WorkflowKind,
+    WorkspaceId,
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
 struct StoreFixture {
     _directory: TempDir,
     store: SqliteRuntimeStore,
+}
+
+fn create_run(snapshot: RunSnapshot) -> CreateRunCommand {
+    let profile_id = ProfileId::new();
+    let versions =
+        ValidationVersions::new("test-catalog", "test-probe", "test-liter", "test-codec");
+    let credential = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+        .expect("test credential generation");
+    let mut revision = ProfileRevision::draft(
+        profile_id,
+        1,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/test-model")
+            .expect("test model prefix"),
+        ProviderParameters::default(),
+        Some(credential),
+    )
+    .expect("test provider revision");
+    let evidence = CompatibilityEvidence::passing(revision.validation_inputs(versions.clone()));
+    revision
+        .accept_validation(evidence, versions)
+        .expect("test validation evidence");
+    let active = ActiveProviderSnapshot::from_ready(&revision, 1).expect("active test Provider");
+    let run_id = snapshot.run_id;
+    CreateRunCommand::new(
+        snapshot,
+        RunProviderBinding::from_active(run_id, active).expect("test Run binding"),
+        Vec::new(),
+    )
+    .expect("complete Run create command")
 }
 
 impl StoreFixture {
@@ -51,7 +84,7 @@ impl StoreFixture {
                 receipt,
                 new_session: None,
                 new_task: Some(task),
-                new_run_snapshot: Some(snapshot.clone()),
+                create_run: Some(create_run(snapshot.clone())),
                 new_artifact: None,
                 pending_events: vec![],
                 snapshot_update: None,
@@ -151,7 +184,7 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
             },
             new_session: None,
             new_task: Some(task),
-            new_run_snapshot: Some(initial.clone()),
+            create_run: Some(create_run(initial.clone())),
             new_artifact: None,
             pending_events: vec![],
             snapshot_update: None,
@@ -185,15 +218,19 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
 
     assert_eq!(loaded.status, RunStatus::WaitingForInput);
     assert_eq!(loaded.version, 2);
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
     assert_eq!(events[0].sequence, 1);
-    assert_eq!(events[3].sequence, 4);
+    assert_eq!(events[4].sequence, 5);
     assert!(matches!(
         events[0].event.kind,
+        RunEventKind::ProviderBound { .. }
+    ));
+    assert!(matches!(
+        events[1].event.kind,
         RunEventKind::RunStateProjected { .. }
     ));
     assert!(matches!(
-        events[3].event.kind,
+        events[4].event.kind,
         RunEventKind::RunStateProjected { .. }
     ));
 }
@@ -268,7 +305,7 @@ async fn duplicate_command_id_returns_the_origianl_recepit() {
         },
         new_session: None,
         new_task: Some(task),
-        new_run_snapshot: Some(snapshot),
+        create_run: Some(create_run(snapshot)),
         new_artifact: None,
         pending_events: vec![],
         snapshot_update: None,

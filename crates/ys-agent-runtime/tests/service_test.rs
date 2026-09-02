@@ -15,6 +15,7 @@ use ys_agent_core::{
 use ys_agent_runtime::{
     AgentServiceApi, CoordinationDecision, Coordinator, CreateTaskRequest, InProcessAgentService,
     RuleBasedCoordinator, RunScheduler, SendMessageRequest, ServiceReply,
+    StaticRunProviderBindingSource,
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
@@ -54,14 +55,18 @@ struct ServiceFixture {
 
 impl ServiceFixture {
     async fn new() -> Self {
-        Self::build(None).await
+        Self::build(None, true).await
     }
 
     async fn with_conversation_model(model: Arc<dyn ys_agent_core::ModelProvider>) -> Self {
-        Self::build(Some(model)).await
+        Self::build(Some(model), true).await
     }
 
-    async fn build(model: Option<Arc<dyn ys_agent_core::ModelProvider>>) -> Self {
+    async fn without_provider_binding() -> Self {
+        Self::build(None, false).await
+    }
+
+    async fn build(model: Option<Arc<dyn ys_agent_core::ModelProvider>>, bind_runs: bool) -> Self {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = Arc::new(
             SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -79,6 +84,11 @@ impl ServiceFixture {
             scheduler.clone(),
             2,
         );
+        if bind_runs {
+            service = service.with_run_provider_binding_source(Arc::new(
+                StaticRunProviderBindingSource::for_test(),
+            ));
+        }
         if let Some(model) = model {
             service = service.with_conversation_model(model, "test-model");
         }
@@ -155,7 +165,7 @@ impl ServiceFixture {
                 },
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: Some(metadata.clone()),
                 pending_events: Vec::new(),
                 snapshot_update: None,
@@ -164,6 +174,30 @@ impl ServiceFixture {
             .expect("index Artifact metadata");
         metadata
     }
+}
+
+#[tokio::test]
+async fn production_run_creation_rejects_missing_provider_binding_before_persistence() {
+    let fixture = ServiceFixture::without_provider_binding().await;
+
+    let error = fixture
+        .service
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            fixture.session_id(),
+            "Query GMV",
+        ))
+        .await
+        .expect_err("production Run requires a Provider binding");
+
+    assert!(matches!(
+        error,
+        CoreError::Validation {
+            code: "provider.no_active_profile",
+            ..
+        }
+    ));
+    assert_eq!(fixture.created_run_count().await, 0);
 }
 
 #[tokio::test]
@@ -640,7 +674,19 @@ async fn subscription_reads_durable_events_before_live_notifications() {
     let event = subscription.next().await.expect("durable event");
 
     assert_eq!(event.sequence, 1);
-    assert!(matches!(event.event.kind, RunEventKind::RunStarted));
+    assert!(matches!(
+        event.event.kind,
+        RunEventKind::ProviderBound { .. }
+    ));
+    assert!(matches!(
+        subscription
+            .next()
+            .await
+            .expect("RunStarted event")
+            .event
+            .kind,
+        RunEventKind::RunStarted
+    ));
 }
 
 #[tokio::test]

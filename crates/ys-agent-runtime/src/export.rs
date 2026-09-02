@@ -362,7 +362,7 @@ impl ArtifactExportService for ArtifactExporter {
                 receipt,
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: Some(metadata.clone()),
                 pending_events: Vec::new(),
                 snapshot_update: None,

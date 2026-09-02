@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentAction, ArtifactId, ArtifactMetadata, CoreError, CoreResult, CostClass, EventId,
-    PrincipalId, RunId, RunSnapshot, StepId, TaskId, ToolCall, ToolCallId, ToolFailure,
-    WorkspaceId,
+    PrincipalId, ProviderFingerprint, RunId, RunSnapshot, StepId, TaskId, ToolCall, ToolCallId,
+    ToolFailure, WorkspaceId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +64,10 @@ impl VersionedRunEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunEventKind {
+    /// The non-sensitive Provider configuration snapshot selected atomically for this Run.
+    ProviderBound {
+        fingerprint: ProviderFingerprint,
+    },
     RunStarted,
     StepStarted {
         step_id: StepId,

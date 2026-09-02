@@ -300,12 +300,17 @@ impl QueryWorkflowFixture {
         );
         let workspace_id = ys_agent_core::WorkspaceId::new();
         let principal = ys_agent_core::Principal::local_operator("tutorial");
-        let service = Arc::new(ys_agent_runtime::InProcessAgentService::new(
-            workspace_id,
-            runtime.clone(),
-            artifacts.clone(),
-            Arc::new(ys_agent_runtime::NoopRunScheduler),
-        ));
+        let service = Arc::new(
+            ys_agent_runtime::InProcessAgentService::new(
+                workspace_id,
+                runtime.clone(),
+                artifacts.clone(),
+                Arc::new(ys_agent_runtime::NoopRunScheduler),
+            )
+            .with_run_provider_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunProviderBindingSource::for_test(),
+            )),
+        );
         let session = ys_agent_runtime::AgentServiceApi::create_session(
             service.as_ref(),
             ys_agent_core::CommandId::new(),
@@ -1348,12 +1353,17 @@ async fn open_runtime_components(
         model,
         Arc::new(TelemetryDispatcher::default()),
     )?;
-    let service = Arc::new(ys_agent_runtime::InProcessAgentService::new(
-        workspace_id,
-        runtime.clone(),
-        artifacts,
-        Arc::new(ys_agent_runtime::NoopRunScheduler),
-    ));
+    let service = Arc::new(
+        ys_agent_runtime::InProcessAgentService::new(
+            workspace_id,
+            runtime.clone(),
+            artifacts,
+            Arc::new(ys_agent_runtime::NoopRunScheduler),
+        )
+        .with_run_provider_binding_source(Arc::new(
+            ys_agent_runtime::StaticRunProviderBindingSource::for_test(),
+        )),
+    );
     let recovery = Arc::new(ys_agent_runtime::RecoveryManager::new(runtime.clone()));
     Ok(RuntimeComponents {
         runtime,

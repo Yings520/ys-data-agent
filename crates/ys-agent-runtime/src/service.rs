@@ -8,11 +8,15 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use ys_agent_core::{
     ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, ArtifactKind, ArtifactMetadata,
-    ArtifactRef, ArtifactStore, CommandId, CommandReceipt, CommandResultKind, ContextManifest,
-    CoreError, CoreResult, EventActor, EventEnvelope, ExportFormat, ModelMessage, ModelProvider,
-    ModelRequest, ModelRole, PendingRunEvent, Principal, PutArtifact, RetentionPolicy, Run,
-    RunEventKind, RunId, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, Sensitivity,
-    Session, SessionId, Task, TaskId, WorkflowKind, WorkspaceId,
+    ArtifactRef, ArtifactStore, CommandId, CommandReceipt, CommandResultKind,
+    CompatibilityEvidence, ContextManifest, CoreError, CoreResult, CredentialGeneration,
+    CredentialKind, EventActor, EventEnvelope, ExportFormat, ModelMessage, ModelProvider,
+    ModelRequest, ModelRole, PendingRunEvent, Principal, ProfileId, ProfileRevision,
+    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError, ProviderModelId,
+    ProviderParameters, ProviderRemediation, ProviderResult, PutArtifact, RetentionPolicy, Run,
+    RunEventKind, RunId, RunProviderBinding, RunProviderBindingSource, RunSnapshot, RunStatus,
+    RuntimeCommandBatch, RuntimeStore, Sensitivity, Session, SessionId, Task, TaskId,
+    ValidationVersions, WorkflowKind, WorkspaceId,
 };
 
 use crate::{
@@ -267,6 +271,68 @@ pub struct InProcessAgentService {
     event_sender: broadcast::Sender<ServiceEvent>,
     artifact_retention_days: u32,
     front_door: Option<FrontDoorAgent>,
+    run_provider_bindings: Arc<dyn RunProviderBindingSource>,
+}
+
+#[derive(Debug, Default)]
+pub struct UnavailableRunProviderBindingSource;
+
+#[async_trait]
+impl RunProviderBindingSource for UnavailableRunProviderBindingSource {
+    async fn bind_new_run(&self, _run_id: RunId) -> ProviderResult<RunProviderBinding> {
+        Err(ProviderManagementError::new(
+            ProviderErrorCode::NoActiveProfile,
+            Some(ProviderField::Activation),
+            ProviderRemediation::EnterNoActiveProvider,
+        ))
+    }
+}
+
+/// Deterministic non-network binding source for Fake/Replay test assemblies only.
+#[derive(Clone)]
+pub struct StaticRunProviderBindingSource {
+    active: ys_agent_core::ActiveProviderSnapshot,
+}
+
+impl StaticRunProviderBindingSource {
+    pub fn for_test() -> Self {
+        let profile_id = ProfileId::new();
+        let versions =
+            ValidationVersions::new("test-catalog", "test-probe", "test-liter", "test-codec");
+        let credential = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+            .expect("test credential generation is valid");
+        let mut revision = ProfileRevision::draft(
+            profile_id,
+            1,
+            ProviderId::DeepSeek,
+            ProviderModelId::new(ProviderId::DeepSeek, "deepseek/test-model")
+                .expect("test model prefix is valid"),
+            ProviderParameters::default(),
+            Some(credential),
+        )
+        .expect("test provider revision is valid");
+        let evidence = CompatibilityEvidence::passing(revision.validation_inputs(versions.clone()));
+        revision
+            .accept_validation(evidence, versions)
+            .expect("test validation evidence matches");
+        Self {
+            active: ys_agent_core::ActiveProviderSnapshot::from_ready(&revision, 1)
+                .expect("test active snapshot is valid"),
+        }
+    }
+}
+
+#[async_trait]
+impl RunProviderBindingSource for StaticRunProviderBindingSource {
+    async fn bind_new_run(&self, run_id: RunId) -> ProviderResult<RunProviderBinding> {
+        RunProviderBinding::from_active(run_id, self.active.clone()).map_err(|_| {
+            ProviderManagementError::new(
+                ProviderErrorCode::Internal,
+                None,
+                ProviderRemediation::Retry,
+            )
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -403,6 +469,7 @@ impl InProcessAgentService {
             event_sender,
             artifact_retention_days: options.artifact_retention_days,
             front_door: None,
+            run_provider_bindings: Arc::new(UnavailableRunProviderBindingSource),
         }
     }
 
@@ -424,6 +491,14 @@ impl InProcessAgentService {
         model_name: impl Into<String>,
     ) -> Self {
         self.with_front_door_agent(provider, model_name)
+    }
+
+    pub fn with_run_provider_binding_source(
+        mut self,
+        source: Arc<dyn RunProviderBindingSource>,
+    ) -> Self {
+        self.run_provider_bindings = source;
+        self
     }
 
     async fn classify_front_door(&self, input: &str) -> CoreResult<FrontDoorDecision> {
@@ -541,7 +616,7 @@ impl InProcessAgentService {
                 receipt: receipt.clone(),
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: vec![],
                 snapshot_update: None,
@@ -633,6 +708,12 @@ impl InProcessAgentService {
             message: None,
             capability: None,
         };
+        let binding = self
+            .run_provider_bindings
+            .bind_new_run(snapshot.run_id)
+            .await
+            .map_err(|error| CoreError::validation(error.code(), error.to_string()))?;
+        let create_run = ys_agent_core::CreateRunCommand::new(snapshot, binding, events)?;
         self.store
             .commit_command(RuntimeCommandBatch {
                 command_id,
@@ -640,9 +721,9 @@ impl InProcessAgentService {
                 receipt,
                 new_session: None,
                 new_task: task,
-                new_run_snapshot: Some(snapshot),
+                create_run: Some(create_run),
                 new_artifact: None,
-                pending_events: events,
+                pending_events: Vec::new(),
                 snapshot_update: None,
             })
             .await
@@ -691,7 +772,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: Some(session),
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: vec![],
                 snapshot_update: None,
@@ -741,7 +822,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: None,
                 new_task: Some(task),
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: vec![],
                 snapshot_update: None,
@@ -950,30 +1031,14 @@ impl AgentServiceApi for InProcessAgentService {
                 primary_artifact_id: None,
                 last_completed_step_id: None,
             };
-            let receipt = CommandReceipt {
+            self.commit_run(
                 command_id,
-                command_fingerprint: fingerprint.clone(),
-                result_kind: CommandResultKind::RunStarted,
-                session_id: None,
-                task_id: Some(*task_id),
-                run_id: Some(retry.run_id),
-                artifact_id: None,
-                message: None,
-                capability: None,
-            };
-            self.store
-                .commit_command(RuntimeCommandBatch {
-                    command_id,
-                    command_fingerprint: fingerprint,
-                    receipt,
-                    new_session: None,
-                    new_task: None,
-                    new_run_snapshot: Some(retry.clone()),
-                    new_artifact: None,
-                    pending_events: vec![system_event(RunEventKind::RunStarted)],
-                    snapshot_update: None,
-                })
-                .await?;
+                fingerprint,
+                None,
+                retry.clone(),
+                vec![system_event(RunEventKind::RunStarted)],
+            )
+            .await?;
             self.scheduler.schedule(retry.run_id).await?;
             self.event_publisher().notify(retry.run_id, u64::MAX);
             return Ok(retry.run_id);
@@ -1007,7 +1072,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: Vec::new(),
                 snapshot_update: None,
@@ -1169,7 +1234,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: Some(metadata.clone()),
                 pending_events: vec![
                     system_event(RunEventKind::ClarificationAnswered {
@@ -1234,7 +1299,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: vec![system_event(RunEventKind::RunCancelled { reason })],
                 snapshot_update: Some(cancelled),

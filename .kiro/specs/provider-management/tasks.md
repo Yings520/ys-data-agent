@@ -24,7 +24,7 @@
   - _Requirements: 2.1, 3.1, 3.2, 3.4, 4.1, 5.1, 7.1, 8.1, 8.2, 9.4_
   - _Boundary: Core Provider ports and masked service views_
   - _Depends: 1.2_
-- [ ] 1.4 扩展 Run 创建与 Provider 绑定命令契约
+- [x] 1.4 扩展 Run 创建与 Provider 绑定命令契约
   - 使 Run 创建命令批次强制携带完整的不可变 Provider binding，并定义首个非敏感 ProviderBound lifecycle event。
   - 保留现有 tool call ID、Policy、Tool Runtime、QueryBudget、Completion Gate 与显式失败契约，不把治理权威交给 Provider。
   - 增加 contract tests，拒绝缺少 binding 的生产 Run 创建并证明 Fake/Replay 仍可遵循稳定 ModelProvider port。

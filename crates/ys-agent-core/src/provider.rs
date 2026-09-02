@@ -57,7 +57,7 @@ impl ProviderId {
 }
 
 /// A model identifier whose provider prefix has already been verified.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProviderModelId {
     provider: ProviderId,
     value: String,
@@ -192,7 +192,7 @@ impl Drop for SecretValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ParameterValue {
     Boolean(bool),
@@ -233,7 +233,7 @@ pub enum ProviderParameterKey {
 }
 
 /// Only non-sensitive, provider-request parameters may enter a configuration snapshot.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderParameters {
     temperature: Option<f32>,
     max_tokens: Option<u32>,
@@ -668,7 +668,7 @@ pub struct ActiveProviderSnapshot {
 }
 
 impl ActiveProviderSnapshot {
-    fn from_ready(revision: &ProfileRevision, activation_revision: u64) -> CoreResult<Self> {
+    pub fn from_ready(revision: &ProfileRevision, activation_revision: u64) -> CoreResult<Self> {
         let evidence = revision.ready_evidence()?;
         let credential_generation = revision.credential_generation.ok_or_else(|| {
             CoreError::validation(
@@ -770,7 +770,7 @@ impl From<&ProviderParameters> for FingerprintParameters {
 }
 
 /// Canonical, non-sensitive identity for the Provider configuration selected by a Run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderFingerprint {
     profile_id: ProfileId,
     profile_revision: u64,
@@ -846,6 +846,14 @@ impl RunProviderBinding {
 
     pub fn profile_id(&self) -> ProfileId {
         self.active.profile_id()
+    }
+
+    pub fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub fn fingerprint(&self) -> &ProviderFingerprint {
+        &self.fingerprint
     }
 
     pub fn profile_revision(&self) -> u64 {

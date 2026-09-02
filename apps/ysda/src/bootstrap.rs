@@ -28,7 +28,7 @@ use ys_agent_core::{
 use ys_agent_runtime::{
     AgentServiceApi, ContextAssembler, Harness, HarnessConfig, HarnessDependencies,
     InMemoryQueryContextProvider, InProcessAgentService, LoopDriver, PromptBuilder, RunScheduler,
-    ServiceEventPublisher,
+    ServiceEventPublisher, StaticRunProviderBindingSource,
     doctor::{DoctorInputs, DoctorProbe, ModelReadiness, SourceReadiness, WorkspaceDoctor},
     export::{ArtifactExporter, DefaultExportPolicy, ExportWriter, WrittenExport},
     telemetry::{TelemetryDispatcher, TracingTelemetrySink},
@@ -1385,12 +1385,10 @@ pub async fn assemble_deterministic_query_runtime(
         driver: Arc::new(LoopDriver::with_defaults(harness)),
         model,
     });
-    let service: Arc<dyn AgentServiceApi> = Arc::new(InProcessAgentService::new(
-        workspace_id,
-        runtime_store,
-        artifact_store,
-        scheduler,
-    ));
+    let service: Arc<dyn AgentServiceApi> = Arc::new(
+        InProcessAgentService::new(workspace_id, runtime_store, artifact_store, scheduler)
+            .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::for_test())),
+    );
     Ok(DeterministicRuntimeAssembly {
         service,
         workspace_id,

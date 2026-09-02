@@ -27,7 +27,7 @@ pub use recovery::{RecoveryDecision, RecoveryManager, RecoveryRequest};
 pub use service::{
     AgentServiceApi, ArtifactView, CreateTaskRequest, EventSubscription, InProcessAgentService,
     NoopRunScheduler, RunScheduler, SendMessageRequest, ServiceEvent, ServiceEventPublisher,
-    ServiceReply,
+    ServiceReply, StaticRunProviderBindingSource, UnavailableRunProviderBindingSource,
 };
 pub use workflow::query::{
     ClarificationNeed, FreshnessState, MetricReference, ParameterKind, QUERY_SYSTEM_PROMPT_VERSION,

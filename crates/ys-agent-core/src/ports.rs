@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::{
     ActivateProfileRequest, ActiveProviderSnapshot, ActiveProviderView, AllowedDataScope,
     ArtifactAccessContext, ArtifactMetadata, ArtifactRef, CommandId, CommandReceipt,
-    CompatibilityEvidenceView, ContextEvidence, CoreResult, CredentialLease,
+    CompatibilityEvidenceView, ContextEvidence, CoreError, CoreResult, CredentialLease,
     CredentialMutationIntent, CredentialMutationRequest, CredentialPointerCommit,
     CredentialProtectionStatus, CredentialViewStatus, DeleteProfileRequest,
     DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, EventEnvelope,
@@ -15,10 +15,78 @@ use crate::{
     ProfileId, ProfileRevision, ProfileSummary, ProtectedCredentialWrite, ProviderCatalogView,
     ProviderClientBinding, ProviderCredentialReference, ProviderDoctorView, ProviderResult,
     PutArtifact, QueryBudget, QueryPreflight, QueryRequest, QueryResult, RemoteRevocationOutcome,
-    ResolvedRunProvider, RunId, RunSnapshot, SaveProfileRequest, SaveProfileRevision, Session,
-    SessionId, SourceId, Task, TaskId, ToolCallId, ToolOutcome, ToolSpec, ValidateProfileRequest,
-    ValidationCommit, WorkspaceId,
+    ResolvedRunProvider, RunId, RunProviderBinding, RunSnapshot, SaveProfileRequest,
+    SaveProfileRevision, Session, SessionId, SourceId, Task, TaskId, ToolCallId, ToolOutcome,
+    ToolSpec, ValidateProfileRequest, ValidationCommit, WorkspaceId,
 };
+
+/// A production Run is only created from this complete, immutable Provider snapshot. The Store
+/// integration added by the Provider-management feature persists this command atomically with the
+/// Run and its initial lifecycle events.
+#[derive(Debug, Clone)]
+pub struct CreateRunCommand {
+    snapshot: RunSnapshot,
+    provider_binding: RunProviderBinding,
+    initial_events: Vec<PendingRunEvent>,
+}
+
+/// Resolves the immutable Provider snapshot for one newly-created production Run. Implementors
+/// must fail closed when there is no active Ready Profile rather than selecting another Provider.
+#[async_trait]
+pub trait RunProviderBindingSource: Send + Sync {
+    async fn bind_new_run(&self, run_id: RunId) -> ProviderResult<RunProviderBinding>;
+}
+
+impl CreateRunCommand {
+    pub fn new(
+        snapshot: RunSnapshot,
+        provider_binding: RunProviderBinding,
+        initial_events: Vec<PendingRunEvent>,
+    ) -> CoreResult<Self> {
+        if snapshot.run_id != provider_binding.run_id() {
+            return Err(CoreError::validation(
+                "run_provider_binding_mismatch",
+                "a Run creation binding must belong to the Run being created",
+            ));
+        }
+        if initial_events
+            .iter()
+            .any(|event| matches!(event.kind, crate::RunEventKind::ProviderBound { .. }))
+        {
+            return Err(CoreError::validation(
+                "duplicate_provider_bound_event",
+                "ProviderBound is generated exactly once by the Run creation command",
+            ));
+        }
+
+        let mut events = Vec::with_capacity(initial_events.len() + 1);
+        events.push(PendingRunEvent {
+            actor: crate::EventActor::System,
+            kind: crate::RunEventKind::ProviderBound {
+                fingerprint: provider_binding.fingerprint().clone(),
+            },
+        });
+        events.extend(initial_events);
+
+        Ok(Self {
+            snapshot,
+            provider_binding,
+            initial_events: events,
+        })
+    }
+
+    pub fn snapshot(&self) -> &RunSnapshot {
+        &self.snapshot
+    }
+
+    pub fn provider_binding(&self) -> &RunProviderBinding {
+        &self.provider_binding
+    }
+
+    pub fn initial_events(&self) -> &[PendingRunEvent] {
+        &self.initial_events
+    }
+}
 
 /// Atomic control-plane mutation unit for RuntimeStore::commit_command.
 #[derive(Debug, Clone)]
@@ -28,7 +96,9 @@ pub struct RuntimeCommandBatch {
     pub receipt: CommandReceipt,
     pub new_session: Option<Session>,
     pub new_task: Option<Task>,
-    pub new_run_snapshot: Option<RunSnapshot>,
+    /// A production Run cannot be represented here without a complete Provider binding. Task 2.4
+    /// persists it in the same transaction as the Run.
+    pub create_run: Option<CreateRunCommand>,
     pub new_artifact: Option<ArtifactMetadata>,
     pub pending_events: Vec<PendingRunEvent>,
     pub snapshot_update: Option<RunSnapshot>,

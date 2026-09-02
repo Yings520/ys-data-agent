@@ -133,7 +133,8 @@ impl ExternalFacts {
             RunEventKind::RunResumed => {
                 self.latest_indeterminate = None;
             }
-            RunEventKind::RunStarted
+            RunEventKind::ProviderBound { .. }
+            | RunEventKind::RunStarted
             | RunEventKind::StepStarted { .. }
             | RunEventKind::PolicyEvaluated { .. }
             | RunEventKind::ArtifactCreated { .. }
