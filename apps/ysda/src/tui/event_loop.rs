@@ -26,8 +26,8 @@ use ys_agent_core::{
 use crate::bootstrap::AppDependencies;
 
 use super::{
-    TranscriptItem, TransientView, TuiApp, TuiController, UiPreferenceStore, UiPreferences,
-    parse_input,
+    AsyncOperationBusy, RouteKey, TranscriptItem, TransientView, TuiApp, TuiController,
+    UiPreferenceStore, UiPreferences, parse_input,
     provider_management::{
         ProviderAuthentication, ProviderManagementStateKind, ProviderOperationKind,
     },
@@ -94,6 +94,7 @@ impl ProviderOperationCancellation {
 #[derive(Debug)]
 pub struct ProviderOperationCompletion<T> {
     pub operation_id: OperationId,
+    pub route_key: RouteKey,
     pub kind: ProviderOperationKind,
     pub attempts: u8,
     pub result: ProviderResult<T>,
@@ -103,6 +104,7 @@ struct OperationControl {
     cancel: watch::Sender<bool>,
     cancelled: bool,
     kind: ProviderOperationKind,
+    route_key: RouteKey,
 }
 
 enum OperationExit<T> {
@@ -144,6 +146,37 @@ where
         F: FnMut(OperationId, ProviderOperationCancellation) -> Fut + Send + 'static,
         Fut: Future<Output = ProviderResult<T>> + Send + 'static,
     {
+        self.schedule(kind, RouteKey::default(), operation)
+    }
+
+    /// Starts one route-bound Provider mutation. Production callers cannot queue a second
+    /// mutation while the first remains active.
+    pub fn start_on_route<F, Fut>(
+        &mut self,
+        kind: ProviderOperationKind,
+        route_key: RouteKey,
+        operation: F,
+    ) -> Result<OperationId, AsyncOperationBusy>
+    where
+        F: FnMut(OperationId, ProviderOperationCancellation) -> Fut + Send + 'static,
+        Fut: Future<Output = ProviderResult<T>> + Send + 'static,
+    {
+        if self.active_count() > 0 {
+            return Err(AsyncOperationBusy);
+        }
+        Ok(self.schedule(kind, route_key, operation))
+    }
+
+    fn schedule<F, Fut>(
+        &mut self,
+        kind: ProviderOperationKind,
+        route_key: RouteKey,
+        operation: F,
+    ) -> OperationId
+    where
+        F: FnMut(OperationId, ProviderOperationCancellation) -> Fut + Send + 'static,
+        Fut: Future<Output = ProviderResult<T>> + Send + 'static,
+    {
         let operation_id = OperationId::new();
         let (cancel, receiver) = watch::channel(false);
         self.operations.insert(
@@ -152,10 +185,12 @@ where
                 cancel,
                 cancelled: false,
                 kind,
+                route_key,
             },
         );
         let task = self.tasks.spawn(run_provider_operation(
             operation_id,
+            route_key,
             kind,
             self.policy,
             self.gate.clone(),
@@ -207,6 +242,7 @@ where
                     }
                     return Some(ProviderOperationCompletion {
                         operation_id,
+                        route_key: control.route_key,
                         kind: control.kind,
                         attempts: 0,
                         result: Err(internal_operation_error()),
@@ -251,6 +287,7 @@ where
                     }
                     return Some(ProviderOperationCompletion {
                         operation_id,
+                        route_key: control.route_key,
                         kind: control.kind,
                         attempts: 0,
                         result: Err(internal_operation_error()),
@@ -279,6 +316,7 @@ where
 
 async fn run_provider_operation<T, F, Fut>(
     operation_id: OperationId,
+    route_key: RouteKey,
     kind: ProviderOperationKind,
     policy: ProviderOperationPolicy,
     gate: Arc<Semaphore>,
@@ -296,6 +334,7 @@ where
             Ok(permit) => permit,
             Err(_) => return OperationExit::Completed(ProviderOperationCompletion {
                 operation_id,
+                route_key,
                 kind,
                 attempts: 0,
                 result: Err(internal_operation_error()),
@@ -315,6 +354,7 @@ where
             Ok(Ok(value)) => {
                 return OperationExit::Completed(ProviderOperationCompletion {
                     operation_id,
+                    route_key,
                     kind,
                     attempts,
                     result: Ok(value),
@@ -324,6 +364,7 @@ where
             Ok(Err(error)) => {
                 return OperationExit::Completed(ProviderOperationCompletion {
                     operation_id,
+                    route_key,
                     kind,
                     attempts,
                     result: Err(error),
@@ -333,6 +374,7 @@ where
             Err(_) => {
                 return OperationExit::Completed(ProviderOperationCompletion {
                     operation_id,
+                    route_key,
                     kind,
                     attempts,
                     result: Err(timeout_error()),
@@ -569,10 +611,12 @@ async fn handle_terminal_event(
                 return Ok(true);
             }
             if key.code == KeyCode::Esc {
-                if app.transient == Some(TransientView::Detail(super::DetailKind::Providers))
-                    && controller.provider_operation_in_flight()
-                {
-                    controller.cancel_provider_operation(app).await;
+                if app.transient == Some(TransientView::Detail(super::DetailKind::Providers)) {
+                    if controller.provider_operation_in_flight() {
+                        controller.cancel_provider_operation(app).await;
+                    } else {
+                        controller.close_provider_management(app);
+                    }
                     return Ok(false);
                 }
                 app.close_transient();
@@ -931,10 +975,12 @@ mod tests {
     };
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
-    use crate::tui::{InputAction, provider_management::ProviderOperationKind, render_to_string};
+    use crate::tui::{
+        ContentRoute, InputAction, provider_management::ProviderOperationKind, render_to_string,
+    };
 
     use super::{
-        AsyncOperationRegistry, ProviderOperationPolicy, TuiApp, TuiController,
+        AsyncOperationRegistry, ProviderOperationPolicy, RouteKey, TuiApp, TuiController,
         handle_terminal_event, user_readable_error,
     };
 
@@ -959,6 +1005,40 @@ mod tests {
                 .expect("cancelled task is reaped")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn route_bound_provider_work_is_single_flight_and_preserves_its_route_key() {
+        let mut registry = AsyncOperationRegistry::new(
+            ProviderOperationPolicy::new(Duration::from_secs(1), 0).expect("valid bounded policy"),
+        );
+        let route_key = RouteKey {
+            route: ContentRoute::ProviderManagement,
+            generation: 7,
+        };
+        let release = Arc::new(Notify::new());
+        let pending_release = release.clone();
+        let operation_id = registry
+            .start_on_route(ProviderOperationKind::Validate, route_key, move |_, _| {
+                let pending_release = pending_release.clone();
+                async move {
+                    pending_release.notified().await;
+                    Ok(1_u8)
+                }
+            })
+            .expect("first Provider mutation starts");
+        assert!(
+            registry
+                .start_on_route(ProviderOperationKind::Activate, route_key, |_, _| async {
+                    Ok(2_u8)
+                })
+                .is_err(),
+            "a second Provider mutation is rejected instead of queued"
+        );
+        release.notify_one();
+        let completion = registry.next_completion().await.expect("completion");
+        assert_eq!(completion.operation_id, operation_id);
+        assert_eq!(completion.route_key, route_key);
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ContentRoute {
     #[default]
     Timeline,
@@ -6,6 +6,14 @@ pub enum ContentRoute {
     ModelSelection,
     ProviderManagement,
     Diagnostics,
+}
+
+/// Identifies one visit to a content route. Returning to the same route later produces a
+/// different key, so work completed for the earlier visit cannot overwrite current state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct RouteKey {
+    pub route: ContentRoute,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +46,7 @@ pub enum FocusTarget {
 pub struct NavigationState {
     routes: Vec<ContentRoute>,
     overlay: Option<Overlay>,
+    generation: u64,
 }
 
 impl Default for NavigationState {
@@ -51,6 +60,7 @@ impl NavigationState {
         Self {
             routes: vec![ContentRoute::Timeline],
             overlay: None,
+            generation: 0,
         }
     }
 
@@ -65,18 +75,33 @@ impl NavigationState {
             .unwrap_or(ContentRoute::Timeline)
     }
 
+    pub fn route_key(&self) -> RouteKey {
+        RouteKey {
+            route: self.current(),
+            generation: self.generation,
+        }
+    }
+
     pub fn push(&mut self, route: ContentRoute) {
         if route == ContentRoute::Timeline {
-            self.routes.truncate(1);
+            if self.routes.len() > 1 {
+                self.routes.truncate(1);
+                self.generation = self.generation.wrapping_add(1);
+            }
             return;
         }
         if self.current() != route {
             self.routes.push(route);
+            self.generation = self.generation.wrapping_add(1);
         }
     }
 
     pub fn pop(&mut self) -> Option<ContentRoute> {
-        (self.routes.len() > 1).then(|| self.routes.pop()).flatten()
+        let popped = (self.routes.len() > 1).then(|| self.routes.pop()).flatten();
+        if popped.is_some() {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        popped
     }
 
     pub fn open_overlay(&mut self, overlay: Overlay) -> bool {

@@ -1,5 +1,6 @@
 mod app;
 mod artifact;
+mod async_guard;
 mod composer;
 mod event_loop;
 mod input;
@@ -17,6 +18,7 @@ pub use app::{
     TransientView, TuiApp, TuiController,
 };
 pub use artifact::ArtifactWorkspaceState;
+pub use async_guard::{AsyncChannel, AsyncOperationBusy, AsyncOperationTicket, AsyncResultGuard};
 pub use event_loop::{
     AsyncOperationRegistry, ProviderOperationCancellation, ProviderOperationCompletion,
     ProviderOperationPolicy, run_tui,
@@ -26,6 +28,7 @@ pub use mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQ
 pub use model_selection::ModelSelectionState;
 pub use navigation::{
     ContentRoute, FocusTarget, InputLayer, NavigationState, Overlay, ProviderNavigationState,
+    RouteKey,
 };
 pub use palette::{SelectionItem, Selector};
 pub use theme::{ColorSpec, ThemeRegistry, ThemeToken, UiPreferenceStore, UiPreferences};

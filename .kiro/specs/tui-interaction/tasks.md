@@ -74,7 +74,7 @@
   - _Requirements: 1.5, 2.4, 2.7, 3.8, 4.9_
   - _Boundary: TUI route stack, overlay, focus, and render extension seams_
   - _Depends: 2.2_
-- [ ] 2.4 隔离异步操作与陈旧结果
+- [x] 2.4 隔离异步操作与陈旧结果
   - 为 Display Context、Catalog、Artifact 和 Provider 操作关联 operation ID 与 route key，只允许匹配当前页面和当前操作的 completion 更新状态。
   - 丢弃迟到或陈旧结果，限制同一时刻最多一个 Provider mutation，同时允许 Catalog 与 Artifact 读取独立推进。
   - 将网络发现、认证和验证移出事件循环，并提供安全取消或返回语义；取消后保留非敏感输入和原活动配置。

@@ -17,7 +17,7 @@ use ys_agent_runtime::{
 
 use super::input::{DetailRequest, InputAction};
 use super::{
-    AsyncOperationRegistry, ProviderOperationCompletion, ProviderOperationPolicy,
+    AsyncOperationRegistry, ProviderOperationCompletion, ProviderOperationPolicy, RouteKey,
     artifact::ArtifactWorkspaceState,
     composer::ComposerState,
     mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQueryMode},
@@ -331,6 +331,7 @@ pub struct TuiController {
     pending_submission: Option<JoinHandle<ys_agent_core::CoreResult<SubmissionCompletion>>>,
     provider_screen: Option<ProviderManagementScreen>,
     provider_operations: AsyncOperationRegistry<ProviderOperationPayload>,
+    provider_route_key: Option<RouteKey>,
 }
 
 pub(super) enum SubmissionCompletion {
@@ -372,6 +373,7 @@ impl TuiController {
                 ProviderOperationPolicy::new(Duration::from_secs(30), 2)
                     .expect("fixed Provider operation policy is valid"),
             ),
+            provider_route_key: None,
         }
     }
 
@@ -422,9 +424,15 @@ impl TuiController {
         })?;
         let service = self.service.clone();
         let mut secret = secret;
+        let route_key = self.provider_route_key.ok_or_else(|| {
+            ys_agent_core::CoreError::validation(
+                "provider_route_not_open",
+                "Open Provider setup before starting a Provider operation",
+            )
+        })?;
         let operation_id = self
             .provider_operations
-            .start(kind, move |operation_id, _| {
+            .start_on_route(kind, route_key, move |operation_id, _| {
                 let service = service.clone();
                 let command = command.clone();
                 let secret = secret.take();
@@ -506,7 +514,13 @@ impl TuiController {
                     };
                     Ok(payload)
                 }
-            });
+            })
+            .map_err(|_| {
+                ys_agent_core::CoreError::validation(
+                    "provider_operation_in_flight",
+                    "Wait for or cancel the active Provider operation",
+                )
+            })?;
         let screen = self
             .provider_screen
             .as_mut()
@@ -650,6 +664,11 @@ impl TuiController {
         app: &mut TuiApp,
         completion: ProviderOperationCompletion<ProviderOperationPayload>,
     ) {
+        if app.navigation.route_key() != completion.route_key
+            || self.provider_route_key != Some(completion.route_key)
+        {
+            return;
+        }
         let Some(screen) = self.provider_screen.as_mut() else {
             return;
         };
@@ -692,6 +711,12 @@ impl TuiController {
         let _ = self.provider_operations.cancel(operation_id);
         let _ = self.service.cancel_provider_operation(operation_id).await;
         refresh_provider_detail(app, screen);
+    }
+
+    pub fn close_provider_management(&mut self, app: &mut TuiApp) {
+        app.close_transient();
+        let _ = app.pop_route();
+        self.provider_route_key = None;
     }
 
     pub(super) async fn take_ready_submission(
@@ -944,6 +969,12 @@ impl TuiController {
             }
         }
         let view = screen.view();
+        app.push_route(if open_model_step {
+            ContentRoute::ModelSelection
+        } else {
+            ContentRoute::ProviderManagement
+        });
+        self.provider_route_key = Some(app.navigation.route_key());
         app.show_detail(
             DetailKind::Providers,
             DetailView {
@@ -1861,6 +1892,7 @@ mod provider_management_tests {
             app.transient,
             Some(TransientView::Detail(DetailKind::Providers))
         );
+        assert_eq!(app.navigation.current(), ContentRoute::ProviderManagement);
         assert!(
             app.detail
                 .as_ref()
@@ -1875,6 +1907,7 @@ mod provider_management_tests {
             .await
             .expect("legacy model command reuses Provider manager");
         let detail = app.detail.expect("same Provider detail");
+        assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
         assert_eq!(detail.title, "Provider management");
         assert!(
             detail

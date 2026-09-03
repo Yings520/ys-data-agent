@@ -1,11 +1,11 @@
 use ratatui::layout::Rect;
 use ys_agent_core::Principal;
 use ysda::tui::{
-    ArtifactWorkspaceState, ColorSpec, ContentRoute, DetailKind, DetailView, FocusTarget,
-    HitRegion, InputAction, InputLayer, LayoutMode, ModePickerAction, ModePickerOutcome,
-    ModePickerState, ModelSelectionState, NavigationState, Overlay, ThemeRegistry, TimelineState,
-    TransientView, TuiApp, TuiQueryMode, UiPreferences, bottom_panel_height, parse_input,
-    render_to_string,
+    ArtifactWorkspaceState, AsyncChannel, AsyncResultGuard, ColorSpec, ContentRoute, DetailKind,
+    DetailView, FocusTarget, HitRegion, InputAction, InputLayer, LayoutMode, ModePickerAction,
+    ModePickerOutcome, ModePickerState, ModelSelectionState, NavigationState, Overlay,
+    ThemeRegistry, TimelineState, TransientView, TuiApp, TuiQueryMode, UiPreferences,
+    bottom_panel_height, parse_input, render_to_string,
 };
 
 #[test]
@@ -170,6 +170,74 @@ fn route_overlay_and_focus_state_is_local_reversible_and_independent() {
     assert_eq!(app.pop_route(), Some(ContentRoute::Artifact));
     app.push_route(ContentRoute::ModelSelection);
     assert!(render_to_string(&app, 100, 28).contains("Search · deepseek"));
+}
+
+#[test]
+fn async_results_are_accepted_only_for_the_current_route_and_operation() {
+    let mut navigation = NavigationState::new();
+    navigation.push(ContentRoute::ModelSelection);
+    let model_route = navigation.route_key();
+    let mut guard = AsyncResultGuard::default();
+
+    let old_catalog = guard
+        .start(AsyncChannel::Catalog, model_route)
+        .expect("catalog read starts");
+    let current_catalog = guard
+        .start(AsyncChannel::Catalog, model_route)
+        .expect("a newer catalog read supersedes the old one");
+    assert!(!guard.accept_completion(old_catalog, model_route));
+    assert!(guard.accept_completion(current_catalog, model_route));
+
+    let late_catalog = guard
+        .start(AsyncChannel::Catalog, model_route)
+        .expect("catalog refresh starts");
+    navigation.pop();
+    assert!(!guard.accept_completion(late_catalog, navigation.route_key()));
+    assert!(
+        guard.active(AsyncChannel::Catalog).is_none(),
+        "discarding a completed stale operation must release its lane"
+    );
+    navigation.push(ContentRoute::ModelSelection);
+    assert_ne!(
+        navigation.route_key(),
+        model_route,
+        "re-entering the same page creates a new route visit"
+    );
+}
+
+#[test]
+fn async_channels_are_independent_and_provider_mutation_is_single_flight() {
+    let navigation = NavigationState::new();
+    let route = navigation.route_key();
+    let mut guard = AsyncResultGuard::default();
+
+    let display = guard
+        .start(AsyncChannel::DisplayContext, route)
+        .expect("display context read starts");
+    let catalog = guard
+        .start(AsyncChannel::Catalog, route)
+        .expect("catalog read starts independently");
+    let artifact = guard
+        .start(AsyncChannel::Artifact, route)
+        .expect("artifact read starts independently");
+    let provider = guard
+        .start(AsyncChannel::ProviderMutation, route)
+        .expect("first Provider mutation starts");
+    assert!(
+        guard.start(AsyncChannel::ProviderMutation, route).is_err(),
+        "at most one Provider mutation may be active"
+    );
+
+    let mut app = TuiApp::for_principal(Principal::local_operator("async-cancel-test"));
+    app.model_label = "active-before-cancel".to_owned();
+    app.composer.set_text("keep this nonsensitive draft");
+    assert!(guard.cancel(provider));
+    assert_eq!(app.model_label, "active-before-cancel");
+    assert_eq!(app.composer.text(), "keep this nonsensitive draft");
+    assert!(guard.accept_completion(display, route));
+    assert!(guard.accept_completion(catalog, route));
+    assert!(guard.accept_completion(artifact, route));
+    assert!(!guard.accept_completion(provider, route));
 }
 
 #[test]
