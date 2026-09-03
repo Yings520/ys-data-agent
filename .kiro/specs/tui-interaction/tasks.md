@@ -223,7 +223,7 @@
   - _Requirements: 1.2, 1.3, 1.4, 6.1, 6.2, 6.4_
   - _Boundary: TUI Display Context lifecycle contract tests_
   - _Depends: 4.1, 5.1_
-- [ ] 5.5 验证 Artifact Policy、Preview 与无重跑导航
+- [x] 5.5 验证 Artifact Policy、Preview 与无重跑导航
   - 覆盖 Artifact Policy 拒绝、缺失内容、100 行、cell 256 字符和总 64 KiB 上限，以及 Query warning 与 UI 截断的独立语义。
   - 验证 Results 只渲染当前 viewport，大型持久化结果不会被完整复制进 TUI 状态或渲染树。
   - 使用真实 Crossterm MouseEvent 证明启用鼠标时点击结果卡片与 Enter 产生同一个 typed navigation action。

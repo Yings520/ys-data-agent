@@ -2920,6 +2920,9 @@ mod event_timeline_tests {
     };
 
     use chrono::Utc;
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
     use ys_agent_core::{
@@ -2936,7 +2939,6 @@ mod event_timeline_tests {
     use super::*;
     use crate::tui::{
         HitRegion,
-        artifact::{ArtifactAction, ResultMove},
         timeline::TimelineStatus,
     };
 
@@ -3254,6 +3256,7 @@ mod event_timeline_tests {
         let principal = Principal::local_operator("artifact-navigation-test");
         let mut controller = TuiController::new(service.clone(), workspace_id, principal.clone());
         let mut app = TuiApp::for_principal(principal);
+        app.mouse_enabled = true;
         let task_id = TaskId::new();
         let run_id = RunId::new();
         let primary_artifact_id = ArtifactId::new();
@@ -3314,11 +3317,28 @@ mod event_timeline_tests {
             "the rendered result card exposes a mouse hit region"
         );
 
-        assert!(
-            controller
-                .request_open_artifact(&mut app)
-                .expect("open request")
-        );
+        let mut opened_by_mouse = false;
+        'hit_test: for row in 0..28 {
+            for column in 0..100 {
+                crate::tui::event_loop::handle_terminal_event(
+                    &mut app,
+                    &mut controller,
+                    Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                )
+                .await
+                .expect("mouse input remains safe across the rendered viewport");
+                if app.navigation.current() == ContentRoute::Artifact {
+                    opened_by_mouse = true;
+                    break 'hit_test;
+                }
+            }
+        }
+        assert!(opened_by_mouse, "clicking the rendered result card opens Artifact");
         for _ in 0..100 {
             if controller.apply_ready_artifact(&mut app) {
                 break;
@@ -3331,16 +3351,44 @@ mod event_timeline_tests {
                 .join("\n")
                 .contains("Artifact is missing")
         );
-        controller.apply_artifact_action(&mut app, ArtifactAction::NextTab);
-        controller.apply_artifact_action(&mut app, ArtifactAction::MoveResult(ResultMove::Down));
-        controller.apply_artifact_action(&mut app, ArtifactAction::Back);
+        for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Esc] {
+            crate::tui::event_loop::handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            )
+            .await
+            .expect("Artifact navigation follows the public keyboard path");
+        }
 
         assert_eq!(app.navigation.current(), ContentRoute::Timeline);
         assert_eq!(
             app.timeline_state.view().question,
             Some("Show governed orders")
         );
-        assert_eq!(service.artifact_reads.load(Ordering::SeqCst), 1);
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("focused result card accepts Enter");
+        assert_eq!(app.navigation.current(), ContentRoute::Artifact);
+        for _ in 0..100 {
+            if controller.apply_ready_artifact(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("return after Enter navigation");
+
+        assert_eq!(service.artifact_reads.load(Ordering::SeqCst), 2);
         assert_eq!(service.query_or_tool_calls.load(Ordering::SeqCst), 0);
         assert_eq!(service.resume_calls.load(Ordering::SeqCst), 0);
     }
