@@ -2734,10 +2734,7 @@ mod provider_management_tests {
             crate::tui::event_loop::handle_terminal_event(
                 &mut app,
                 &mut controller,
-                Event::Key(KeyEvent::new(
-                    KeyCode::Char(character),
-                    KeyModifiers::NONE,
-                )),
+                Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
             )
             .await
             .expect("search selection");
@@ -2748,8 +2745,8 @@ mod provider_management_tests {
             &mut controller,
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         )
-            .await
-            .expect("Needs setup opens existing Provider flow");
+        .await
+        .expect("Needs setup opens existing Provider flow");
         assert_eq!(app.navigation.current(), ContentRoute::ProviderManagement);
         assert_eq!(
             controller
@@ -2937,10 +2934,7 @@ mod event_timeline_tests {
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
     use super::*;
-    use crate::tui::{
-        HitRegion,
-        timeline::TimelineStatus,
-    };
+    use crate::tui::{HitRegion, timeline::TimelineStatus};
 
     #[derive(Default)]
     struct CountingMissingArtifactService {
@@ -3338,7 +3332,10 @@ mod event_timeline_tests {
                 }
             }
         }
-        assert!(opened_by_mouse, "clicking the rendered result card opens Artifact");
+        assert!(
+            opened_by_mouse,
+            "clicking the rendered result card opens Artifact"
+        );
         for _ in 0..100 {
             if controller.apply_ready_artifact(&mut app) {
                 break;

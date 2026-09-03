@@ -1795,7 +1795,6 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("Active · DeepSeek"))
         );
-
     }
 
     #[tokio::test]

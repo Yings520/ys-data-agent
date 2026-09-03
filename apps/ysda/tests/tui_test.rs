@@ -412,7 +412,10 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
             "kept governed question",
             "/mode  /model",
         ] {
-            assert!(rendered.contains(required), "{width}×{height} omitted {required}");
+            assert!(
+                rendered.contains(required),
+                "{width}×{height} omitted {required}"
+            );
         }
         assert!(!rendered.contains("Terminal too small"));
 
@@ -422,7 +425,10 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
         for required in [
             "Artifact", "Summary", "Results", "SQL", "Schema", "Evidence", "Esc back",
         ] {
-            assert!(rendered.contains(required), "{width}×{height} omitted {required}");
+            assert!(
+                rendered.contains(required),
+                "{width}×{height} omitted {required}"
+            );
         }
     }
 
@@ -483,8 +489,14 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
         app.timeline_state.apply_event(&timeline_event(1, event));
         for (width, height) in [(150, 40), (100, 28), (60, 12)] {
             let rendered = render_to_string(&app, width, height);
-            assert!(rendered.contains(status), "{width}×{height} omitted {status}");
-            assert!(rendered.contains(reason), "{width}×{height} omitted {reason}");
+            assert!(
+                rendered.contains(status),
+                "{width}×{height} omitted {status}"
+            );
+            assert!(
+                rendered.contains(reason),
+                "{width}×{height} omitted {reason}"
+            );
             if !status.ends_with("Succeeded") {
                 assert!(!rendered.contains("Verified"));
             }

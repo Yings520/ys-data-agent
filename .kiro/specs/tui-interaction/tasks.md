@@ -248,7 +248,7 @@
   - _Requirements: 2.8, 4.3, 4.8, 6.1, 6.2, 6.3, 6.4, 6.8_
   - _Boundary: TUI safe-view, external-text, and no-fixture leak regression tests_
   - _Depends: 3.1, 3.3, 3.4, 5.4, 5.5, 5.6_
-- [ ] 5.8 运行 Feature 最终自动化门禁
+- [x] 5.8 运行 Feature 最终自动化门禁
   - 运行格式、workspace lint、全 workspace 测试和 v0.2 production-like release gate，并只修复本 Feature 边界内暴露的回归。
   - 确认真实键盘、关键渲染、失败原子性、结果导航不重跑、新旧 Run binding 和安全泄漏测试均包含在可重复执行的自动化门禁中。
   - 检查生产依赖方向，证明 TUI 只通过 AgentService/Provider Management port 获取状态和发起副作用，且没有数据库、Repository、Artifact Store、Secret Store 或 Model Provider 直连。
