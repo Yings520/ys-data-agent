@@ -403,8 +403,8 @@ use ys_agent_core::{
     WorkspaceId,
 };
 use ys_agent_runtime::{
-    ContextAssembler, Harness, HarnessConfig, HarnessDependencies, InMemoryQueryContextProvider,
-    FixedRunModelProviderResolver, LoopDriver, PromptBuilder,
+    ContextAssembler, FixedRunModelProviderResolver, Harness, HarnessConfig, HarnessDependencies,
+    InMemoryQueryContextProvider, LoopDriver, PromptBuilder,
     telemetry::TelemetryDispatcher,
     tools::{ConnectorToolAvailability, ToolCatalog, ToolRuntime, WorkspaceToolPolicy},
 };

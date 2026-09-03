@@ -313,7 +313,7 @@
   - _Requirements: 1.5, 1.6, 1.7, 9.4, 11.4, 11.5, 11.6, 11.7, 11.8_
   - _Boundary: ProviderManagement EvidenceGate and release-gate script_
   - _Depends: 6.3, 7.1, 7.4, 7.5_
-- [ ] 7.7 收口既有 Query/Doctor/Fake/Replay 回归与主发布门禁
+- [x] 7.7 收口既有 Query/Doctor/Fake/Replay 回归与主发布门禁
   - 更新既有 contract、lifecycle、store、Query workflow、service、Doctor、TUI、Artifact、Telemetry 和 query eval tests 以使用 Run-bound Provider，不改变原产品断言。
   - 将 Provider management release gate 接入 v0.2 主 gate，并验证 Fake/Replay 无网确定性、tool/policy/completion 权威和显式非成功状态。
   - 运行工作区 fmt、clippy、test 与 production-like release gate；发现的回归只在本 Feature 边界内修复，不重构无关行为。

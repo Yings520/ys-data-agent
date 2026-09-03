@@ -1,11 +1,14 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use tempfile::TempDir;
 use ys_agent_core::{
     ActivateProfileRequest, ActivationPrecondition, CompatibilityEvidence, CredentialGeneration,
-    DeviceAuthorizationView, OAuthConnectionService, OAuthConnectionStatus,
-    OAuthConnectionView, OperationId, ProfileId, ProfileName, ProfileRevision, ProfileState,
-    ProviderErrorCode, ProviderId, ProviderManagementError, ProviderRemediation, ProviderResult,
+    DeviceAuthorizationView, OAuthConnectionService, OAuthConnectionStatus, OAuthConnectionView,
+    OperationId, ProfileId, ProfileName, ProfileRevision, ProfileState, ProviderErrorCode,
+    ProviderId, ProviderManagementError, ProviderRemediation, ProviderResult,
     RemoteRevocationOutcome, RevisionPrecondition, SaveProfileRevision, ValidationCommit,
     ValidationCommitPrecondition, ValidationVersions,
 };
@@ -133,7 +136,9 @@ async fn service_with_chatgpt_draft() -> (
 ) {
     let directory = TempDir::new().expect("temporary database directory");
     let database = directory.keep().join("runtime.db");
-    let store = SqliteRuntimeStore::open(database).await.expect("open database");
+    let store = SqliteRuntimeStore::open(database)
+        .await
+        .expect("open database");
     let repository = store.provider_repository();
     let profile_id = ProfileId::new();
     repository
@@ -189,9 +194,18 @@ async fn oauth_completion_reauthorization_and_refresh_rotate_generations_without
         .complete_oauth(connect)
         .await
         .expect("complete persists the connected OAuth generation");
-    let connected = service.load_profile(profile_id).await.expect("load connected profile");
+    let connected = service
+        .load_profile(profile_id)
+        .await
+        .expect("load connected profile");
     assert_eq!(connected.revision, 2);
-    assert_eq!(connected.credential_generation.expect("OAuth generation").number(), 1);
+    assert_eq!(
+        connected
+            .credential_generation
+            .expect("OAuth generation")
+            .number(),
+        1
+    );
     assert_eq!(connected.summary.state, ProfileState::Draft);
     let revision = repository
         .load_current_revision(profile_id)
@@ -263,9 +277,18 @@ async fn oauth_completion_reauthorization_and_refresh_rotate_generations_without
         .refresh_oauth(profile_id, OperationId::new())
         .await
         .expect("refresh rotates into a newer Draft that must be validated explicitly");
-    let refreshed = service.load_profile(profile_id).await.expect("load refreshed profile");
+    let refreshed = service
+        .load_profile(profile_id)
+        .await
+        .expect("load refreshed profile");
     assert_eq!(refreshed.revision, 4);
-    assert_eq!(refreshed.credential_generation.expect("rotated generation").number(), 3);
+    assert_eq!(
+        refreshed
+            .credential_generation
+            .expect("rotated generation")
+            .number(),
+        3
+    );
     assert_eq!(refreshed.summary.state, ProfileState::Draft);
     assert_eq!(
         repository
@@ -279,19 +302,31 @@ async fn oauth_completion_reauthorization_and_refresh_rotate_generations_without
 }
 
 #[tokio::test]
-async fn oauth_cancellation_and_disconnected_status_fail_closed_for_activation_and_logout_reports_residual_risk() {
+async fn oauth_cancellation_and_disconnected_status_fail_closed_for_activation_and_logout_reports_residual_risk()
+ {
     let (service, repository, profile_id, oauth) = service_with_chatgpt_draft().await;
     let cancelled = OperationId::new();
-    service.cancel_operation(cancelled).expect("cancel operation");
+    service
+        .cancel_operation(cancelled)
+        .expect("cancel operation");
     let cancelled_error = service
         .start_oauth(profile_id, cancelled)
         .await
         .expect_err("cancelled OAuth must not start");
-    assert_eq!(cancelled_error.code(), ProviderErrorCode::OperationCancelled.as_str());
+    assert_eq!(
+        cancelled_error.code(),
+        ProviderErrorCode::OperationCancelled.as_str()
+    );
 
     let connect = OperationId::new();
-    service.start_oauth(profile_id, connect).await.expect("start OAuth");
-    service.complete_oauth(connect).await.expect("connect OAuth");
+    service
+        .start_oauth(profile_id, connect)
+        .await
+        .expect("start OAuth");
+    service
+        .complete_oauth(connect)
+        .await
+        .expect("connect OAuth");
     let current = repository
         .load_current_revision(profile_id)
         .await
@@ -332,7 +367,10 @@ async fn oauth_cancellation_and_disconnected_status_fail_closed_for_activation_a
             .activate(request.clone())
             .await
             .expect_err("a disconnected OAuth status cannot activate");
-        assert_eq!(activation_error.code(), ProviderErrorCode::OAuthNotConnected.as_str());
+        assert_eq!(
+            activation_error.code(),
+            ProviderErrorCode::OAuthNotConnected.as_str()
+        );
     }
 
     *oauth.residual_risk.lock().expect("fake OAuth state") = true;
