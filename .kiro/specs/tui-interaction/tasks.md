@@ -82,7 +82,7 @@
   - _Requirements: 4.9, 5.3, 6.4, 6.5_
   - _Boundary: TUI asynchronous operation registry and stale-result guard_
   - _Depends: 2.3_
-- [ ] 2.5 实现两级 Model Selection reducer
+- [x] 2.5 实现两级 Model Selection reducer
   - 顶层只提供 Providers 与 Plans，并支持 Tab、←/→ 切换以及统一的搜索、↑/↓、Enter、Esc 行为。
   - 显示 `Configured / Needs setup / Unavailable`、唯一 `Current` 标记和下层模型验证状态；不可用候选不能产生切换动作。
   - 从下层返回时恢复原页签、搜索内容和高亮，Catalog 失败或为空时保持可 retry 的错误或空状态。

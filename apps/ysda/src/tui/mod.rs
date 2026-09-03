@@ -25,7 +25,10 @@ pub use event_loop::{
 };
 pub use input::{DetailRequest, InputAction, InputError, parse_input};
 pub use mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQueryMode};
-pub use model_selection::ModelSelectionState;
+pub use model_selection::{
+    ModelSelectionAction, ModelSelectionBlock, ModelSelectionLevel, ModelSelectionLoadState,
+    ModelSelectionOutcome, ModelSelectionState, ModelSelectionTab,
+};
 pub use navigation::{
     ContentRoute, FocusTarget, InputLayer, NavigationState, Overlay, ProviderNavigationState,
     RouteKey,

@@ -137,12 +137,11 @@ fn route_overlay_and_focus_state_is_local_reversible_and_independent() {
         scroll: 9,
         focus: FocusTarget::ArtifactContent,
     };
-    let models = ModelSelectionState {
-        search: "deepseek".to_owned(),
-        highlighted: Some(1),
-        scroll: 4,
-        focus: FocusTarget::ModelSelectionList,
-    };
+    let mut models = ModelSelectionState::default();
+    models.search = "deepseek".to_owned();
+    models.highlighted = Some(1);
+    models.scroll = 4;
+    models.focus = FocusTarget::ModelSelectionList;
     assert_ne!(artifact.search, models.search);
     assert_ne!(artifact.highlighted, models.highlighted);
 
