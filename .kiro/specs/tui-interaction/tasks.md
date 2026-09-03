@@ -1,6 +1,6 @@
 # Implementation Plan
 
-- [ ] 1. 建立安全的 TUI 应用契约与 Runtime 用例
+- [x] 1. 建立安全的 TUI 应用契约与 Runtime 用例
 - [x] 1.1 定义 Provider、Plan 与 Model Selection 的安全领域契约
   - 表达由受治理 Catalog 提供的 Provider/Plan 分类、`Configured / Needs setup / Unavailable` 状态，以及全局唯一的 `Current` 标记。
   - 定义包含 Profile revision、activation revision、Provider 和 Model 的稳定候选键，并使不同 Profile 下的同名模型保持为不同候选。
@@ -46,9 +46,9 @@
   - _Boundary: ProviderManagement model validation and activation use cases_
   - _Depends: 1.1, 1.4_
 
-- [ ] 2. 建立无 I/O 的 TUI 交互状态基础
+- [x] 2. 建立无 I/O 的 TUI 交互状态基础
 - [x] 2.1 建立唯一命令目录与通用选择器
-  - 将产品命令目录收敛为恰好 `/mode` 和 `/model`，解析器、命令面板、Footer 与帮助界面只能读取这一来源。
+  - 将产品命令目录收敛为恰好 `/mode`、`/model` 和 `/exit`，解析器、命令面板、Footer 与帮助界面只能读取这一来源。
   - 实现精确、前缀、有序字符和描述匹配的稳定搜索顺序，以及非空列表唯一高亮和空列表无伪选择的不变量。
   - 只在搜索 query 或候选集合变化时重新计算匹配结果，光标移动和无关渲染不得重复执行搜索。
   - 支持实时输入、↑/↓、Enter、Esc 和无匹配继续编辑，并保存打开面板前的 Composer 内容。
@@ -92,7 +92,7 @@
   - _Boundary: TUI Model Selection state and reducer_
   - _Depends: 1.4, 2.4_
 
-- [ ] 3. 构建独立的产品视图与响应式壳层
+- [x] 3. 构建独立的产品视图与响应式壳层
 - [x] 3.1 (P) 构建 Timeline 投影与专用渲染
   - 按持久化 Query Artifact、终态 Snapshot、运行中 Snapshot、typed Event、Service Reply 的优先级投影用户问题、关键阶段、状态、警告和主要结果。
   - 按 sequence 去重并禁止旧 Event 降级终态；等待输入、拒绝、失败和取消使用明确原因与下一步，不使用成功色或 verified。
@@ -139,7 +139,7 @@
   - _Boundary: TUI responsive shell, Header, Composer, Footer, and top-level renderer_
   - _Depends: 3.1, 3.3, 3.4_
 
-- [ ] 4. 完成 TUI 与 AgentService 的跨边界集成
+- [x] 4. 完成 TUI 与 AgentService 的跨边界集成
 - [x] 4.1 集成 Display Context 生命周期
   - 在启动、Query 状态变化、数据源变化、Provider 操作完成和用户 retry 时通过 AgentService 刷新 Display Context，禁止每帧刷新。
   - 刷新失败时由 Controller 保留最后一次成功值并显示 `status unavailable`；没有历史值时显示真实不可用状态，不读取本地配置或猜测 Header。
@@ -190,10 +190,10 @@
   - _Boundary: TUI-AgentService active-model readiness and immutable Run binding integration_
   - _Depends: 4.5_
 
-- [ ] 5. 验证真实交互、安全渲染与发布门禁
+- [x] 5. 验证真实交互、安全渲染与发布门禁
 - [x] 5.1 验证命令、Mode 与页面导航的真实键盘路径
   - 使用真实 Crossterm KeyEvent 驱动公开输入路径，覆盖命令起始位置、实时搜索、无匹配、↑/↓、Enter、Esc 和 Overlay→View→Composer 优先级。
-  - 证明命令面板、解析器、Footer 与帮助界面只公开 `/mode` 和 `/model`，旧命令不能通过隐藏路径执行。
+  - 证明命令面板、解析器、Footer 与帮助界面只公开 `/mode`、`/model` 和 `/exit`，旧命令不能通过隐藏路径执行。
   - 覆盖 Auto/Query 确认与取消、结果卡片 Enter、Artifact 五页签和逐层返回，不直接修改 reducer 私有字段。
   - 完成后，所有必需键盘操作均通过生产输入路径，取消操作能恢复原 Mode、页面与 Composer。
   - _Requirements: 2.4, 2.7, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.8, 4.2, 4.9_

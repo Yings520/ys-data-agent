@@ -56,6 +56,12 @@ impl OAuthConnectionService for FakeOAuth {
         profile_id: ProfileId,
         _generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
+        // Match the production adapter: restoring a persisted generation replaces the
+        // in-memory connection state, including any active browser authorization.
+        self.operations
+            .lock()
+            .expect("fake OAuth state")
+            .retain(|_, pending_profile_id| *pending_profile_id != profile_id);
         Ok(self.view_for(profile_id))
     }
 
@@ -248,6 +254,10 @@ async fn oauth_completion_reauthorization_and_refresh_rotate_generations_without
         .await
         .expect("reauthorization starts another safe device flow");
     service
+        .load_profile(profile_id)
+        .await
+        .expect("TUI readback must preserve the pending browser authorization");
+    service
         .complete_oauth(reauthorize)
         .await
         .expect("reauthorization rotates into a newer Draft");
@@ -317,6 +327,23 @@ async fn oauth_cancellation_and_disconnected_status_fail_closed_for_activation_a
         cancelled_error.code(),
         ProviderErrorCode::OperationCancelled.as_str()
     );
+
+    let abandoned = OperationId::new();
+    service
+        .start_oauth(profile_id, abandoned)
+        .await
+        .expect("start browser authorization");
+    service
+        .cancel_operation(abandoned)
+        .expect("cancel browser authorization");
+    let abandoned_error = service
+        .complete_oauth(abandoned)
+        .await
+        .expect_err("a cancelled browser authorization cannot commit later");
+    assert!(matches!(
+        abandoned_error.code(),
+        "provider.operation.cancelled" | "provider.operation.stale"
+    ));
 
     let connect = OperationId::new();
     service

@@ -6,12 +6,25 @@ use zeroize::Zeroize;
 
 use crate::{CoreError, CoreResult, ModelProvider, OperationId, ProfileId, RunId, ValidationId};
 
-/// The only product providers accepted by the Provider-management feature.
+/// Provider and subscription-plan identities exposed by the model picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
+    OpenAi,
+    Kimi,
+    Qwen,
+    Gemini,
+    Glm,
     ChatGptSubscription,
+    ClaudeSubscription,
     OpenCodeGo,
+    AlibabaCoding,
+    BigModelCoding,
+    ZaiCoding,
+    MiniMaxCoding,
+    KimiCoding,
+    // Retained for backwards-compatible deserialization of profiles created before the
+    // The current catalog replaced the original provider list. They are not selectable.
     OpenCodeZen,
     DeepSeek,
     Xai,
@@ -22,22 +35,80 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 9] = [
-        Self::ChatGptSubscription,
-        Self::OpenCodeGo,
-        Self::OpenCodeZen,
+    pub const PROVIDERS: [Self; 9] = [
+        Self::OpenAi,
         Self::DeepSeek,
-        Self::Xai,
-        Self::Zai,
-        Self::OpenRouter,
-        Self::MiniMax,
         Self::Anthropic,
+        Self::Kimi,
+        Self::Qwen,
+        Self::Gemini,
+        Self::MiniMax,
+        Self::Glm,
+        Self::OpenRouter,
     ];
+
+    pub const PLANS: [Self; 8] = [
+        Self::ChatGptSubscription,
+        Self::ClaudeSubscription,
+        Self::OpenCodeGo,
+        Self::AlibabaCoding,
+        Self::BigModelCoding,
+        Self::ZaiCoding,
+        Self::MiniMaxCoding,
+        Self::KimiCoding,
+    ];
+
+    pub const ALL: [Self; 17] = [
+        Self::OpenAi,
+        Self::DeepSeek,
+        Self::Anthropic,
+        Self::Kimi,
+        Self::Qwen,
+        Self::Gemini,
+        Self::MiniMax,
+        Self::Glm,
+        Self::OpenRouter,
+        Self::ChatGptSubscription,
+        Self::ClaudeSubscription,
+        Self::OpenCodeGo,
+        Self::AlibabaCoding,
+        Self::BigModelCoding,
+        Self::ZaiCoding,
+        Self::MiniMaxCoding,
+        Self::KimiCoding,
+    ];
+
+    pub const LEGACY: [Self; 3] = [Self::OpenCodeZen, Self::Xai, Self::Zai];
+
+    pub const fn is_plan(self) -> bool {
+        matches!(
+            self,
+            Self::ChatGptSubscription
+                | Self::ClaudeSubscription
+                | Self::OpenCodeGo
+                | Self::AlibabaCoding
+                | Self::BigModelCoding
+                | Self::ZaiCoding
+                | Self::MiniMaxCoding
+                | Self::KimiCoding
+        )
+    }
 
     pub const fn model_prefix(self) -> &'static str {
         match self {
+            Self::OpenAi => "openai/",
+            Self::Kimi => "moonshot/",
+            Self::Qwen => "dashscope/",
+            Self::Gemini => "gemini/",
+            Self::Glm => "zai/",
             Self::ChatGptSubscription => "chatgpt/",
+            Self::ClaudeSubscription => "anthropic/",
             Self::OpenCodeGo => "opencode-go/",
+            Self::AlibabaCoding
+            | Self::BigModelCoding
+            | Self::ZaiCoding
+            | Self::MiniMaxCoding
+            | Self::KimiCoding => "anthropic/",
             Self::OpenCodeZen => "opencode/",
             Self::DeepSeek => "deepseek/",
             Self::Xai => "xai/",
@@ -64,6 +135,8 @@ pub struct ProviderModelId {
 }
 
 impl ProviderModelId {
+    pub const SETUP_PENDING_SUFFIX: &'static str = "__setup_pending__";
+
     pub fn new(provider: ProviderId, value: impl Into<String>) -> CoreResult<Self> {
         let value = value.into();
         let expected_prefix = provider.model_prefix();
@@ -88,6 +161,20 @@ impl ProviderModelId {
 
     pub fn provider(&self) -> ProviderId {
         self.provider
+    }
+
+    pub fn setup_pending(provider: ProviderId) -> Self {
+        Self::new(
+            provider,
+            format!("{}{}", provider.model_prefix(), Self::SETUP_PENDING_SUFFIX),
+        )
+        .expect("the internal setup-pending model uses the provider prefix")
+    }
+
+    pub fn is_setup_pending(&self) -> bool {
+        self.value
+            .strip_prefix(self.provider.model_prefix())
+            .is_some_and(|value| value == Self::SETUP_PENDING_SUFFIX)
     }
 }
 
@@ -1479,12 +1566,6 @@ impl SelectionTargetView {
     ) -> CoreResult<Self> {
         let display_name = display_name.into();
         validate_selection_label(&display_name, "selection target display name")?;
-        if current.is_current() && availability != SelectionAvailability::Configured {
-            return Err(CoreError::validation(
-                "invalid_current_selection_target",
-                "the current selection target must be configured",
-            ));
-        }
         Ok(Self {
             target,
             display_name,
@@ -1650,12 +1731,6 @@ impl ModelCandidateView {
         let model_display_name = model_display_name.into();
         validate_selection_label(&profile_display_name, "profile display name")?;
         validate_selection_label(&model_display_name, "model display name")?;
-        if current.is_current() && status != ModelCandidateStatus::Ready {
-            return Err(CoreError::validation(
-                "invalid_current_model_candidate",
-                "the current model candidate must be ready",
-            ));
-        }
         Ok(Self {
             key,
             profile_display_name,

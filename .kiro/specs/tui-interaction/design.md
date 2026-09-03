@@ -6,7 +6,7 @@
 
 主界面包含 Header、Timeline、固定 Composer 和 Footer。Query 成功后显示结果卡片；Enter 或点击卡片进入结果详情。
 
-TUI 只公开 `/mode` 和 `/model`。所有产品状态与副作用都经过 AgentService；TUI 只负责展示、输入、焦点和导航。
+TUI 只公开 `/mode`、`/model` 和 `/exit`。所有产品状态与副作用都经过 AgentService；TUI 只负责展示、输入、焦点和导航。
 
 ## 1. User-visible Contract
 
@@ -29,6 +29,7 @@ Command Palette 和 Mode Picker 是 Overlay。关闭 Overlay 后，原页面和 
 |---|---|
 | `/mode` | 打开 `Auto / Query` 选择器 |
 | `/model` | 打开 `Providers / Plans → Models` |
+| `/exit` | 退出应用 |
 
 解析器、Command Palette、Footer 和帮助界面读取同一个目录。旧入口不保留隐藏解析路径。
 
@@ -51,8 +52,8 @@ Command Palette 和 Mode Picker 是 Overlay。关闭 Overlay 后，原页面和 
 
 ### Footer
 
-- Timeline 有完成结果卡片：`/mode  /model  Enter open results`
-- Artifact：`/mode  /model  Esc back`
+- Timeline 有完成结果卡片：`/mode  /model  /exit  Enter open results`
+- Artifact：`/mode  /model  /exit  Esc back`
 - 其他页面：只显示当前可执行的键位。
 
 Footer 只是上下文提示，不是第三套命令目录。
@@ -357,7 +358,7 @@ Profile revision 或活动 revision 不匹配时，Service 返回 `Conflict`。�
 
 ### Required Tests
 
-1. 命令目录恰好包含 `/mode` 和 `/model`。
+1. 命令目录恰好包含 `/mode`、`/model` 和 `/exit`。
 2. `/mode` 只显示 `Auto` 与 `Query`；Esc 恢复旧状态。
 3. `/model` 支持两级选择、搜索、确认和逐层返回。
 4. 切换成功后 Header 更新；失败、取消和冲突后保持不变。
@@ -395,5 +396,5 @@ Profile revision 或活动 revision 不匹配时，Service 返回 `Conflict`。�
 
 - `docs/prototypes/ysda-tui.html`
 - `.kiro/specs/provider-management/{requirements,design}.md`
-- `/Users/ysc/Documents/Data_Engineering/projects/Datus-agent-opencode-go/datus/cli/model_app.py`
-- `/Users/ysc/Documents/Data_Engineering/projects/Datus-agent-opencode-go/datus/cli/slash_registry.py`
+- 已审核的外部参考实现：模型选择交互
+- 已审核的外部参考实现：斜杠命令交互

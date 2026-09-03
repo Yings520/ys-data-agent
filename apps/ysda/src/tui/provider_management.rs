@@ -7,13 +7,15 @@ use std::collections::BTreeMap;
 
 use ys_agent_core::{
     ActiveProviderView, CompatibilityEvidenceView, CredentialKind, CredentialViewStatus,
-    DiscoveredModel, OAuthConnectionStatus, OperationId, ParameterApplicability, ProfileDetail,
-    ProfileId, ProfileState, ProviderCatalogView, ProviderId, ProviderManagementError,
-    ProviderModelId, ProviderParameterKey, ProviderParameters, ProviderRemediation, SecretValue,
+    DeviceAuthorizationView, DiscoveredModel, OAuthConnectionStatus, OperationId,
+    ParameterApplicability, ProfileDetail, ProfileId, ProfileState, ProviderCatalogView,
+    ProviderField, ProviderId, ProviderManagementError, ProviderModelId, ProviderParameterKey,
+    ProviderParameters, ProviderRemediation, SecretValue,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const SECRET_MASK: &str = "••••••••";
+const VISIBLE_MODEL_ROWS: usize = 9;
 
 /// The fixed, ordered Provider-management wizard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,8 +231,12 @@ pub struct ProviderEditView {
     pub model: Option<ProviderModelId>,
     pub model_source: Option<ProviderModelSource>,
     pub discovered_models: Vec<DiscoveredModel>,
+    pub model_filter: String,
+    pub highlighted_model: Option<usize>,
+    pub model_scroll: usize,
     pub parameters: ProviderParameters,
     pub credential_mask: Option<&'static str>,
+    pub has_saved_credential: bool,
     pub parameter_issue: Option<ProviderEditIssue>,
 }
 
@@ -243,7 +249,7 @@ pub struct ProviderEditCommand {
     pub name: String,
     pub provider: ProviderId,
     pub authentication: ProviderAuthentication,
-    pub model: ProviderModelId,
+    pub model: Option<ProviderModelId>,
     pub parameters: ProviderParameters,
     pub observed_context_limit: Option<u32>,
 }
@@ -285,6 +291,7 @@ pub struct ProviderManagementScreenView {
     pub confirmation: Option<ProviderConfirmationView>,
     pub busy: Option<ProviderBusyView>,
     pub result: Option<ProviderResultView>,
+    pub oauth_authorization: Option<DeviceAuthorizationView>,
 }
 
 struct ProviderEditBuffer {
@@ -296,8 +303,12 @@ struct ProviderEditBuffer {
     model_input: String,
     model_source: Option<ProviderModelSource>,
     discovered_models: Vec<DiscoveredModel>,
+    model_filter: String,
+    highlighted_model: Option<usize>,
+    model_scroll: usize,
     parameters: ProviderParameters,
     credential: Zeroizing<String>,
+    has_saved_credential: bool,
     parameter_issue: Option<ProviderEditIssue>,
 }
 
@@ -312,8 +323,12 @@ impl ProviderEditBuffer {
             model_input: String::new(),
             model_source: None,
             discovered_models: Vec::new(),
+            model_filter: String::new(),
+            highlighted_model: None,
+            model_scroll: 0,
             parameters: ProviderParameters::default(),
             credential: Zeroizing::new(String::new()),
+            has_saved_credential: false,
             parameter_issue: None,
         }
     }
@@ -328,8 +343,12 @@ impl ProviderEditBuffer {
             model_input: self.model_input.clone(),
             model_source: self.model_source,
             discovered_models: self.discovered_models.clone(),
+            model_filter: self.model_filter.clone(),
+            highlighted_model: self.highlighted_model,
+            model_scroll: self.model_scroll,
             parameters: self.parameters.clone(),
             credential: Zeroizing::new(String::new()),
+            has_saved_credential: self.has_saved_credential,
             parameter_issue: self.parameter_issue.clone(),
         }
     }
@@ -343,8 +362,13 @@ impl ProviderEditBuffer {
             model: self.model.clone(),
             model_source: self.model_source,
             discovered_models: self.discovered_models.clone(),
+            model_filter: self.model_filter.clone(),
+            highlighted_model: self.highlighted_model,
+            model_scroll: self.model_scroll,
             parameters: self.parameters.clone(),
-            credential_mask: (!self.credential.is_empty()).then_some(SECRET_MASK),
+            credential_mask: (!self.credential.is_empty() || self.has_saved_credential)
+                .then_some(SECRET_MASK),
+            has_saved_credential: self.has_saved_credential && self.credential.is_empty(),
             parameter_issue: self.parameter_issue.clone(),
         }
     }
@@ -363,10 +387,12 @@ enum ScreenState {
     Busy {
         operation_id: OperationId,
         kind: ProviderOperationKind,
+        resume_step: ProviderManagementStep,
         buffer: ProviderEditBuffer,
     },
     Result {
         operation: ProviderOperationKind,
+        resume_step: ProviderManagementStep,
         outcome: ProviderResultOutcome,
         buffer: ProviderEditBuffer,
     },
@@ -378,6 +404,7 @@ enum ScreenState {
 pub struct ProviderManagementScreen {
     browse: ProviderManagementView,
     state: ScreenState,
+    oauth_authorization: Option<DeviceAuthorizationView>,
 }
 
 impl ProviderManagementScreen {
@@ -385,6 +412,7 @@ impl ProviderManagementScreen {
         Self {
             browse,
             state: ScreenState::Browse,
+            oauth_authorization: None,
         }
     }
 
@@ -407,6 +435,7 @@ impl ProviderManagementScreen {
             confirmation: None,
             busy: None,
             result: None,
+            oauth_authorization: self.oauth_authorization.clone(),
         };
         match &self.state {
             ScreenState::Browse => {}
@@ -426,6 +455,7 @@ impl ProviderManagementScreen {
                 operation_id,
                 kind,
                 buffer,
+                ..
             } => {
                 view.edit = Some(buffer.view());
                 view.busy = Some(ProviderBusyView {
@@ -435,6 +465,7 @@ impl ProviderManagementScreen {
             }
             ScreenState::Result {
                 operation,
+                resume_step,
                 outcome,
                 buffer,
             } => {
@@ -448,8 +479,7 @@ impl ProviderManagementScreen {
                     outcome: outcome.clone(),
                     remediation: error.map(ProviderManagementError::remediation),
                     can_retry: error.is_some_and(|error| {
-                        error.remediation() == ProviderRemediation::Retry
-                            || error.retryability() == ys_agent_core::ProviderRetryability::Bounded
+                        retry_is_safe(*operation, *resume_step, buffer, error)
                     }),
                 });
             }
@@ -466,19 +496,23 @@ impl ProviderManagementScreen {
             ScreenState::Browse => return None,
         };
         let provider = buffer.provider?;
-        let model = buffer.model.clone()?;
         let authentication = buffer.authentication?;
         let observed_context_limit = buffer
-            .discovered_models
-            .iter()
-            .find(|candidate| candidate.model == model.as_str())
+            .model
+            .as_ref()
+            .and_then(|model| {
+                buffer
+                    .discovered_models
+                    .iter()
+                    .find(|candidate| candidate.model == model.as_str())
+            })
             .and_then(|candidate| candidate.context_limit);
         Some(ProviderEditCommand {
             profile_id: buffer.profile_id,
             name: buffer.name.clone(),
             provider,
             authentication,
-            model,
+            model: buffer.model.clone(),
             parameters: buffer.parameters.clone(),
             observed_context_limit,
         })
@@ -489,6 +523,15 @@ impl ProviderManagementScreen {
     /// look Active or erase fields that the user may retry.
     pub fn replace_browse(&mut self, browse: ProviderManagementView) {
         self.browse = browse;
+    }
+
+    pub fn apply_active_provider(&mut self, active: ActiveProviderView) {
+        self.browse = ProviderManagementView::new(
+            self.browse.catalog.clone(),
+            self.browse.profiles.clone(),
+            Some(active),
+            self.browse.offline,
+        );
     }
 
     pub fn start_create(&mut self, name: impl Into<String>) -> bool {
@@ -517,6 +560,7 @@ impl ProviderManagementScreen {
             .iter()
             .find(|catalog| catalog.provider == profile.provider)
             .map(|catalog| catalog.credential_kind.into());
+        buffer.has_saved_credential = profile.credential_status == CredentialViewStatus::Saved;
         self.state = ScreenState::Edit {
             step: ProviderManagementStep::Provider,
             buffer,
@@ -541,13 +585,25 @@ impl ProviderManagementScreen {
         if *step != ProviderManagementStep::Provider {
             return false;
         }
+        let provider_changed = buffer.provider != Some(provider);
         buffer.provider = Some(provider);
         buffer.model = None;
         buffer.model_input.clear();
         buffer.model_source = None;
         buffer.discovered_models.clear();
+        buffer.model_filter.clear();
+        buffer.highlighted_model = None;
+        buffer.model_scroll = 0;
         buffer.parameter_issue = None;
+        if provider_changed {
+            buffer.has_saved_credential = false;
+        }
+        self.oauth_authorization = None;
         true
+    }
+
+    pub fn set_oauth_authorization(&mut self, authorization: Option<DeviceAuthorizationView>) {
+        self.oauth_authorization = authorization;
     }
 
     pub fn select_authentication(&mut self, authentication: ProviderAuthentication) -> bool {
@@ -567,7 +623,12 @@ impl ProviderManagementScreen {
         let ScreenState::Edit { step, buffer } = &mut self.state else {
             return false;
         };
-        if *step != ProviderManagementStep::Authentication {
+        if *step != ProviderManagementStep::Authentication
+            || value.is_empty()
+            || value
+                .chars()
+                .any(|character| !character.is_ascii() || character.is_ascii_control())
+        {
             return false;
         }
         buffer.credential = Zeroizing::new(value.to_owned());
@@ -582,10 +643,40 @@ impl ProviderManagementScreen {
         };
         if *step != ProviderManagementStep::Authentication
             || buffer.authentication != Some(ProviderAuthentication::ApiKey)
+            || !character.is_ascii()
+            || character.is_ascii_control()
         {
             return false;
         }
         buffer.credential.push(character);
+        true
+    }
+
+    pub fn append_secret_text(&mut self, mut value: String) -> bool {
+        let ScreenState::Edit { step, buffer } = &mut self.state else {
+            value.zeroize();
+            return false;
+        };
+        if *step != ProviderManagementStep::Authentication
+            || buffer.authentication != Some(ProviderAuthentication::ApiKey)
+        {
+            value.zeroize();
+            return false;
+        }
+        if value.is_empty()
+            || value
+                .chars()
+                .any(|character| !character.is_ascii() || character.is_ascii_control())
+        {
+            value.zeroize();
+            return false;
+        }
+        if buffer.credential.is_empty() {
+            buffer.credential = Zeroizing::new(value);
+        } else {
+            buffer.credential.push_str(&value);
+            value.zeroize();
+        }
         true
     }
 
@@ -623,7 +714,7 @@ impl ProviderManagementScreen {
         if *step != ProviderManagementStep::Model {
             return false;
         }
-        buffer.discovered_models = models;
+        replace_discovered_models(buffer, models);
         true
     }
 
@@ -664,37 +755,73 @@ impl ProviderManagementScreen {
         Ok(())
     }
 
-    /// Edits a manual model one key at a time. An incomplete prefix remains an incomplete local
-    /// field rather than becoming a request; `next_step` still rejects it until it is valid.
-    pub fn append_manual_model_character(&mut self, character: char) -> bool {
+    /// Filters the online model list. Keyboard input never creates an arbitrary model ID.
+    pub fn append_model_filter_character(&mut self, character: char) -> bool {
         let ScreenState::Edit { step, buffer } = &mut self.state else {
             return false;
         };
         if *step != ProviderManagementStep::Model {
             return false;
         }
-        let Some(provider) = buffer.provider else {
-            return false;
-        };
-        buffer.model_input.push(character);
-        buffer.model = ProviderModelId::new(provider, buffer.model_input.clone()).ok();
-        buffer.model_source = Some(ProviderModelSource::Manual);
+        buffer.model_filter.push(character);
+        reset_filtered_model_cursor(buffer);
         true
     }
 
-    pub fn delete_manual_model_character(&mut self) -> bool {
+    pub fn delete_model_filter_character(&mut self) -> bool {
         let ScreenState::Edit { step, buffer } = &mut self.state else {
             return false;
         };
-        if *step != ProviderManagementStep::Model || buffer.model_input.pop().is_none() {
+        if *step != ProviderManagementStep::Model || buffer.model_filter.pop().is_none() {
             return false;
         }
-        let Some(provider) = buffer.provider else {
+        reset_filtered_model_cursor(buffer);
+        true
+    }
+
+    pub fn append_model_filter_text(&mut self, value: &str) -> bool {
+        let ScreenState::Edit { step, buffer } = &mut self.state else {
             return false;
         };
-        buffer.model = ProviderModelId::new(provider, buffer.model_input.clone()).ok();
-        buffer.model_source = Some(ProviderModelSource::Manual);
+        if *step != ProviderManagementStep::Model {
+            return false;
+        }
+        let filtered = value
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>();
+        if filtered.is_empty() {
+            return false;
+        }
+        buffer.model_filter.push_str(&filtered);
+        reset_filtered_model_cursor(buffer);
         true
+    }
+
+    pub fn clear_model_filter(&mut self) -> bool {
+        let ScreenState::Edit { step, buffer } = &mut self.state else {
+            return false;
+        };
+        if *step != ProviderManagementStep::Model || buffer.model_filter.is_empty() {
+            return false;
+        }
+        buffer.model_filter.clear();
+        reset_filtered_model_cursor(buffer);
+        true
+    }
+
+    pub fn select_highlighted_model(&mut self) -> bool {
+        let ScreenState::Edit {
+            step: ProviderManagementStep::Model,
+            buffer,
+        } = &mut self.state
+        else {
+            return false;
+        };
+        let Some(highlighted) = buffer.highlighted_model else {
+            return false;
+        };
+        select_filtered_model(buffer, highlighted)
     }
 
     /// Rejects inapplicable parameters before replacing the buffer, so the widget can report the
@@ -776,7 +903,10 @@ impl ProviderManagementScreen {
     pub fn request_save_draft(&self) -> Option<ProviderScreenRequest> {
         match self.state {
             ScreenState::Edit {
-                step: ProviderManagementStep::Validate | ProviderManagementStep::SaveActivate,
+                step:
+                    ProviderManagementStep::Authentication
+                    | ProviderManagementStep::Validate
+                    | ProviderManagementStep::SaveActivate,
                 ..
             } => Some(ProviderScreenRequest::Operation(
                 ProviderOperationKind::SaveDraft,
@@ -844,7 +974,10 @@ impl ProviderManagementScreen {
                 ProviderOperationKind::SaveDraft => {
                     matches!(
                         step,
-                        ProviderManagementStep::Validate | ProviderManagementStep::SaveActivate
+                        ProviderManagementStep::Authentication
+                            | ProviderManagementStep::Model
+                            | ProviderManagementStep::Validate
+                            | ProviderManagementStep::SaveActivate
                     )
                 }
                 ProviderOperationKind::Activate => false,
@@ -861,15 +994,17 @@ impl ProviderManagementScreen {
         }
 
         let state = std::mem::replace(&mut self.state, ScreenState::Browse);
-        let buffer = match state {
-            ScreenState::Edit { buffer, .. } | ScreenState::Confirm { buffer, .. } => {
-                buffer.safe_copy()
+        let (resume_step, buffer) = match state {
+            ScreenState::Edit { step, buffer } => (step, buffer.safe_copy()),
+            ScreenState::Confirm { buffer, .. } => {
+                (ProviderManagementStep::SaveActivate, buffer.safe_copy())
             }
             _ => unreachable!("allowed state always owns an edit buffer"),
         };
         self.state = ScreenState::Busy {
             operation_id,
             kind,
+            resume_step,
             buffer,
         };
         true
@@ -884,6 +1019,7 @@ impl ProviderManagementScreen {
         let ScreenState::Busy {
             operation_id: current,
             kind: ProviderOperationKind::DiscoverModels,
+            resume_step,
             mut buffer,
         } = state
         else {
@@ -894,15 +1030,80 @@ impl ProviderManagementScreen {
             self.state = ScreenState::Busy {
                 operation_id: current,
                 kind: ProviderOperationKind::DiscoverModels,
+                resume_step,
                 buffer,
             };
             return false;
         }
-        buffer.discovered_models = models;
+        replace_discovered_models(&mut buffer, models);
         self.state = ScreenState::Edit {
             step: ProviderManagementStep::Model,
             buffer,
         };
+        true
+    }
+
+    /// Confirms that online discovery still contains the exact persisted model selected for
+    /// revalidation. A removed model must stop at the picker instead of silently validating a
+    /// different candidate's context limit against the saved revision.
+    pub fn selected_discovered_model_matches(&self, expected: &ProviderModelId) -> bool {
+        let ScreenState::Edit {
+            step: ProviderManagementStep::Model,
+            buffer,
+        } = &self.state
+        else {
+            return false;
+        };
+        buffer.model.as_ref() == Some(expected)
+            && buffer.discovered_models.iter().any(|candidate| {
+                candidate.model == expected.as_str()
+                    && candidate.context_limit.is_some_and(|limit| limit > 0)
+            })
+    }
+
+    pub fn move_discovered_model(&mut self, delta: isize) -> bool {
+        let ScreenState::Edit {
+            step: ProviderManagementStep::Model,
+            buffer,
+        } = &mut self.state
+        else {
+            return false;
+        };
+        let indices = filtered_model_indices(buffer);
+        if indices.is_empty() {
+            return false;
+        }
+        let current = buffer.highlighted_model.unwrap_or(0).min(indices.len() - 1);
+        let selected = (current as isize + delta).rem_euclid(indices.len() as isize) as usize;
+        buffer.highlighted_model = Some(selected);
+        keep_model_highlight_visible(buffer);
+        let _ = select_filtered_model(buffer, selected);
+        true
+    }
+
+    pub fn move_discovered_model_page(&mut self, direction: isize) -> bool {
+        let ScreenState::Edit {
+            step: ProviderManagementStep::Model,
+            buffer,
+        } = &mut self.state
+        else {
+            return false;
+        };
+        let indices = filtered_model_indices(buffer);
+        if indices.is_empty() {
+            return false;
+        }
+        let current = buffer.highlighted_model.unwrap_or(0).min(indices.len() - 1);
+        let selected = if direction < 0 {
+            current.saturating_sub(VISIBLE_MODEL_ROWS)
+        } else {
+            current
+                .saturating_add(VISIBLE_MODEL_ROWS)
+                .min(indices.len() - 1)
+        };
+        buffer.highlighted_model = Some(selected);
+        keep_model_highlight_visible(buffer);
+        let _ = select_filtered_model(buffer, selected);
         true
     }
 
@@ -915,6 +1116,7 @@ impl ProviderManagementScreen {
         let ScreenState::Busy {
             operation_id: current,
             kind,
+            resume_step,
             buffer,
         } = state
         else {
@@ -925,6 +1127,7 @@ impl ProviderManagementScreen {
             self.state = ScreenState::Busy {
                 operation_id: current,
                 kind,
+                resume_step,
                 buffer,
             };
             return false;
@@ -936,10 +1139,22 @@ impl ProviderManagementScreen {
             };
             return true;
         }
+        let resume_step = match &outcome {
+            ProviderResultOutcome::Failed(error)
+                if matches!(
+                    error.field(),
+                    Some(ProviderField::Credential | ProviderField::OAuth)
+                ) =>
+            {
+                ProviderManagementStep::Authentication
+            }
+            _ => resume_step,
+        };
         // A completion must never turn a failed/expired snapshot into active locally. The next
         // committed browse snapshot is supplied by the service integration task.
         self.state = ScreenState::Result {
             operation: kind,
+            resume_step,
             outcome,
             buffer,
         };
@@ -959,6 +1174,7 @@ impl ProviderManagementScreen {
         let ScreenState::Busy {
             operation_id: current,
             kind: ProviderOperationKind::SaveDraft,
+            resume_step: requested_step,
             mut buffer,
         } = state
         else {
@@ -969,13 +1185,57 @@ impl ProviderManagementScreen {
             self.state = ScreenState::Busy {
                 operation_id: current,
                 kind: ProviderOperationKind::SaveDraft,
+                resume_step: requested_step,
                 buffer,
             };
             return false;
         }
         buffer.profile_id = Some(profile_id);
+        if buffer.authentication == Some(ProviderAuthentication::ApiKey) {
+            buffer.has_saved_credential = true;
+        }
         self.state = ScreenState::Edit {
-            step: resume_step,
+            step: requested_step,
+            buffer,
+        };
+        debug_assert_eq!(requested_step, resume_step);
+        true
+    }
+
+    /// Records a failed Save Draft after its profile revision was durably created. Keeping the
+    /// authoritative Profile identity makes a credential retry update that Profile instead of
+    /// creating a duplicate.
+    pub fn complete_partially_saved_draft(
+        &mut self,
+        operation_id: OperationId,
+        profile_id: ProfileId,
+        error: ProviderManagementError,
+    ) -> bool {
+        let state = std::mem::replace(&mut self.state, ScreenState::Browse);
+        let ScreenState::Busy {
+            operation_id: current,
+            kind: ProviderOperationKind::SaveDraft,
+            resume_step,
+            mut buffer,
+        } = state
+        else {
+            self.state = state;
+            return false;
+        };
+        if current != operation_id {
+            self.state = ScreenState::Busy {
+                operation_id: current,
+                kind: ProviderOperationKind::SaveDraft,
+                resume_step,
+                buffer,
+            };
+            return false;
+        }
+        buffer.profile_id = Some(profile_id);
+        self.state = ScreenState::Result {
+            operation: ProviderOperationKind::SaveDraft,
+            resume_step,
+            outcome: ProviderResultOutcome::Failed(error),
             buffer,
         };
         true
@@ -987,15 +1247,16 @@ impl ProviderManagementScreen {
         let state = std::mem::replace(&mut self.state, ScreenState::Browse);
         let ScreenState::Busy {
             operation_id,
-            kind,
+            resume_step,
             buffer,
+            ..
         } = state
         else {
             self.state = state;
             return None;
         };
         self.state = ScreenState::Edit {
-            step: step_for_operation(kind),
+            step: resume_step,
             buffer,
         };
         Some(operation_id)
@@ -1004,14 +1265,16 @@ impl ProviderManagementScreen {
     pub fn return_to_edit(&mut self) -> bool {
         let state = std::mem::replace(&mut self.state, ScreenState::Browse);
         let ScreenState::Result {
-            operation, buffer, ..
+            resume_step,
+            buffer,
+            ..
         } = state
         else {
             self.state = state;
             return false;
         };
         self.state = ScreenState::Edit {
-            step: step_for_operation(operation),
+            step: resume_step,
             buffer,
         };
         true
@@ -1021,6 +1284,7 @@ impl ProviderManagementScreen {
         let state = std::mem::replace(&mut self.state, ScreenState::Browse);
         let ScreenState::Result {
             operation,
+            resume_step,
             outcome: ProviderResultOutcome::Failed(error),
             buffer,
         } = state
@@ -1028,18 +1292,17 @@ impl ProviderManagementScreen {
             self.state = state;
             return None;
         };
-        if error.remediation() != ProviderRemediation::Retry
-            && error.retryability() != ys_agent_core::ProviderRetryability::Bounded
-        {
+        if !retry_is_safe(operation, resume_step, &buffer, &error) {
             self.state = ScreenState::Result {
                 operation,
+                resume_step,
                 outcome: ProviderResultOutcome::Failed(error),
                 buffer,
             };
             return None;
         }
         self.state = ScreenState::Edit {
-            step: step_for_operation(operation),
+            step: resume_step,
             buffer,
         };
         Some(ProviderScreenRequest::Operation(operation))
@@ -1061,15 +1324,124 @@ impl ProviderManagementScreen {
     }
 }
 
-fn step_for_operation(operation: ProviderOperationKind) -> ProviderManagementStep {
-    match operation {
-        ProviderOperationKind::DiscoverModels => ProviderManagementStep::Model,
-        ProviderOperationKind::Validate => ProviderManagementStep::Validate,
-        ProviderOperationKind::SaveDraft | ProviderOperationKind::Activate => {
-            ProviderManagementStep::SaveActivate
-        }
-        ProviderOperationKind::OAuth => ProviderManagementStep::Authentication,
+fn filtered_model_indices(buffer: &ProviderEditBuffer) -> Vec<usize> {
+    let query = buffer.model_filter.trim().to_ascii_lowercase();
+    buffer
+        .discovered_models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            (query.is_empty() || candidate.model.to_ascii_lowercase().contains(&query))
+                .then_some(index)
+        })
+        .collect()
+}
+
+fn select_filtered_model(buffer: &mut ProviderEditBuffer, filtered_index: usize) -> bool {
+    let Some(candidate_index) = filtered_model_indices(buffer).get(filtered_index).copied() else {
+        buffer.model = None;
+        buffer.model_input.clear();
+        buffer.model_source = None;
+        return false;
+    };
+    let Some(provider) = buffer.provider else {
+        return false;
+    };
+    if buffer.discovered_models[candidate_index]
+        .context_limit
+        .is_none_or(|limit| limit == 0)
+    {
+        buffer.model = None;
+        buffer.model_input.clear();
+        buffer.model_source = None;
+        return false;
     }
+    let Ok(model) = ProviderModelId::new(
+        provider,
+        buffer.discovered_models[candidate_index].model.clone(),
+    ) else {
+        return false;
+    };
+    buffer.model_input = model.as_str().to_owned();
+    buffer.model = Some(model);
+    buffer.model_source = Some(ProviderModelSource::Discovered);
+    true
+}
+
+fn keep_model_highlight_visible(buffer: &mut ProviderEditBuffer) {
+    let Some(highlighted) = buffer.highlighted_model else {
+        buffer.model_scroll = 0;
+        return;
+    };
+    if highlighted < buffer.model_scroll {
+        buffer.model_scroll = highlighted;
+    } else if highlighted >= buffer.model_scroll.saturating_add(VISIBLE_MODEL_ROWS) {
+        buffer.model_scroll = highlighted + 1 - VISIBLE_MODEL_ROWS;
+    }
+}
+
+fn reset_filtered_model_cursor(buffer: &mut ProviderEditBuffer) {
+    buffer.model_scroll = 0;
+    let filtered = filtered_model_indices(buffer);
+    buffer.highlighted_model = filtered
+        .iter()
+        .position(|index| {
+            buffer.discovered_models[*index]
+                .context_limit
+                .is_some_and(|limit| limit > 0)
+        })
+        .or_else(|| (!filtered.is_empty()).then_some(0));
+    if buffer.highlighted_model.is_some() {
+        let _ = select_filtered_model(
+            buffer,
+            buffer.highlighted_model.expect("highlight checked above"),
+        );
+    } else {
+        buffer.model = None;
+        buffer.model_input.clear();
+        buffer.model_source = None;
+    }
+}
+
+fn replace_discovered_models(buffer: &mut ProviderEditBuffer, models: Vec<DiscoveredModel>) {
+    let current_model = buffer.model.as_ref().map(ProviderModelId::as_str);
+    let current_index = current_model.and_then(|current| {
+        models
+            .iter()
+            .position(|candidate| candidate.model == current)
+    });
+    buffer.discovered_models = models;
+    buffer.model_filter.clear();
+    buffer.model_scroll = 0;
+    buffer.highlighted_model = current_index
+        .or_else(|| {
+            buffer
+                .discovered_models
+                .iter()
+                .position(|candidate| candidate.context_limit.is_some_and(|limit| limit > 0))
+        })
+        .or_else(|| (!buffer.discovered_models.is_empty()).then_some(0));
+    if let Some(highlighted) = buffer.highlighted_model {
+        let _ = select_filtered_model(buffer, highlighted);
+    } else {
+        buffer.model = None;
+        buffer.model_input.clear();
+        buffer.model_source = None;
+    }
+}
+
+fn retry_is_safe(
+    operation: ProviderOperationKind,
+    resume_step: ProviderManagementStep,
+    buffer: &ProviderEditBuffer,
+    error: &ProviderManagementError,
+) -> bool {
+    let retryable = error.remediation() == ProviderRemediation::Retry
+        || error.retryability() == ys_agent_core::ProviderRetryability::Bounded;
+    let consumed_api_key = operation == ProviderOperationKind::SaveDraft
+        && resume_step == ProviderManagementStep::Authentication
+        && buffer.authentication == Some(ProviderAuthentication::ApiKey);
+    retryable && !consumed_api_key
 }
 
 #[cfg(test)]
@@ -1179,6 +1551,23 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_provider_never_prefills_a_catalog_model() {
+        let mut screen = ProviderManagementScreen::new(ProviderManagementView::new(
+            vec![catalog(ProviderId::OpenCodeGo, CredentialKind::ApiKey)],
+            Vec::new(),
+            None,
+            false,
+        ));
+        assert!(screen.start_create("OpenCode Go"));
+        assert!(screen.select_provider(ProviderId::OpenCodeGo));
+
+        let edit = screen.view().edit.expect("provider edit");
+        assert_eq!(edit.model, None);
+        assert_eq!(edit.model_source, None);
+        assert!(edit.discovered_models.is_empty());
+    }
+
+    #[test]
     fn fixed_wizard_validates_before_distinct_save_and_activate_actions() {
         let mut screen = screen_at_save_activate();
 
@@ -1242,6 +1631,154 @@ mod tests {
             screen.view().edit.expect("edit view").model_source,
             Some(ProviderModelSource::Manual)
         );
+    }
+
+    #[test]
+    fn typing_filters_discovered_models_and_never_creates_an_arbitrary_model() {
+        let mut screen = screen_at_model();
+        assert!(screen.set_discovered_models(vec![
+            DiscoveredModel {
+                model: "deepseek/chat".to_owned(),
+                context_limit: Some(32_000),
+            },
+            DiscoveredModel {
+                model: "deepseek/reasoner".to_owned(),
+                context_limit: Some(64_000),
+            },
+        ]));
+
+        for character in "reason".chars() {
+            assert!(screen.append_model_filter_character(character));
+        }
+        let edit = screen.view().edit.expect("filtered model view");
+        assert_eq!(edit.model_filter, "reason");
+        assert_eq!(edit.highlighted_model, Some(0));
+        assert_eq!(
+            edit.model
+                .expect("first matching model is highlighted")
+                .as_str(),
+            "deepseek/reasoner"
+        );
+        assert!(screen.select_highlighted_model());
+
+        for _ in 0.."reason".len() {
+            assert!(screen.delete_model_filter_character());
+        }
+        assert_eq!(screen.view().edit.expect("cleared filter").model_filter, "");
+    }
+
+    #[test]
+    fn pasted_filter_escape_and_page_navigation_follow_the_model_picker() {
+        let mut screen = screen_at_model();
+        assert!(
+            screen.set_discovered_models(
+                (0..20)
+                    .map(|index| DiscoveredModel {
+                        model: format!("deepseek/model-{index:02}"),
+                        context_limit: Some(32_000),
+                    })
+                    .collect(),
+            )
+        );
+
+        assert!(screen.move_discovered_model_page(1));
+        assert_eq!(
+            screen
+                .view()
+                .edit
+                .expect("paged model view")
+                .highlighted_model,
+            Some(VISIBLE_MODEL_ROWS)
+        );
+        assert!(screen.move_discovered_model_page(-1));
+        assert_eq!(
+            screen.view().edit.expect("first page").highlighted_model,
+            Some(0)
+        );
+
+        assert!(screen.append_model_filter_text("model-19\n"));
+        let edit = screen.view().edit.expect("pasted filter");
+        assert_eq!(edit.model_filter, "model-19");
+        assert_eq!(
+            edit.model.expect("matching model").as_str(),
+            "deepseek/model-19"
+        );
+        assert!(screen.clear_model_filter());
+        assert!(
+            screen
+                .view()
+                .edit
+                .expect("cleared filter")
+                .model_filter
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_model_without_context_evidence_is_visible_but_cannot_be_selected() {
+        let mut screen = screen_at_model();
+        assert!(screen.set_discovered_models(vec![DiscoveredModel {
+            model: "deepseek/new-online-model".to_owned(),
+            context_limit: None,
+        }]));
+
+        let edit = screen.view().edit.expect("online model remains visible");
+        assert_eq!(edit.discovered_models.len(), 1);
+        assert_eq!(edit.highlighted_model, Some(0));
+        assert!(edit.model.is_none());
+        assert!(!screen.select_highlighted_model());
+        assert!(!screen.next_step());
+    }
+
+    #[test]
+    fn discovery_initially_highlights_the_first_usable_model() {
+        let mut screen = screen_at_model();
+        assert!(screen.set_discovered_models(vec![
+            DiscoveredModel {
+                model: "deepseek/unknown".to_owned(),
+                context_limit: None,
+            },
+            DiscoveredModel {
+                model: "deepseek/ready-to-check".to_owned(),
+                context_limit: Some(64_000),
+            },
+        ]));
+
+        let edit = screen.view().edit.expect("discovered model list");
+        assert_eq!(edit.highlighted_model, Some(1));
+        assert_eq!(
+            edit.model.expect("usable model selected").as_str(),
+            "deepseek/ready-to-check"
+        );
+    }
+
+    #[test]
+    fn discovered_model_navigation_wraps_and_keeps_the_cursor_visible() {
+        let mut screen = screen_at_model();
+        assert!(
+            screen.set_discovered_models(
+                (0..12)
+                    .map(|index| DiscoveredModel {
+                        model: format!("deepseek/model-{index:02}"),
+                        context_limit: Some(32_000),
+                    })
+                    .collect(),
+            )
+        );
+
+        assert!(screen.move_discovered_model(-1));
+        let edit = screen.view().edit.expect("wrapped selection");
+        assert_eq!(edit.highlighted_model, Some(11));
+        assert_eq!(edit.model_scroll, 3);
+        assert_eq!(
+            edit.model.expect("last model is selected").as_str(),
+            "deepseek/model-11"
+        );
+
+        assert!(screen.move_discovered_model(1));
+        let edit = screen.view().edit.expect("wrapped to first");
+        assert_eq!(edit.highlighted_model, Some(0));
+        assert_eq!(edit.model_scroll, 0);
     }
 
     #[test]
@@ -1335,6 +1872,175 @@ mod tests {
     }
 
     #[test]
+    fn failed_api_key_save_returns_to_authentication_and_retains_persisted_profile_identity() {
+        let mut screen = ProviderManagementScreen::new(ProviderManagementView::offline());
+        assert!(screen.start_create("local DeepSeek"));
+        assert!(screen.select_provider(ProviderId::DeepSeek));
+        assert!(screen.next_step());
+        assert!(screen.select_authentication(ProviderAuthentication::ApiKey));
+        assert!(screen.set_secret_input("one-use-secret"));
+        assert!(screen.take_secret_input().is_some());
+
+        let operation_id = OperationId::new();
+        assert!(screen.start_operation(operation_id, ProviderOperationKind::SaveDraft));
+        let profile_id = ProfileId::new();
+        assert!(screen.complete_partially_saved_draft(
+            operation_id,
+            profile_id,
+            ProviderManagementError::new(
+                ProviderErrorCode::Network,
+                None,
+                ProviderRemediation::Retry,
+            ),
+        ));
+
+        let result = screen.view().result.expect("failed save result");
+        assert!(!result.can_retry, "the consumed API key cannot be replayed");
+        assert_eq!(screen.retry(), None);
+        assert!(screen.return_to_edit());
+        let view = screen.view();
+        assert_eq!(view.step, Some(ProviderManagementStep::Authentication));
+        assert_eq!(
+            view.edit.expect("restored edit").profile_id,
+            Some(profile_id)
+        );
+    }
+
+    #[test]
+    fn failed_save_from_validate_retries_from_validate() {
+        let mut screen = screen_at_validate();
+        let operation_id = OperationId::new();
+        assert!(screen.start_operation(operation_id, ProviderOperationKind::SaveDraft));
+        assert!(screen.complete_operation(
+            operation_id,
+            ProviderResultOutcome::Failed(ProviderManagementError::new(
+                ProviderErrorCode::Network,
+                None,
+                ProviderRemediation::Retry,
+            )),
+        ));
+
+        assert!(screen.view().result.expect("failed save result").can_retry);
+        assert_eq!(
+            screen.retry(),
+            Some(ProviderScreenRequest::Operation(
+                ProviderOperationKind::SaveDraft
+            ))
+        );
+        assert_eq!(screen.view().step, Some(ProviderManagementStep::Validate));
+    }
+
+    #[test]
+    fn failed_or_cancelled_model_save_returns_to_the_model_picker() {
+        let mut failed = screen_at_model();
+        failed
+            .set_manual_model("deepseek/reasoner")
+            .expect("selected model");
+        let failed_id = OperationId::new();
+        assert!(failed.start_operation(failed_id, ProviderOperationKind::SaveDraft));
+        assert!(failed.complete_operation(
+            failed_id,
+            ProviderResultOutcome::Failed(ProviderManagementError::new(
+                ProviderErrorCode::StorageConflict,
+                None,
+                ProviderRemediation::ReturnToEdit,
+            )),
+        ));
+        assert!(failed.return_to_edit());
+        assert_eq!(failed.view().step, Some(ProviderManagementStep::Model));
+
+        let mut cancelled = screen_at_model();
+        cancelled
+            .set_manual_model("deepseek/reasoner")
+            .expect("selected model");
+        let cancelled_id = OperationId::new();
+        assert!(cancelled.start_operation(cancelled_id, ProviderOperationKind::SaveDraft));
+        assert_eq!(cancelled.cancel_busy(), Some(cancelled_id));
+        assert_eq!(cancelled.view().step, Some(ProviderManagementStep::Model));
+    }
+
+    #[test]
+    fn expired_saved_model_absent_from_discovery_requires_an_explicit_new_selection() {
+        let profile_id = ProfileId::new();
+        let profile = profile_view(
+            profile_id,
+            ProviderId::DeepSeek,
+            ProfileState::Ready,
+            CredentialViewStatus::Saved,
+            None,
+        );
+        let expected = profile.model.clone();
+        let browse = ProviderManagementView::new(
+            vec![catalog(ProviderId::DeepSeek, CredentialKind::ApiKey)],
+            vec![profile.clone()],
+            None,
+            false,
+        );
+        let mut screen = ProviderManagementScreen::new(browse);
+        assert!(screen.start_edit(&profile));
+        assert!(screen.next_step());
+        assert!(screen.next_step());
+        let operation_id = OperationId::new();
+        assert!(screen.start_operation(operation_id, ProviderOperationKind::DiscoverModels));
+        assert!(screen.complete_discovery(
+            operation_id,
+            vec![DiscoveredModel {
+                model: "deepseek/replacement".to_owned(),
+                context_limit: Some(32_768),
+            }],
+        ));
+
+        assert!(!screen.selected_discovered_model_matches(&expected));
+        assert_eq!(screen.view().step, Some(ProviderManagementStep::Model));
+    }
+
+    #[test]
+    fn validation_credential_failure_returns_to_authentication() {
+        let mut screen = screen_at_validate();
+        let operation_id = OperationId::new();
+        assert!(screen.start_operation(operation_id, ProviderOperationKind::Validate));
+        assert!(screen.complete_operation(
+            operation_id,
+            ProviderResultOutcome::Failed(ProviderManagementError::new(
+                ProviderErrorCode::CredentialMissing,
+                Some(ProviderField::Credential),
+                ProviderRemediation::ReturnToEdit,
+            )),
+        ));
+        assert!(screen.return_to_edit());
+        assert_eq!(
+            screen.view().step,
+            Some(ProviderManagementStep::Authentication)
+        );
+    }
+
+    #[test]
+    fn api_key_input_rejects_newlines_control_characters_and_non_ascii_text() {
+        let mut screen = ProviderManagementScreen::new(ProviderManagementView::offline());
+        assert!(screen.start_create("local DeepSeek"));
+        assert!(screen.select_provider(ProviderId::DeepSeek));
+        assert!(screen.next_step());
+        assert!(screen.select_authentication(ProviderAuthentication::ApiKey));
+
+        assert!(!screen.append_secret_text("abc\ndef".to_owned()));
+        assert!(!screen.append_secret_character('\u{7f}'));
+        assert!(!screen.append_secret_character('密'));
+        assert_eq!(
+            screen
+                .view()
+                .edit
+                .expect("authentication edit")
+                .credential_mask,
+            None
+        );
+        assert!(screen.append_secret_text("sk-valid_ascii".to_owned()));
+        assert_eq!(
+            screen.view().edit.expect("masked API key").credential_mask,
+            Some(SECRET_MASK)
+        );
+    }
+
+    #[test]
     fn secret_handoff_is_move_only_and_oauth_cancel_returns_to_authentication() {
         let mut screen = ProviderManagementScreen::new(ProviderManagementView::offline());
         assert!(screen.start_create("subscription"));
@@ -1395,6 +2101,9 @@ mod tests {
         let mut screen = ProviderManagementScreen::new(browse);
 
         assert!(screen.start_edit(&profile));
+        let edit = screen.view().edit.expect("saved credential edit");
+        assert_eq!(edit.credential_mask, Some(SECRET_MASK));
+        assert!(edit.has_saved_credential);
         assert!(screen.discard_edit());
         assert_eq!(screen.state_kind(), ProviderManagementStateKind::Browse);
         assert_eq!(screen.view().browse, original);

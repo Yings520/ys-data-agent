@@ -716,6 +716,33 @@ fn model_selection_views_are_safe_and_keep_same_named_models_distinct_by_profile
 }
 
 #[test]
+fn current_is_an_orthogonal_marker_when_setup_becomes_unavailable() {
+    let target = SelectionTarget::Provider(ProviderId::DeepSeek);
+    let current_target = SelectionTargetView::new(
+        target.clone(),
+        "DeepSeek",
+        SelectionAvailability::NeedsSetup,
+        SelectionCurrentStatus::Current,
+    )
+    .expect("a persisted current target may require credential repair");
+    ModelSelectionSnapshot::new(vec![current_target]).expect("one current target remains valid");
+
+    let model =
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/reasoner").expect("valid model");
+    let current_model = ModelCandidateView::new(
+        ModelCandidateKey::new(ProfileId::new(), 1, Some(1), ProviderId::DeepSeek, model)
+            .expect("valid candidate key"),
+        "primary",
+        "reasoner",
+        ModelCandidateStatus::Unavailable,
+        SelectionCurrentStatus::Current,
+    )
+    .expect("current and availability are independent display facts");
+    ModelCandidateBatch::new(target, vec![current_model])
+        .expect("one unavailable current marker remains valid");
+}
+
+#[test]
 fn store_adapter_runtime_and_tui_can_compile_against_fake_provider_ports() {
     let repository = FakeProviderProfileRepository;
     let bindings = FakeRunProviderBindingRepository;

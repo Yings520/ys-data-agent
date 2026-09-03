@@ -2,6 +2,7 @@
 pub enum CommandKind {
     Mode,
     Model,
+    Exit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,13 +30,14 @@ impl CommandSpec {
     }
 }
 
-const COMMAND_CATALOG: [CommandSpec; 2] = [
-    CommandSpec::product(CommandKind::Mode, "mode", "choose Auto or Query mode"),
+const COMMAND_CATALOG: [CommandSpec; 3] = [
+    CommandSpec::product(CommandKind::Mode, "mode", "Choose Auto or Query mode"),
     CommandSpec::product(
         CommandKind::Model,
         "model",
-        "choose active Provider and model",
+        "Choose active Provider and model",
     ),
+    CommandSpec::product(CommandKind::Exit, "exit", "Exit the CLI"),
 ];
 
 pub fn command_catalog() -> &'static [CommandSpec] {
@@ -122,6 +124,13 @@ where
             .take(self.visible_rows)
             .enumerate()
             .map(|(visible, index)| (self.scroll + visible == self.selected, &self.items[*index]))
+    }
+
+    pub fn visible_row_count(&self) -> usize {
+        self.matches
+            .len()
+            .saturating_sub(self.scroll)
+            .min(self.visible_rows)
     }
 
     pub fn selected(&self) -> Option<&T> {
@@ -212,9 +221,9 @@ fn match_score<T: SelectionItem>(query: &str, item: &T) -> Option<u8> {
         Some(0)
     } else if name.starts_with(query) {
         Some(1)
-    } else if is_ordered_subsequence(query, &name) {
+    } else if query.chars().count() >= 2 && is_ordered_subsequence(query, &name) {
         Some(2)
-    } else if description.contains(query) {
+    } else if query.chars().count() >= 2 && description.contains(query) {
         Some(3)
     } else {
         None
@@ -253,6 +262,7 @@ impl SlashPalette {
             self.clear();
             return false;
         };
+        self.selector.replace_items(command_catalog().to_vec());
         self.selector.update_query(query);
         true
     }
@@ -261,6 +271,10 @@ impl SlashPalette {
         self.selector
             .rows()
             .map(|(selected, item)| (selected, *item))
+    }
+
+    pub fn visible_row_count(&self) -> usize {
+        self.selector.visible_row_count()
     }
 
     pub fn selected(&self) -> Option<CommandSpec> {
@@ -293,7 +307,7 @@ impl SlashPalette {
     }
 
     pub fn clear(&mut self) {
-        self.selector.clear();
+        self.selector = Selector::new(command_catalog().to_vec());
     }
 }
 
@@ -310,14 +324,42 @@ mod tests {
                 .rows()
                 .map(|(_, command)| command.name)
                 .collect::<Vec<_>>(),
-            vec!["mode", "model"]
+            vec!["mode", "model", "exit"]
         );
         assert_eq!(palette.rows().filter(|(selected, _)| *selected).count(), 1);
         palette.move_down();
         assert_eq!(palette.completion(), Some(("/model".to_owned(), false)));
+        assert!(palette.update("/e"));
+        assert_eq!(palette.completion(), Some(("/exit".to_owned(), false)));
+        assert_eq!(palette.visible_row_count(), 1);
         assert!(palette.update("/no-such-command"));
         assert!(palette.rows().next().is_none());
         assert_eq!(palette.selected(), None);
+    }
+
+    #[test]
+    fn live_palette_uses_subsequence_and_description_matching() {
+        let mut palette = SlashPalette::with_default_commands();
+        assert!(palette.update("/mdl"));
+        assert_eq!(
+            palette.selected().map(|command| command.name),
+            Some("model")
+        );
+
+        assert!(palette.update("/active provider"));
+        assert_eq!(
+            palette.selected().map(|command| command.name),
+            Some("model")
+        );
+    }
+
+    #[test]
+    fn command_palette_reopens_with_the_complete_catalog_after_clear() {
+        let mut palette = SlashPalette::with_default_commands();
+        palette.clear();
+
+        assert!(palette.update("/"));
+        assert_eq!(palette.visible_row_count(), 3);
     }
 
     #[test]

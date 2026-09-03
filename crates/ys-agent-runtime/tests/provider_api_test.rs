@@ -1,4 +1,11 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use ys_agent_adapters::{
     credential::keyring::InMemoryCredentialVault, model::liter::LiterProviderFactory,
@@ -26,6 +33,7 @@ mod provider_fixture;
 
 struct ScriptedDiscovery {
     responses: tokio::sync::Mutex<VecDeque<ProviderResult<Vec<DiscoveredModel>>>>,
+    delay_ms: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -35,11 +43,17 @@ impl ModelDiscovery for ScriptedDiscovery {
         _request: DiscoverModelsRequest,
         _credential: CredentialLease,
     ) -> ProviderResult<Vec<DiscoveredModel>> {
-        self.responses
+        let response = self
+            .responses
             .lock()
             .await
             .pop_front()
-            .expect("scripted discovery response")
+            .expect("scripted discovery response");
+        let delay_ms = self.delay_ms.load(Ordering::SeqCst);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+        }
+        response
     }
 }
 
@@ -188,6 +202,7 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
                 ProviderRemediation::Retry,
             )),
         ])),
+        delay_ms: AtomicUsize::new(0),
     });
     let factory = Arc::new(ScriptedProviderFactory {
         scripts: tokio::sync::Mutex::new(VecDeque::from([
@@ -208,15 +223,19 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
         GovernedProviderCatalog::default(),
         catalog_views(),
         profiles,
-        vault,
+        vault.clone(),
         run_bindings,
         lifecycle,
         credentials,
-        discovery,
+        discovery.clone(),
         factory,
-    );
+    )
+    .with_model_discovery_timeout(Duration::from_millis(20));
 
-    assert_eq!(api.catalog().await.expect("offline catalog").len(), 9);
+    assert_eq!(
+        api.catalog().await.expect("offline catalog").len(),
+        ProviderId::ALL.len()
+    );
     let profiles = api.list_profiles().await.expect("masked profile list");
     assert_eq!(profiles.len(), 1);
     assert_eq!(profiles[0].credential_status, CredentialViewStatus::Saved);
@@ -253,7 +272,7 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
         .model_selection_snapshot()
         .await
         .expect("compose selection snapshot");
-    assert_eq!(snapshot.targets().len(), 9);
+    assert_eq!(snapshot.targets().len(), ProviderId::ALL.len());
     assert_eq!(
         snapshot
             .targets()
@@ -296,6 +315,11 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
         .await
         .expect("merge saved and discovered candidates");
     assert_eq!(first.candidates().len(), 3);
+    assert!(first.candidates().iter().all(|candidate| {
+        !candidate
+            .model_display_name()
+            .starts_with(ProviderId::DeepSeek.model_prefix())
+    }));
     assert_eq!(
         first
             .candidates()
@@ -311,7 +335,7 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
     }));
     assert!(first.candidates().iter().any(|candidate| {
         candidate.key().model().as_str() == "deepseek/new-model"
-            && candidate.status() == ModelCandidateStatus::NeedsValidation
+            && candidate.status() == ModelCandidateStatus::Unavailable
     }));
     let ready_key = first
         .candidates()
@@ -326,10 +350,12 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
             .contains("anthropic/polluted")
     );
 
+    discovery.delay_ms.store(100, Ordering::SeqCst);
     let second = api
         .list_model_candidates(request)
         .await
-        .expect("discovery failure retains saved candidates");
+        .expect("discovery timeout retains saved candidates");
+    discovery.delay_ms.store(0, Ordering::SeqCst);
     assert_eq!(second.candidates().len(), 2);
     assert!(
         second
@@ -483,6 +509,60 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
         .collect::<Vec<_>>();
     assert_eq!(current.len(), 1);
     assert_eq!(current[0].key().model().as_str(), "deepseek/new-model");
+
+    let active_detail = api
+        .load_profile(first_used.profile_id)
+        .await
+        .expect("load active Profile before credential loss");
+    let credential_generation = active_detail
+        .credential_generation
+        .expect("active Profile has a credential generation");
+    vault
+        .delete_generation(ProviderCredentialReference {
+            profile_id: first_used.profile_id,
+            generation: credential_generation,
+        })
+        .await
+        .expect("simulate protected credential loss");
+
+    assert_eq!(
+        api.active_provider()
+            .await
+            .expect("durable active pointer remains available for CAS"),
+        Some(first_used.clone())
+    );
+    assert_eq!(
+        api.usable_active_provider()
+            .await
+            .expect("credential loss is a renderable active-model state"),
+        None,
+        "a missing Credential must not appear usable in the Header or Query gate"
+    );
+
+    let snapshot = api
+        .model_selection_snapshot()
+        .await
+        .expect("credential loss remains a renderable selection state");
+    let target = snapshot
+        .targets()
+        .iter()
+        .find(|target| target.target().provider() == ProviderId::DeepSeek)
+        .expect("DeepSeek target remains visible");
+    assert_eq!(target.current(), SelectionCurrentStatus::Current);
+    assert_eq!(target.availability(), SelectionAvailability::NeedsSetup);
+
+    let candidates = api
+        .list_model_candidates(ListModelCandidatesRequest {
+            target: SelectionTarget::Provider(ProviderId::DeepSeek),
+        })
+        .await
+        .expect("credential loss remains a renderable candidate state");
+    let current = candidates
+        .candidates()
+        .iter()
+        .find(|candidate| candidate.current().is_current())
+        .expect("persisted current model remains marked");
+    assert_eq!(current.status(), ModelCandidateStatus::Unavailable);
 }
 
 #[tokio::test]
@@ -513,6 +593,7 @@ async fn empty_catalog_stays_empty_and_rejects_unprovable_candidates() {
         credentials,
         Arc::new(ScriptedDiscovery {
             responses: tokio::sync::Mutex::new(VecDeque::new()),
+            delay_ms: AtomicUsize::new(0),
         }),
         Arc::new(LiterProviderFactory::new()),
     );

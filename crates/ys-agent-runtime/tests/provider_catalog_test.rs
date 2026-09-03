@@ -44,10 +44,10 @@ fn evidence_for(
 }
 
 #[test]
-fn governed_catalog_is_exact_offline_and_has_no_dynamic_or_openai_route() {
+fn governed_catalog_matches_approved_provider_and_plan_groups() {
     let catalog = GovernedProviderCatalog::default();
     let entries = catalog.entries();
-    assert_eq!(entries.len(), 9);
+    assert_eq!(entries.len(), 17);
     assert_eq!(
         entries.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
         ProviderId::ALL
@@ -65,9 +65,49 @@ fn governed_catalog_is_exact_offline_and_has_no_dynamic_or_openai_route() {
         .iter()
         .map(|entry| entry.endpoint_key())
         .collect::<BTreeSet<_>>();
-    assert_eq!(names.len(), 9);
-    assert_eq!(prefixes.len(), 9);
-    assert_eq!(endpoints.len(), 9);
+    assert_eq!(names.len(), 17);
+    assert!(!prefixes.contains(""));
+    assert_eq!(endpoints.len(), 17);
+
+    assert_eq!(
+        ProviderId::PROVIDERS
+            .into_iter()
+            .map(|provider| catalog.entry(provider).display_name())
+            .collect::<Vec<_>>(),
+        [
+            "openai",
+            "deepseek",
+            "claude",
+            "kimi",
+            "qwen",
+            "gemini",
+            "minimax",
+            "glm",
+            "openrouter",
+        ]
+    );
+    assert_eq!(
+        ProviderId::PLANS
+            .into_iter()
+            .map(|provider| catalog.entry(provider).display_name())
+            .collect::<Vec<_>>(),
+        [
+            "codex",
+            "claude code",
+            "OpenCode Go",
+            "alibaba coding",
+            "bigmodel coding",
+            "zai coding",
+            "minimax coding",
+            "kimi coding",
+        ]
+    );
+    assert!(ProviderId::PROVIDERS.into_iter().all(|provider| {
+        matches!(catalog.entry(provider).selection_target(), ys_agent_core::SelectionTarget::Provider(id) if id == provider)
+    }));
+    assert!(ProviderId::PLANS.into_iter().all(|provider| {
+        matches!(catalog.entry(provider).selection_target(), ys_agent_core::SelectionTarget::Plan { provider: id, .. } if id == provider)
+    }));
 
     for entry in entries {
         assert_eq!(entry.model_prefix(), entry.id().model_prefix());
@@ -75,8 +115,6 @@ fn governed_catalog_is_exact_offline_and_has_no_dynamic_or_openai_route() {
             entry.credential_kind(),
             entry.id().required_credential_kind()
         );
-        assert!(!entry.model_prefix().starts_with("openai/"));
-        assert!(!entry.display_name().to_ascii_lowercase().contains("openai"));
         assert!(matches!(
             entry.discovery(),
             ModelDiscoveryKind::FixedBackend | ModelDiscoveryKind::ProviderCatalog
@@ -121,13 +159,23 @@ fn governed_catalog_is_exact_offline_and_has_no_dynamic_or_openai_route() {
 }
 
 #[test]
+fn legacy_profile_providers_remain_resolvable_but_are_not_selectable() {
+    let catalog = GovernedProviderCatalog::default();
+
+    for provider in ProviderId::LEGACY {
+        assert!(!catalog.entries().iter().any(|entry| entry.id() == provider));
+        assert_eq!(catalog.entry(provider).id(), provider);
+    }
+}
+
+#[test]
 fn static_catalog_without_approved_evidence_can_only_be_candidate() {
     let catalog = GovernedProviderCatalog::default();
     let baseline = EvidenceBaseline::for_catalog(&catalog, "probe-v1", "codec-v1", "1.19.1");
     let registry = EvidenceRegistry::new(baseline);
 
     let statuses = registry.derive_all(&catalog);
-    assert_eq!(statuses.len(), 9);
+    assert_eq!(statuses.len(), ProviderId::ALL.len());
     assert!(!registry.is_nine_of_nine_supported(&catalog));
     for status in statuses {
         assert_eq!(status.status(), ProviderSupportStatus::Candidate);

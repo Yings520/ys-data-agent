@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
@@ -30,6 +30,31 @@ impl BrowserLauncher for RecordingBrowser {
             .lock()
             .expect("browser recorder lock")
             .push(uri.to_owned());
+    }
+}
+
+#[derive(Default)]
+struct BlockingBrowser {
+    released: Mutex<bool>,
+    release_signal: Condvar,
+}
+
+impl BlockingBrowser {
+    fn release(&self) {
+        *self.released.lock().expect("browser release lock") = true;
+        self.release_signal.notify_all();
+    }
+}
+
+impl BrowserLauncher for BlockingBrowser {
+    fn open(&self, _uri: &str) {
+        let mut released = self.released.lock().expect("browser release lock");
+        while !*released {
+            released = self
+                .release_signal
+                .wait(released)
+                .expect("browser release wait");
+        }
     }
 }
 
@@ -258,6 +283,35 @@ async fn device_flow_opens_fixed_verification_and_writes_one_masked_bundle() {
             .expect("browser recorder lock")
             .as_slice(),
         &[format!("{}/codex/device", server.uri())]
+    );
+}
+
+#[tokio::test]
+async fn device_code_returns_before_a_blocked_browser_launcher_finishes() {
+    let server = MockServer::start().await;
+    let vault = Arc::new(InMemoryCredentialVault::new());
+    let browser = Arc::new(BlockingBrowser::default());
+    let manager = ChatGptOAuthManager::with_endpoints_for_test(
+        vault,
+        OAuthEndpoints::for_test(&server.uri()),
+        browser.clone(),
+    )
+    .expect("fixture manager");
+    mount_device_start(&server, 1).await;
+
+    let authorization = tokio::time::timeout(
+        Duration::from_millis(500),
+        manager.start(ProfileId::new(), OperationId::new()),
+    )
+    .await
+    .expect("the TUI must receive the code without waiting for browser startup")
+    .expect("start device authorization");
+    browser.release();
+
+    assert_eq!(authorization.user_code, "ABCD-1234");
+    assert_eq!(
+        authorization.verification_uri,
+        format!("{}/codex/device", server.uri())
     );
 }
 

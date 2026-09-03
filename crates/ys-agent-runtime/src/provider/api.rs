@@ -4,7 +4,7 @@
 //! probing, and Doctor. Callers receive core view types and stable `ProviderManagementError`s;
 //! neither a repository nor a credential lease escapes it.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use ys_agent_core::{
@@ -12,14 +12,15 @@ use ys_agent_core::{
     CredentialGeneration, CredentialMutationRequest, CredentialVault, CredentialViewStatus,
     DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
     ListModelCandidatesRequest, ModelCandidateBatch, ModelCandidateKey, ModelCandidateStatus,
-    ModelCandidateView, ModelDiscovery, ModelSelectionSnapshot, OAuthConnectionView, OperationId,
-    ProfileDetail, ProfileId, ProfileName, ProfileRevision, ProfileState, ProviderCatalogView,
-    ProviderClientBinding, ProviderClientFactory, ProviderCredentialReference, ProviderDoctorView,
-    ProviderErrorCode, ProviderField, ProviderManagementApi, ProviderManagementError,
-    ProviderModelId, ProviderProfileRepository, ProviderRemediation, ProviderResult,
-    ProviderSupportStatus, RevisionPrecondition, RunProviderBindingRepository, SaveProfileRequest,
-    SaveProfileRevision, SelectionAvailability, SelectionCurrentStatus, SelectionTargetView,
-    SwitchModelRequest, ValidateProfileRequest, ValidationCommit, ValidationCommitPrecondition,
+    ModelCandidateView, ModelDiscovery, ModelSelectionSnapshot, OAuthConnectionStatus,
+    OAuthConnectionView, OperationId, ProfileDetail, ProfileId, ProfileName, ProfileRevision,
+    ProfileState, ProviderCatalogView, ProviderClientBinding, ProviderClientFactory,
+    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField,
+    ProviderManagementApi, ProviderManagementError, ProviderModelId, ProviderProfileRepository,
+    ProviderRemediation, ProviderResult, ProviderSupportStatus, RevisionPrecondition,
+    RunProviderBindingRepository, SaveProfileRequest, SaveProfileRevision, SelectionAvailability,
+    SelectionCurrentStatus, SelectionTargetView, SwitchModelRequest, ValidateProfileRequest,
+    ValidationCommit, ValidationCommitPrecondition,
 };
 
 use super::{
@@ -49,7 +50,10 @@ pub struct InProcessProviderManagementApi {
     local_validator: LocalProfileValidator,
     compatibility_validator: CompatibilityValidator,
     doctor: ProviderDoctorCheck,
+    model_discovery_timeout: Duration,
 }
+
+const DEFAULT_MODEL_SELECTION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl InProcessProviderManagementApi {
     #[allow(clippy::too_many_arguments)]
@@ -77,7 +81,17 @@ impl InProcessProviderManagementApi {
             credentials,
             discovery,
             factory,
+            model_discovery_timeout: DEFAULT_MODEL_SELECTION_DISCOVERY_TIMEOUT,
         }
+    }
+
+    /// Bounds best-effort online enrichment of a model-selection batch. Persisted candidates are
+    /// still returned when the provider is slow or unreachable.
+    pub fn with_model_discovery_timeout(mut self, timeout: Duration) -> Self {
+        self.model_discovery_timeout = timeout
+            .max(Duration::from_millis(1))
+            .min(Duration::from_secs(25));
+        self
     }
 
     async fn current_revision(
@@ -107,6 +121,33 @@ impl InProcessProviderManagementApi {
             })
             .await?;
         Ok((generation, status))
+    }
+
+    async fn selection_credential_status(
+        &self,
+        revision: &ProfileRevision,
+    ) -> ProviderResult<CredentialViewStatus> {
+        let status = match revision.credential_generation() {
+            Some(generation) => {
+                self.vault
+                    .credential_status(ProviderCredentialReference {
+                        profile_id: revision.profile_id(),
+                        generation,
+                    })
+                    .await?
+            }
+            None => CredentialViewStatus::Missing,
+        };
+        if revision.provider() != ys_agent_core::ProviderId::ChatGptSubscription
+            || status != CredentialViewStatus::Saved
+        {
+            return Ok(status);
+        }
+        let oauth = self
+            .lifecycle
+            .oauth_connection(revision.profile_id())
+            .await?;
+        Ok(oauth_selection_credential_status(oauth.status))
     }
 
     async fn local_validation(
@@ -202,9 +243,23 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
             } else {
                 SelectionCurrentStatus::NotCurrent
             };
-            let configured = profiles
+            let mut configured = false;
+            for profile in profiles
                 .iter()
-                .any(|profile| profile.provider == view.provider);
+                .filter(|profile| profile.provider == view.provider)
+            {
+                let revision = self
+                    .profiles
+                    .load_current_revision(profile.profile_id)
+                    .await?;
+                let credential_status = self.selection_credential_status(&revision).await?;
+                if credential_status == CredentialViewStatus::Saved
+                    && !revision.model().is_setup_pending()
+                {
+                    configured = true;
+                    break;
+                }
+            }
             let availability = match view.support_status {
                 ProviderSupportStatus::Blocked => SelectionAvailability::Unavailable,
                 ProviderSupportStatus::Supported | ProviderSupportStatus::Candidate
@@ -262,6 +317,7 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
         let expected_activation_revision = active.as_ref().map(|active| active.activation_revision);
         let summaries = self.lifecycle.list_profiles().await?;
         let mut candidates = Vec::new();
+        let discovery_deadline = tokio::time::Instant::now() + self.model_discovery_timeout;
 
         for summary in summaries
             .iter()
@@ -274,34 +330,25 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
             if revision.provider() != provider {
                 return Err(catalog_unavailable());
             }
-            let credential_status = match revision.credential_generation() {
-                Some(generation) => {
-                    self.vault
-                        .credential_status(ProviderCredentialReference {
-                            profile_id: summary.profile_id,
-                            generation,
-                        })
-                        .await?
-                }
-                None => CredentialViewStatus::Missing,
-            };
+            let credential_status = self.selection_credential_status(&revision).await?;
             let current = candidate_current_status(active.as_ref(), &revision);
             let saved_status = candidate_status(
                 summary.state,
                 credential_status,
                 &catalog_view.support_status,
-                current,
             );
-            candidates.push(model_candidate_view(
-                summary.profile_id,
-                revision.revision(),
-                expected_activation_revision,
-                provider,
-                revision.model().clone(),
-                &summary.name,
-                saved_status,
-                current,
-            )?);
+            if !revision.model().is_setup_pending() {
+                candidates.push(model_candidate_view(
+                    summary.profile_id,
+                    revision.revision(),
+                    expected_activation_revision,
+                    provider,
+                    revision.model().clone(),
+                    &summary.name,
+                    saved_status,
+                    current,
+                )?);
+            }
 
             if catalog_view.support_status == ProviderSupportStatus::Blocked
                 || credential_status != CredentialViewStatus::Saved
@@ -311,20 +358,36 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
             let Some(credential_generation) = revision.credential_generation() else {
                 continue;
             };
-            let discovered = self
-                .discover_models(DiscoverModelsRequest {
+            let remaining =
+                discovery_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                continue;
+            }
+            let discovered = tokio::time::timeout(
+                remaining,
+                self.discover_models(DiscoverModelsRequest {
                     operation_id: OperationId::new(),
                     profile_id: summary.profile_id,
                     profile_revision: revision.revision(),
                     provider,
                     credential_generation,
-                })
-                .await;
-            let Ok(discovered) = discovered else {
+                }),
+            )
+            .await;
+            let Ok(Ok(discovered)) = discovered else {
                 continue;
             };
-            let mut seen_models = HashSet::from([revision.model().as_str().to_owned()]);
+            let mut seen_models = if revision.model().is_setup_pending() {
+                HashSet::new()
+            } else {
+                HashSet::from([revision.model().as_str().to_owned()])
+            };
             for discovered in discovered {
+                let status = if discovered.context_limit.is_some_and(|limit| limit > 0) {
+                    ModelCandidateStatus::NeedsValidation
+                } else {
+                    ModelCandidateStatus::Unavailable
+                };
                 let Ok(model) = ProviderModelId::new(provider, discovered.model) else {
                     continue;
                 };
@@ -338,7 +401,7 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
                     provider,
                     model,
                     &summary.name,
-                    ModelCandidateStatus::NeedsValidation,
+                    status,
                     SelectionCurrentStatus::NotCurrent,
                 )?);
             }
@@ -364,6 +427,7 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
             {
                 return Err(catalog_unavailable());
             }
+            let credential_status = self.selection_credential_status(&active_revision).await?;
             candidates.push(model_candidate_view(
                 active.profile_id,
                 active.profile_revision,
@@ -371,7 +435,11 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
                 active.provider,
                 active.model.clone(),
                 &summary.name,
-                ModelCandidateStatus::Ready,
+                candidate_status(
+                    active_revision.state(),
+                    credential_status,
+                    &catalog_view.support_status,
+                ),
                 SelectionCurrentStatus::Current,
             )?);
         }
@@ -428,8 +496,6 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
                 credential_generation,
             })
             .await?;
-        self.lifecycle
-            .require_not_cancelled(request.operation_id())?;
         let observed_context_limit = discovered.into_iter().find_map(|discovered| {
             let model = ProviderModelId::new(revision.provider(), discovered.model).ok()?;
             (model == *candidate.model())
@@ -437,6 +503,8 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
                 .flatten()
                 .filter(|limit| *limit > 0)
         });
+        self.lifecycle
+            .require_not_cancelled(request.operation_id())?;
         let observed_context_limit = observed_context_limit.ok_or_else(model_context_unknown)?;
 
         let latest_revision = self
@@ -521,6 +589,21 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
             .await?
             .as_ref()
             .map(ActiveProviderView::from))
+    }
+
+    async fn usable_active_provider(&self) -> ProviderResult<Option<ActiveProviderView>> {
+        let active = self.active_provider().await?;
+        let Some(active) = active else {
+            return Ok(None);
+        };
+        let revision = self
+            .profiles
+            .load_revision(active.profile_id, active.profile_revision)
+            .await?;
+        if self.selection_credential_status(&revision).await? != CredentialViewStatus::Saved {
+            return Ok(None);
+        }
+        Ok(Some(active))
     }
 
     async fn load_profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail> {
@@ -809,11 +892,7 @@ fn candidate_status(
     state: ProfileState,
     credential_status: CredentialViewStatus,
     support_status: &ProviderSupportStatus,
-    current: SelectionCurrentStatus,
 ) -> ModelCandidateStatus {
-    if current.is_current() {
-        return ModelCandidateStatus::Ready;
-    }
     if *support_status == ProviderSupportStatus::Blocked {
         return ModelCandidateStatus::CapabilityInsufficient;
     }
@@ -824,6 +903,17 @@ fn candidate_status(
         ProfileState::Ready => ModelCandidateStatus::Ready,
         ProfileState::Draft => ModelCandidateStatus::NeedsValidation,
         ProfileState::Invalid => ModelCandidateStatus::ValidationExpired,
+    }
+}
+
+fn oauth_selection_credential_status(status: OAuthConnectionStatus) -> CredentialViewStatus {
+    match status {
+        OAuthConnectionStatus::Connected => CredentialViewStatus::Saved,
+        OAuthConnectionStatus::Expired => CredentialViewStatus::Expired,
+        OAuthConnectionStatus::Revoked => CredentialViewStatus::Revoked,
+        OAuthConnectionStatus::Pending | OAuthConnectionStatus::Failed => {
+            CredentialViewStatus::ReconciliationRequired
+        }
     }
 }
 
@@ -838,7 +928,11 @@ fn model_candidate_view(
     status: ModelCandidateStatus,
     current: SelectionCurrentStatus,
 ) -> ProviderResult<ModelCandidateView> {
-    let model_display_name = model.as_str().to_owned();
+    let model_display_name = model
+        .as_str()
+        .strip_prefix(provider.model_prefix())
+        .unwrap_or(model.as_str())
+        .to_owned();
     let key = ModelCandidateKey::new(
         profile_id,
         profile_revision,
@@ -911,5 +1005,31 @@ fn codec_version(provider: ys_agent_core::ProviderId) -> &'static str {
     match provider {
         ys_agent_core::ProviderId::ChatGptSubscription => "chatgpt-responses-v1",
         _ => "liter-chat-v1",
+    }
+}
+
+#[cfg(test)]
+mod selection_status_tests {
+    use super::oauth_selection_credential_status;
+    use ys_agent_core::{CredentialViewStatus, OAuthConnectionStatus};
+
+    #[test]
+    fn oauth_selection_requires_a_live_connected_session() {
+        assert_eq!(
+            oauth_selection_credential_status(OAuthConnectionStatus::Connected),
+            CredentialViewStatus::Saved
+        );
+        assert_eq!(
+            oauth_selection_credential_status(OAuthConnectionStatus::Expired),
+            CredentialViewStatus::Expired
+        );
+        assert_eq!(
+            oauth_selection_credential_status(OAuthConnectionStatus::Revoked),
+            CredentialViewStatus::Revoked
+        );
+        assert_eq!(
+            oauth_selection_credential_status(OAuthConnectionStatus::Failed),
+            CredentialViewStatus::ReconciliationRequired
+        );
     }
 }

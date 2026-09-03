@@ -13,15 +13,16 @@ use ys_agent_core::{
 
 use super::{DiscoveryTransport, LiterModelDiscovery, TransportFailure, fixed_provider_hint};
 
-const API_KEY_PROVIDERS: [ProviderId; 8] = [
-    ProviderId::OpenCodeGo,
-    ProviderId::OpenCodeZen,
+const ONLINE_MODEL_PROVIDERS: [ProviderId; 9] = [
+    ProviderId::OpenAi,
     ProviderId::DeepSeek,
-    ProviderId::Xai,
-    ProviderId::Zai,
-    ProviderId::OpenRouter,
-    ProviderId::MiniMax,
     ProviderId::Anthropic,
+    ProviderId::Kimi,
+    ProviderId::Qwen,
+    ProviderId::Gemini,
+    ProviderId::MiniMax,
+    ProviderId::Glm,
+    ProviderId::OpenRouter,
 ];
 
 #[derive(Clone)]
@@ -97,8 +98,8 @@ fn credential() -> CredentialLease {
 }
 
 #[tokio::test]
-async fn eight_allowlisted_providers_use_fixed_hints_and_return_prefixed_models() {
-    for provider in API_KEY_PROVIDERS {
+async fn online_providers_use_fixed_hints_and_return_prefixed_models() {
+    for provider in ONLINE_MODEL_PROVIDERS {
         assert_eq!(fixed_provider_hint(provider), Ok(provider.model_prefix()));
 
         let transport = FixtureTransport::success(&["model-z", "model-a", "model-a"]);
@@ -151,6 +152,89 @@ async fn already_prefixed_results_survive_and_wrong_outer_prefixes_are_filtered(
 }
 
 #[tokio::test]
+async fn online_catalog_omits_non_chat_models_before_they_become_selectable() {
+    let transport = FixtureTransport::success(&["gpt-5.4", "text-embedding-3-small"]);
+    let discovery = LiterModelDiscovery::with_transport(Arc::new(transport));
+
+    let models = discovery
+        .discover(request(ProviderId::OpenAi), credential())
+        .await
+        .expect("a supported chat model remains");
+
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].model, "openai/gpt-5.4");
+    assert_eq!(models[0].context_limit, Some(1_050_000));
+}
+
+#[tokio::test]
+async fn opencode_go_intersects_the_online_catalog_with_the_product_allowlist() {
+    let transport = FixtureTransport::success(&[
+        "deepseek-v4-pro",
+        "kimi-k3",
+        "claude-sonnet-4-6",
+        "unapproved-model",
+    ]);
+    let discovery = LiterModelDiscovery::with_transport(Arc::new(transport));
+
+    let models = discovery
+        .discover(request(ProviderId::OpenCodeGo), credential())
+        .await
+        .expect("supported OpenCode Go models remain selectable");
+
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.model.as_str())
+            .collect::<Vec<_>>(),
+        ["opencode-go/deepseek-v4-pro", "opencode-go/kimi-k3"]
+    );
+}
+
+#[tokio::test]
+async fn every_opencode_go_model_has_catalog_context_evidence() {
+    let transport = FixtureTransport::success(&[
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "kimi-k2.7-code",
+        "kimi-k3",
+        "kimi-k2.6",
+        "glm-5.2",
+        "glm-5.1",
+        "grok-4.5",
+        "mimo-v2.5-pro",
+        "mimo-v2.5",
+    ]);
+    let discovery = LiterModelDiscovery::with_transport(Arc::new(transport));
+
+    let models = discovery
+        .discover(request(ProviderId::OpenCodeGo), credential())
+        .await
+        .expect("the OpenCode Go catalog is selectable");
+
+    assert_eq!(models.len(), 10);
+    assert!(
+        models
+            .iter()
+            .all(|model| model.context_limit.is_some_and(|limit| limit > 0)),
+        "every displayed OpenCode Go model must carry activation context evidence: {models:?}"
+    );
+}
+
+#[tokio::test]
+async fn opencode_go_rejects_an_online_catalog_without_supported_models() {
+    let transport = FixtureTransport::success(&["claude-sonnet-4-6", "unapproved-model"]);
+    let discovery = LiterModelDiscovery::with_transport(Arc::new(transport));
+
+    let error = discovery
+        .discover(request(ProviderId::OpenCodeGo), credential())
+        .await
+        .expect_err("an empty allowlist intersection cannot become a selectable catalog");
+
+    assert_eq!(error.code(), ProviderErrorCode::DiscoveryFailed.as_str());
+    assert_eq!(error.field(), Some(&ProviderField::Model));
+}
+
+#[tokio::test]
 async fn empty_or_fully_polluted_catalog_is_a_recoverable_discovery_failure() {
     for ids in [&[][..], &["xai/foreign-model", "   "][..]] {
         let transport = FixtureTransport::success(ids);
@@ -171,15 +255,6 @@ async fn empty_or_fully_polluted_catalog_is_a_recoverable_discovery_failure() {
 async fn invalid_request_never_reaches_the_transport() {
     let transport = FixtureTransport::success(&["model-a"]);
     let discovery = LiterModelDiscovery::with_transport(Arc::new(transport.clone()));
-
-    let chatgpt_error = discovery
-        .discover(request(ProviderId::ChatGptSubscription), credential())
-        .await
-        .expect_err("ChatGPT uses its fixed backend list");
-    assert_eq!(
-        chatgpt_error.code(),
-        ProviderErrorCode::ProtocolIncompatible.as_str()
-    );
 
     let mut mismatched = request(ProviderId::Anthropic);
     mismatched.credential_generation =
@@ -208,6 +283,30 @@ async fn invalid_request_never_reaches_the_transport() {
         ProviderErrorCode::AuthenticationInvalid.as_str()
     );
 
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn subscription_and_coding_plans_use_their_curated_model_lists() {
+    let transport = FixtureTransport::success(&["must-not-be-used"]);
+    let discovery = LiterModelDiscovery::with_transport(Arc::new(transport.clone()));
+
+    let codex = discovery
+        .discover(request(ProviderId::ChatGptSubscription), credential())
+        .await
+        .expect("connected Codex subscription has its fixed backend model");
+    assert_eq!(codex[0].model, "chatgpt/codex-mini-latest");
+    assert_eq!(codex[0].context_limit, Some(192_000));
+
+    let alibaba = discovery
+        .discover(request(ProviderId::AlibabaCoding), credential())
+        .await
+        .expect("Alibaba coding plan models");
+    assert!(
+        alibaba
+            .iter()
+            .any(|model| model.model == "anthropic/qwen3-coder-plus")
+    );
     assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
 }
 

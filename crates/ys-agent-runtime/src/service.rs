@@ -507,6 +507,10 @@ pub trait AgentServiceApi: Send + Sync {
         provider_api(self)?.active_provider().await
     }
 
+    async fn provider_usable_active(&self) -> ProviderResult<Option<ActiveProviderView>> {
+        provider_api(self)?.usable_active_provider().await
+    }
+
     async fn provider_load_profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail> {
         provider_api(self)?.load_profile(profile_id).await
     }

@@ -222,7 +222,12 @@ impl ChatGptOAuthManager {
 
         let browser = self.browser.clone();
         let browser_uri = verification_uri.clone();
-        let _ = tokio::task::spawn_blocking(move || browser.open(&browser_uri)).await;
+        // Browser startup is synchronous on macOS and can take focus before returning. Do not
+        // hold the device-authorization response behind it: the TUI must receive and render the
+        // user code immediately, even if the system browser launcher is slow or blocked.
+        drop(tokio::task::spawn_blocking(move || {
+            browser.open(&browser_uri)
+        }));
 
         Ok(DeviceAuthorizationView {
             verification_uri,

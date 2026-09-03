@@ -116,10 +116,7 @@ fn eight_chat_paths_encode_the_same_closed_liter_fixture() {
             .expect("approved Chat request");
         let value = serde_json::to_value(encoded).expect("serialize liter request");
 
-        assert_eq!(
-            value["model"],
-            format!("{}fixture-model", provider.model_prefix())
-        );
+        assert_eq!(value["model"], "fixture-model");
         assert_eq!(value["messages"][0]["role"], "system");
         assert_eq!(value["messages"][1]["role"], "user");
         assert_eq!(value["temperature"].as_f64(), Some(f64::from(0.2_f32)));

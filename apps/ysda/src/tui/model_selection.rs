@@ -1,7 +1,7 @@
 use ys_agent_core::{
-    ListModelCandidatesRequest, ModelCandidateBatch, ModelCandidateKey, ModelCandidateStatus,
-    ModelCandidateView, ModelSelectionSnapshot, SelectionAvailability, SelectionCurrentStatus,
-    SelectionTarget, SelectionTargetView,
+    ActiveProviderView, ListModelCandidatesRequest, ModelCandidateBatch, ModelCandidateKey,
+    ModelCandidateStatus, ModelCandidateView, ModelSelectionSnapshot, SelectionAvailability,
+    SelectionCurrentStatus, SelectionTarget, SelectionTargetView,
 };
 
 use super::navigation::FocusTarget;
@@ -63,7 +63,10 @@ pub enum ModelSelectionAction {
     PreviousTab,
     MoveUp,
     MoveDown,
+    PageUp,
+    PageDown,
     SearchChanged(String),
+    EditCredentials,
     Confirm,
     Back,
 }
@@ -201,6 +204,70 @@ impl ModelSelectionState {
         self.normalize_highlight();
     }
 
+    /// Applies Current markers only from the authoritative activation response. Candidate keys
+    /// are refreshed separately because first-use activation can advance their revisions.
+    pub fn apply_active_provider(&mut self, active: &ActiveProviderView) {
+        if let Some(snapshot) = &self.snapshot {
+            let mut marked = false;
+            let targets = snapshot
+                .targets()
+                .iter()
+                .filter_map(|target| {
+                    let current = if !marked && target.target().provider() == active.provider {
+                        marked = true;
+                        SelectionCurrentStatus::Current
+                    } else {
+                        SelectionCurrentStatus::NotCurrent
+                    };
+                    SelectionTargetView::new(
+                        target.target().clone(),
+                        target.display_name(),
+                        if current.is_current() {
+                            SelectionAvailability::Configured
+                        } else {
+                            target.availability()
+                        },
+                        current,
+                    )
+                    .ok()
+                })
+                .collect::<Vec<_>>();
+            if let Ok(snapshot) = ModelSelectionSnapshot::new(targets) {
+                self.snapshot = Some(snapshot);
+            }
+        }
+
+        if let Some(batch) = &self.candidates {
+            let target = batch.target().clone();
+            let candidates = batch
+                .candidates()
+                .iter()
+                .filter_map(|candidate| {
+                    let key = candidate.key();
+                    let current = if key.profile_id() == active.profile_id
+                        && key.expected_profile_revision() == active.profile_revision
+                        && key.model() == &active.model
+                    {
+                        SelectionCurrentStatus::Current
+                    } else {
+                        SelectionCurrentStatus::NotCurrent
+                    };
+                    ModelCandidateView::new(
+                        key.clone(),
+                        candidate.profile_display_name(),
+                        candidate.model_display_name(),
+                        candidate.status(),
+                        current,
+                    )
+                    .ok()
+                })
+                .collect::<Vec<_>>();
+            if let Ok(batch) = ModelCandidateBatch::new(target, candidates) {
+                self.candidates = Some(batch);
+            }
+        }
+    }
+
     pub fn reduce(&mut self, action: ModelSelectionAction) -> ModelSelectionOutcome {
         match action {
             ModelSelectionAction::SnapshotLoaded(snapshot) => {
@@ -254,8 +321,11 @@ impl ModelSelectionState {
             }
             ModelSelectionAction::Retry => self.retry(),
             ModelSelectionAction::NextTab | ModelSelectionAction::PreviousTab => {
-                if self.level != ModelSelectionLevel::Targets {
-                    return ModelSelectionOutcome::Ignored;
+                if self.level == ModelSelectionLevel::Models {
+                    self.level = ModelSelectionLevel::Targets;
+                    self.candidates = None;
+                    self.model_target = None;
+                    self.parent_cursor = None;
                 }
                 self.tab = match self.tab {
                     ModelSelectionTab::Providers => ModelSelectionTab::Plans,
@@ -267,16 +337,33 @@ impl ModelSelectionState {
                 ModelSelectionOutcome::Changed
             }
             ModelSelectionAction::MoveUp => {
-                self.highlighted = self.highlighted.map(|index| index.saturating_sub(1));
+                let count = self.visible_count();
+                self.highlighted =
+                    (count > 0).then(|| match self.highlighted.unwrap_or_default() {
+                        0 => count - 1,
+                        index => index - 1,
+                    });
                 self.keep_highlight_visible();
                 ModelSelectionOutcome::Changed
             }
             ModelSelectionAction::MoveDown => {
                 let count = self.visible_count();
+                self.highlighted = (count > 0)
+                    .then(|| self.highlighted.unwrap_or_default().saturating_add(1) % count);
+                self.keep_highlight_visible();
+                ModelSelectionOutcome::Changed
+            }
+            ModelSelectionAction::PageUp => {
+                self.highlighted = self.highlighted.map(|index| index.saturating_sub(10));
+                self.keep_highlight_visible();
+                ModelSelectionOutcome::Changed
+            }
+            ModelSelectionAction::PageDown => {
+                let count = self.visible_count();
                 self.highlighted = (count > 0).then(|| {
                     self.highlighted
                         .unwrap_or_default()
-                        .saturating_add(1)
+                        .saturating_add(10)
                         .min(count - 1)
                 });
                 self.keep_highlight_visible();
@@ -288,6 +375,7 @@ impl ModelSelectionState {
                 self.normalize_highlight();
                 ModelSelectionOutcome::Changed
             }
+            ModelSelectionAction::EditCredentials => self.edit_credentials(),
             ModelSelectionAction::Confirm => self.confirm(),
             ModelSelectionAction::Back => self.back(),
         }
@@ -311,6 +399,21 @@ impl ModelSelectionState {
             ModelSelectionLevel::Targets => self.confirm_target(),
             ModelSelectionLevel::Models => self.confirm_candidate(),
         }
+    }
+
+    fn edit_credentials(&self) -> ModelSelectionOutcome {
+        if self.load_state != ModelSelectionLoadState::Ready {
+            return ModelSelectionOutcome::Ignored;
+        }
+        let target = match self.level {
+            ModelSelectionLevel::Targets => {
+                self.selected_target().map(|target| target.target().clone())
+            }
+            ModelSelectionLevel::Models => self.model_target.clone(),
+        };
+        target.map_or(ModelSelectionOutcome::Ignored, |target| {
+            ModelSelectionOutcome::OpenProviderManagement(target)
+        })
     }
 
     fn confirm_target(&mut self) -> ModelSelectionOutcome {
@@ -374,6 +477,12 @@ impl ModelSelectionState {
         if self.level == ModelSelectionLevel::Targets {
             return ModelSelectionOutcome::Close;
         }
+        if !self.search.is_empty() {
+            self.search.clear();
+            self.scroll = 0;
+            self.normalize_highlight();
+            return ModelSelectionOutcome::Changed;
+        }
         let Some(parent) = self.parent_cursor.take() else {
             return ModelSelectionOutcome::Ignored;
         };
@@ -421,7 +530,7 @@ impl ModelSelectionState {
     }
 
     fn keep_highlight_visible(&mut self) {
-        const VISIBLE_ROWS: usize = 6;
+        const VISIBLE_ROWS: usize = 9;
         let Some(selected) = self.highlighted else {
             self.scroll = 0;
             return;
@@ -451,11 +560,8 @@ fn matches_query(value: &str, query: &str) -> bool {
 }
 
 pub fn render_lines(state: &ModelSelectionState) -> Vec<String> {
-    const VISIBLE_ROWS: usize = 6;
+    const VISIBLE_ROWS: usize = 9;
     let mut lines = vec!["Model Selection".to_owned(), render_tabs(state.tab)];
-    if state.current_target_count() == 0 {
-        lines.push("Current · unavailable · Query submission is blocked".to_owned());
-    }
     if state.level == ModelSelectionLevel::Models
         && let Some(target) = state.model_target_view()
     {
@@ -541,30 +647,25 @@ impl ModelSelectionState {
 
 fn render_tabs(active: ModelSelectionTab) -> String {
     match active {
-        ModelSelectionTab::Providers => "[Providers]  Plans".to_owned(),
-        ModelSelectionTab::Plans => "Providers  [Plans]".to_owned(),
+        ModelSelectionTab::Providers => "[Providers]  Plans  (Tab or ←/→ to switch)".to_owned(),
+        ModelSelectionTab::Plans => "Providers  [Plans]  (Tab or ←/→ to switch)".to_owned(),
     }
 }
 
 fn render_target_row(target: &SelectionTargetView, selected: bool) -> String {
     let availability = match target.availability() {
-        SelectionAvailability::Configured => "Configured",
-        SelectionAvailability::NeedsSetup => "Needs setup",
-        SelectionAvailability::Unavailable => "Unavailable",
+        SelectionAvailability::Configured => "✓",
+        SelectionAvailability::NeedsSetup => "[needs setup]",
+        SelectionAvailability::Unavailable => "[unavailable]",
     };
     let current = if target.current().is_current() {
-        " · Current"
+        "  ← current"
     } else {
         ""
     };
-    let action = match target.availability() {
-        SelectionAvailability::Configured => " · Enter models",
-        SelectionAvailability::NeedsSetup => " · Enter setup",
-        SelectionAvailability::Unavailable => " · Choose another option",
-    };
     format!(
-        "{}{} · {availability}{current}{action}",
-        if selected { "> " } else { "  " },
+        "{}{}  {availability}{current}",
+        if selected { "→ " } else { "  " },
         target.display_name()
     )
 }
@@ -584,13 +685,13 @@ fn render_candidate_row(candidate: &ModelCandidateView, selected: bool) -> Strin
         ModelCandidateStatus::Unavailable => ("Unavailable", "Choose another model"),
     };
     let current = if candidate.current().is_current() {
-        " · Current"
+        "  ← current"
     } else {
         ""
     };
     format!(
-        "{}{} · {status}{current} · {} · {action}",
-        if selected { "> " } else { "  " },
+        "{}{}  {status}{current}  {}  {action}",
+        if selected { "→ " } else { "  " },
         candidate.model_display_name(),
         candidate.profile_display_name()
     )
@@ -741,6 +842,31 @@ mod tests {
     }
 
     #[test]
+    fn navigation_wraps_and_escape_clears_model_search_before_going_back() {
+        let mut state = ModelSelectionState::default();
+        state.reduce(ModelSelectionAction::SnapshotLoaded(snapshot()));
+
+        state.reduce(ModelSelectionAction::MoveUp);
+        assert_eq!(state.highlighted, Some(2));
+        state.reduce(ModelSelectionAction::MoveDown);
+        assert_eq!(state.highlighted, Some(0));
+
+        enter_models(&mut state);
+        state.reduce(ModelSelectionAction::SearchChanged("new".to_owned()));
+        assert_eq!(state.level(), ModelSelectionLevel::Models);
+        state.reduce(ModelSelectionAction::Back);
+        assert_eq!(state.level(), ModelSelectionLevel::Models);
+        assert!(state.search.is_empty());
+        state.reduce(ModelSelectionAction::Back);
+        assert_eq!(state.level(), ModelSelectionLevel::Targets);
+
+        enter_models(&mut state);
+        state.reduce(ModelSelectionAction::NextTab);
+        assert_eq!(state.level(), ModelSelectionLevel::Targets);
+        assert_eq!(state.tab(), ModelSelectionTab::Plans);
+    }
+
+    #[test]
     fn target_and_model_statuses_produce_distinct_typed_intents() {
         let mut state = ModelSelectionState::default();
         state.reduce(ModelSelectionAction::SnapshotLoaded(snapshot()));
@@ -782,6 +908,28 @@ mod tests {
             state.reduce(ModelSelectionAction::Confirm),
             ModelSelectionOutcome::Blocked(ModelSelectionBlock::ModelUnavailable)
         );
+    }
+
+    #[test]
+    fn edit_credentials_targets_the_highlighted_provider_or_plan() {
+        let mut state = ModelSelectionState::default();
+        state.reduce(ModelSelectionAction::SnapshotLoaded(snapshot()));
+
+        assert_eq!(
+            state.reduce(ModelSelectionAction::EditCredentials),
+            ModelSelectionOutcome::OpenProviderManagement(SelectionTarget::Provider(
+                ProviderId::DeepSeek,
+            ))
+        );
+
+        state.reduce(ModelSelectionAction::NextTab);
+        assert!(matches!(
+            state.reduce(ModelSelectionAction::EditCredentials),
+            ModelSelectionOutcome::OpenProviderManagement(SelectionTarget::Plan {
+                provider: ProviderId::ChatGptSubscription,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -907,10 +1055,10 @@ mod tests {
         let rendered = render_lines(&state).join("\n");
 
         assert!(rendered.contains("[Providers]  Plans"));
-        assert!(rendered.contains("DeepSeek · Configured · Current"));
-        assert!(rendered.contains("xAI · Needs setup"));
-        assert!(rendered.contains("Anthropic · Unavailable"));
-        assert_eq!(rendered.matches("Current").count(), 1);
+        assert!(rendered.contains("DeepSeek  ✓  ← current"));
+        assert!(rendered.contains("xAI  [needs setup]"));
+        assert!(rendered.contains("Anthropic  [unavailable]"));
+        assert_eq!(rendered.matches("← current").count(), 1);
         assert!(!rendered.contains("Credential"));
         assert!(!rendered.contains("http"));
         assert!(!rendered.contains("validation digest"));
@@ -929,15 +1077,15 @@ mod tests {
         let rendered = render_lines(&state).join("\n");
 
         for expected in [
-            "Model ready · Ready",
-            "Model new · Needs validation",
-            "Model expired · Validation expired",
-            "Model insufficient · Capability insufficient",
-            "Model unavailable · Unavailable",
+            "Model ready  Ready",
+            "Model new  Needs validation",
+            "Model expired  Validation expired",
+            "Model insufficient  Capability insufficient",
+            "Model unavailable  Unavailable",
         ] {
             assert!(rendered.contains(expected), "missing {expected}");
         }
-        assert_eq!(rendered.matches(" · Ready").count(), 1);
+        assert_eq!(rendered.matches("  Ready").count(), 1);
         assert!(rendered.contains("Profile ready"));
     }
 

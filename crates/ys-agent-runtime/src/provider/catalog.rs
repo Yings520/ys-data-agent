@@ -13,8 +13,19 @@ use super::evidence::EvidenceKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderEndpointKey {
+    OpenAi,
+    Kimi,
+    Qwen,
+    Gemini,
+    Glm,
     ChatGptBackend,
+    ClaudeSubscription,
     OpenCodeGo,
+    AlibabaCoding,
+    BigModelCoding,
+    ZaiCoding,
+    MiniMaxCoding,
+    KimiCoding,
     OpenCodeZen,
     DeepSeek,
     Xai,
@@ -94,9 +105,9 @@ impl ProviderCatalogEntry {
 
     pub fn selection_target(&self) -> SelectionTarget {
         match self.id {
-            ProviderId::ChatGptSubscription => SelectionTarget::Plan {
-                provider: self.id,
-                plan: ProviderPlanId::new("chatgpt_subscription")
+            provider if provider.is_plan() => SelectionTarget::Plan {
+                provider,
+                plan: ProviderPlanId::new(plan_id(provider))
                     .expect("governed plan ID is a valid static token"),
             },
             provider => SelectionTarget::Provider(provider),
@@ -109,6 +120,7 @@ impl ProviderCatalogEntry {
 #[derive(Debug, Clone)]
 pub struct GovernedProviderCatalog {
     entries: Vec<ProviderCatalogEntry>,
+    legacy_entries: Vec<ProviderCatalogEntry>,
     digest: String,
 }
 
@@ -125,7 +137,15 @@ impl Default for GovernedProviderCatalog {
         let canonical = serde_json::to_vec(&canonical)
             .expect("governed Provider catalog serialization is infallible");
         let digest = hex::encode(Sha256::digest(canonical));
-        Self { entries, digest }
+        let legacy_entries = ProviderId::LEGACY
+            .into_iter()
+            .map(entry_for)
+            .collect::<Vec<_>>();
+        Self {
+            entries,
+            legacy_entries,
+            digest,
+        }
     }
 }
 
@@ -137,6 +157,7 @@ impl GovernedProviderCatalog {
     pub fn entry(&self, provider: ProviderId) -> &ProviderCatalogEntry {
         self.entries
             .iter()
+            .chain(&self.legacy_entries)
             .find(|entry| entry.id == provider)
             .expect("every core Provider belongs to the governed catalog")
     }
@@ -148,15 +169,81 @@ impl GovernedProviderCatalog {
 
 fn entry_for(id: ProviderId) -> ProviderCatalogEntry {
     let (display_name, endpoint_key, protocol, discovery) = match id {
+        ProviderId::OpenAi => (
+            "openai",
+            ProviderEndpointKey::OpenAi,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
+        ProviderId::Kimi => (
+            "kimi",
+            ProviderEndpointKey::Kimi,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
+        ProviderId::Qwen => (
+            "qwen",
+            ProviderEndpointKey::Qwen,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
+        ProviderId::Gemini => (
+            "gemini",
+            ProviderEndpointKey::Gemini,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
+        ProviderId::Glm => (
+            "glm",
+            ProviderEndpointKey::Glm,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
         ProviderId::ChatGptSubscription => (
-            "ChatGPT Subscription",
+            "codex",
             ProviderEndpointKey::ChatGptBackend,
             ProviderProtocol::Responses,
             ModelDiscoveryKind::FixedBackend,
         ),
+        ProviderId::ClaudeSubscription => (
+            "claude code",
+            ProviderEndpointKey::ClaudeSubscription,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
         ProviderId::OpenCodeGo => (
             "OpenCode Go",
             ProviderEndpointKey::OpenCodeGo,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
+        ProviderId::AlibabaCoding => (
+            "alibaba coding",
+            ProviderEndpointKey::AlibabaCoding,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
+        ProviderId::BigModelCoding => (
+            "bigmodel coding",
+            ProviderEndpointKey::BigModelCoding,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
+        ProviderId::ZaiCoding => (
+            "zai coding",
+            ProviderEndpointKey::ZaiCoding,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
+        ProviderId::MiniMaxCoding => (
+            "minimax coding",
+            ProviderEndpointKey::MiniMaxCoding,
+            ProviderProtocol::Chat,
+            ModelDiscoveryKind::ProviderCatalog,
+        ),
+        ProviderId::KimiCoding => (
+            "kimi coding",
+            ProviderEndpointKey::KimiCoding,
             ProviderProtocol::Chat,
             ModelDiscoveryKind::ProviderCatalog,
         ),
@@ -167,7 +254,7 @@ fn entry_for(id: ProviderId) -> ProviderCatalogEntry {
             ModelDiscoveryKind::ProviderCatalog,
         ),
         ProviderId::DeepSeek => (
-            "DeepSeek",
+            "deepseek",
             ProviderEndpointKey::DeepSeek,
             ProviderProtocol::Chat,
             ModelDiscoveryKind::ProviderCatalog,
@@ -185,19 +272,19 @@ fn entry_for(id: ProviderId) -> ProviderCatalogEntry {
             ModelDiscoveryKind::ProviderCatalog,
         ),
         ProviderId::OpenRouter => (
-            "OpenRouter",
+            "openrouter",
             ProviderEndpointKey::OpenRouter,
             ProviderProtocol::Chat,
             ModelDiscoveryKind::ProviderCatalog,
         ),
         ProviderId::MiniMax => (
-            "MiniMax",
+            "minimax",
             ProviderEndpointKey::MiniMax,
             ProviderProtocol::Chat,
             ModelDiscoveryKind::ProviderCatalog,
         ),
         ProviderId::Anthropic => (
-            "Anthropic",
+            "claude",
             ProviderEndpointKey::Anthropic,
             ProviderProtocol::Chat,
             ModelDiscoveryKind::ProviderCatalog,
@@ -213,6 +300,20 @@ fn entry_for(id: ProviderId) -> ProviderCatalogEntry {
         discovery,
         parameter_rules: common_parameter_rules(),
         required_evidence: EvidenceKind::ALL.into_iter().collect(),
+    }
+}
+
+const fn plan_id(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::ChatGptSubscription => "codex",
+        ProviderId::ClaudeSubscription => "claude_subscription",
+        ProviderId::OpenCodeGo => "opencode_go",
+        ProviderId::AlibabaCoding => "alibaba_coding",
+        ProviderId::BigModelCoding => "bigmodel_coding",
+        ProviderId::ZaiCoding => "zai_coding",
+        ProviderId::MiniMaxCoding => "minimax_coding",
+        ProviderId::KimiCoding => "kimi_coding",
+        _ => "provider",
     }
 }
 

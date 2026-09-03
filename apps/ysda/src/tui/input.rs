@@ -90,6 +90,7 @@ pub fn parse_input(raw: &str) -> Result<InputAction, InputError> {
     Ok(match spec.kind {
         CommandKind::Mode => InputAction::Mode,
         CommandKind::Model => InputAction::Model,
+        CommandKind::Exit => InputAction::Quit,
     })
 }
 
@@ -101,6 +102,7 @@ mod tests {
     fn only_catalog_commands_have_parser_paths() {
         assert_eq!(parse_input("/mode"), Ok(InputAction::Mode));
         assert_eq!(parse_input("/model"), Ok(InputAction::Model));
+        assert_eq!(parse_input("/exit"), Ok(InputAction::Quit));
 
         for retired in [
             "/new",

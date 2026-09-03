@@ -64,7 +64,7 @@ impl LiterChatCodec {
     }
 
     pub fn encode_request(&self, request: &ModelRequest) -> ProviderResult<ChatCompletionRequest> {
-        self.validate_model(&request.model)?;
+        let model = self.validate_model(&request.model)?;
         self.validate_temperature(request.temperature)?;
         if request.messages.is_empty() {
             return Err(protocol_incompatible());
@@ -75,7 +75,7 @@ impl LiterChatCodec {
         let has_tools = !tools.is_empty();
 
         Ok(ChatCompletionRequest {
-            model: request.model.clone(),
+            model: model.to_owned(),
             messages,
             temperature: request.temperature.map(f64::from),
             tools: has_tools.then_some(tools),
@@ -184,19 +184,23 @@ impl LiterChatCodec {
         })
     }
 
-    fn validate_model(&self, model: &str) -> ProviderResult<()> {
+    fn validate_model<'a>(&self, model: &'a str) -> ProviderResult<&'a str> {
         let prefix = self.provider.model_prefix();
-        if !model.starts_with(prefix)
-            || model.len() == prefix.len()
-            || model.chars().any(char::is_whitespace)
-        {
+        let Some(model) = model.strip_prefix(prefix) else {
+            return Err(error(
+                ProviderErrorCode::InvalidModelPrefix,
+                Some(ProviderField::Model),
+                ProviderRemediation::ReturnToEdit,
+            ));
+        };
+        if model.is_empty() || model.chars().any(char::is_whitespace) {
             return Err(error(
                 ProviderErrorCode::InvalidModelPrefix,
                 Some(ProviderField::Model),
                 ProviderRemediation::ReturnToEdit,
             ));
         }
-        Ok(())
+        Ok(model)
     }
 
     fn validate_temperature(&self, temperature: Option<f32>) -> ProviderResult<()> {

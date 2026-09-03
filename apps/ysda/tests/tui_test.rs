@@ -2,18 +2,20 @@ use chrono::Utc;
 use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Color};
 use ys_agent_core::{
     ActiveProviderView, ArtifactId, EventActor, EventEnvelope, EventId, PolicyDecision, Principal,
-    ProfileId, ProviderId, ProviderModelId, ProviderParameters, RunEventKind, RunId, TaskId,
+    ProfileId, ProviderId, ProviderModelId, ProviderParameters, RunEventKind, RunId,
+    SelectionAvailability, SelectionCurrentStatus, SelectionTarget, SelectionTargetView, TaskId,
     ToolCallId, VersionedRunEvent, WorkspaceId,
 };
 
 use ys_agent_runtime::{
     DatasourceDisplayState, QueryDisplayState, TuiDisplayContext, TuiDisplayContextInput,
+    provider::catalog::GovernedProviderCatalog,
 };
 use ysda::tui::{
     ArtifactWorkspaceState, AsyncChannel, AsyncResultGuard, ColorSpec, ContentRoute, DetailKind,
     DetailView, FocusTarget, HitRegion, InputAction, InputLayer, LayoutMode, ModePickerAction,
-    ModePickerOutcome, ModePickerState, ModelSelectionState, NavigationState, Overlay,
-    ThemeRegistry, TimelineState, TransientView, TuiApp, TuiQueryMode, UiPreferences,
+    ModePickerOutcome, ModePickerState, ModelSelectionAction, ModelSelectionState, NavigationState,
+    Overlay, ThemeRegistry, TimelineState, TransientView, TuiApp, TuiQueryMode, UiPreferences,
     bottom_panel_height, parse_input, render_to_string,
 };
 
@@ -60,14 +62,32 @@ fn welcome_is_minimal_and_shows_safe_header_labels() {
     );
     let rendered = render_to_string(&app, 100, 28);
 
-    assert!(rendered.contains("Agent"));
-    assert!(rendered.contains("ecommerce"));
+    assert!(rendered.contains("YS·DA"));
+    assert!(!rendered.contains("ecommerce"));
     assert!(rendered.contains("postgres-prod"));
-    assert!(rendered.contains("read-only"));
+    assert!(rendered.contains("READ ONLY"));
+    assert!(rendered.contains("Welcome to YS·DA"));
+    assert!(rendered.contains("Choose an LLM provider and model"));
     assert!(rendered.contains("Ask a governed data question"));
     assert!(!rendered.contains("Recent work"));
     assert!(!rendered.contains("Recent tasks"));
     assert!(!rendered.contains("Artifact"));
+}
+
+#[test]
+fn first_launch_uses_friendly_setup_labels_instead_of_internal_errors() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("first-launch"));
+    app.mark_display_context_unavailable();
+
+    let rendered = render_to_string(&app, 100, 28);
+
+    assert!(rendered.contains("Welcome to YS·DA"));
+    assert!(rendered.contains("No datasource"));
+    assert!(rendered.contains("No model"));
+    assert!(rendered.contains("SETUP REQUIRED"));
+    assert!(!rendered.contains("status unavailable"));
+    assert!(!rendered.contains("STATUS UNAVAILABLE"));
+    assert!(!rendered.contains("Blocker"));
 }
 
 #[test]
@@ -296,6 +316,130 @@ fn default_view_hides_internal_runtime_identifiers() {
 }
 
 #[test]
+fn home_shell_matches_the_approved_product_prototype() {
+    let app = TuiApp::test_home("local/demo", "SQLite · demo.db", "read-only", "gpt-5.4");
+    let rendered = render_to_string(&app, 100, 28);
+
+    for expected in [
+        "YS·DA",
+        "SQLite · demo.db",
+        "AUTO › QUERY",
+        "READ ONLY",
+        "Ask a governed data question…",
+        "/mode  /model",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "approved prototype element missing: {expected}\n{rendered}"
+        );
+    }
+    for implementation_copy in ["Agent", "local/demo", "W:", "D:", "M:AUTO"] {
+        assert!(
+            !rendered.contains(implementation_copy),
+            "implementation-oriented shell copy is visible: {implementation_copy}\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn model_selection_is_a_bottom_panel_below_the_composer() {
+    let mut app = TuiApp::test_home("local/demo", "SQLite · demo.db", "read-only", "gpt-5.4");
+    app.model_selection_state.refresh_snapshot(
+        ys_agent_core::ModelSelectionSnapshot::new(vec![
+            SelectionTargetView::new(
+                SelectionTarget::Provider(ProviderId::DeepSeek),
+                "deepseek",
+                SelectionAvailability::NeedsSetup,
+                SelectionCurrentStatus::NotCurrent,
+            )
+            .expect("valid provider target"),
+        ])
+        .expect("valid model-selection snapshot"),
+    );
+    app.push_route(ContentRoute::ModelSelection);
+
+    let rendered = render_to_string(&app, 100, 32);
+    let composer = rendered
+        .find("Ask a governed data question…")
+        .expect("composer remains visible");
+    let picker = rendered
+        .find("Model Selection")
+        .expect("model picker is visible");
+
+    assert!(
+        composer < picker,
+        "model picker must open below the composer\n{rendered}"
+    );
+    assert!(rendered.contains("[Providers]  Plans  (Tab or ←/→ to switch)"));
+    assert!(rendered.contains("→ deepseek  [needs setup]"));
+    assert!(!rendered.contains("Current · unavailable"));
+}
+
+#[test]
+fn model_selection_matches_approved_provider_and_plan_catalogs() {
+    let catalog = GovernedProviderCatalog::default();
+    let targets = catalog
+        .entries()
+        .iter()
+        .map(|entry| {
+            SelectionTargetView::new(
+                entry.selection_target(),
+                entry.display_name(),
+                SelectionAvailability::NeedsSetup,
+                SelectionCurrentStatus::NotCurrent,
+            )
+            .expect("valid catalog target")
+        })
+        .collect();
+    let snapshot = ys_agent_core::ModelSelectionSnapshot::new(targets).expect("valid catalog");
+    let mut app = TuiApp::test_home("local/demo", "SQLite · demo.db", "read-only", "unavailable");
+    app.model_selection_state.refresh_snapshot(snapshot);
+    app.push_route(ContentRoute::ModelSelection);
+
+    let providers = render_to_string(&app, 110, 34);
+    for name in [
+        "openai",
+        "deepseek",
+        "claude",
+        "kimi",
+        "qwen",
+        "gemini",
+        "minimax",
+        "glm",
+        "openrouter",
+    ] {
+        assert!(
+            providers.contains(name),
+            "missing approved provider {name}\n{providers}"
+        );
+    }
+    assert!(!providers.contains("OpenCode Go"));
+
+    assert_eq!(
+        app.model_selection_state
+            .reduce(ModelSelectionAction::NextTab),
+        ysda::tui::ModelSelectionOutcome::Changed
+    );
+    let plans = render_to_string(&app, 110, 34);
+    for name in [
+        "codex",
+        "claude code",
+        "OpenCode Go",
+        "alibaba coding",
+        "bigmodel coding",
+        "zai coding",
+        "minimax coding",
+        "kimi coding",
+    ] {
+        assert!(
+            plans.contains(name),
+            "missing approved plan {name}\n{plans}"
+        );
+    }
+    assert!(!plans.contains("openrouter"));
+}
+
+#[test]
 fn answer_is_full_width_concise_and_uses_ys_da_role() {
     let app = TuiApp::test_answer(
         "GMV for the last seven complete days",
@@ -335,20 +479,37 @@ fn chat_reply_renders_as_a_ys_da_answer_without_starting_a_query_view() {
 }
 
 #[test]
-fn slash_palette_replaces_composer_and_keeps_one_input_surface() {
+fn slash_palette_is_a_compact_list_below_the_real_composer() {
     let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
-    app.composer.set_text("/");
+    app.composer.set_text("/m");
     app.sync_slash_palette();
 
     let rendered = render_to_string(&app, 100, 28);
-    assert!(rendered.contains("Commands"));
-    assert_eq!(rendered.matches("Search commands").count(), 1);
+    assert!(rendered.contains("› /m"));
+    assert!(rendered.contains("/mode"));
+    assert!(rendered.contains("Choose Auto or Query mode"));
+    assert!(rendered.contains("/model"));
+    assert!(rendered.contains("Choose active Provider and model"));
+    assert!(!rendered.contains("Commands"));
+    assert!(!rendered.contains("Search commands"));
     assert!(!rendered.contains("Ask a governed data question…"));
-    assert_eq!(bottom_panel_height(&app, Rect::new(0, 0, 100, 28)), 10);
+    assert_eq!(bottom_panel_height(&app, Rect::new(0, 0, 100, 28)), 5);
 
     app.composer.set_text("/model");
     app.sync_slash_palette();
-    assert_eq!(bottom_panel_height(&app, Rect::new(0, 0, 100, 28)), 10);
+    assert_eq!(bottom_panel_height(&app, Rect::new(0, 0, 100, 28)), 4);
+}
+
+#[test]
+fn slash_palette_offers_exit_compactly() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    app.composer.set_text("/e");
+    app.sync_slash_palette();
+
+    let rendered = render_to_string(&app, 100, 28);
+    assert!(rendered.contains("/exit"));
+    assert!(rendered.contains("Exit the CLI"));
+    assert_eq!(bottom_panel_height(&app, Rect::new(0, 0, 100, 28)), 4);
 }
 
 #[test]
@@ -406,12 +567,7 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
     shell.composer.set_text("kept governed question");
     for (width, height) in [(150, 40), (100, 28), (60, 12)] {
         let rendered = render_to_string(&shell, width, height);
-        for required in [
-            "Agent",
-            "Ask a governed data question",
-            "kept governed question",
-            "/mode  /model",
-        ] {
+        for required in ["YS·DA", "kept governed question", "/mode  /model"] {
             assert!(
                 rendered.contains(required),
                 "{width}×{height} omitted {required}"
@@ -434,7 +590,7 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
 
     assert_eq!(
         render_to_string(&shell, 50, 8),
-        "Agent\nTerminal too small · resize to at least 60×12\nComposer · kept governed question\nCtrl-C detach"
+        "YS·DA\nTerminal too small · resize to at least 60×12\nComposer · kept governed question\nCtrl-C detach"
     );
 
     let cases = [
@@ -528,8 +684,7 @@ fn responsive_shell_keeps_product_content_composer_and_context_keys_visible() {
 
     for (width, height) in [(60, 12), (80, 20), (120, 30), (150, 40)] {
         let rendered = render_to_string(&app, width, height);
-        assert!(rendered.contains("Agent"));
-        assert!(rendered.contains("Ask a governed data question"));
+        assert!(rendered.contains("YS·DA"));
         assert!(rendered.contains("kept question"));
         assert!(rendered.contains("/mode  /model"));
         assert!(!rendered.contains('\n') || !rendered.contains("workspace\ncontrol"));
@@ -566,18 +721,17 @@ fn header_reads_typed_display_context_mode_and_authoritative_active_model() {
     app.query_mode = TuiQueryMode::Auto;
 
     let rendered = render_to_string(&app, 150, 40);
-    assert!(rendered.contains("Governed Workspace"));
+    assert!(!rendered.contains("Governed Workspace"));
     assert!(rendered.contains("Orders Warehouse"));
     assert!(rendered.contains("AUTO › QUERY"));
     assert!(rendered.contains("deepseek/governed-chat"));
-    assert!(rendered.contains("read-only"));
-    assert!(rendered.contains("query running"));
+    assert!(rendered.contains("READ ONLY"));
     assert!(!rendered.contains("spoofed-local"));
 
     app.mark_display_context_unavailable();
     let unavailable = render_to_string(&app, 150, 40);
-    assert!(unavailable.contains("Governed Workspace"));
-    assert!(unavailable.contains("status unavailable"));
+    assert!(!unavailable.contains("Governed Workspace"));
+    assert!(unavailable.contains("STATUS UNAVAILABLE"));
 }
 
 #[test]
@@ -586,7 +740,7 @@ fn undersized_shell_has_a_non_overlapping_recovery_view() {
     app.composer.set_text("draft");
     let rendered = render_to_string(&app, 50, 8);
 
-    assert!(rendered.contains("Agent"));
+    assert!(rendered.contains("YS·DA"));
     assert!(rendered.contains("Terminal too small"));
     assert!(rendered.contains("draft"));
     assert!(rendered.contains("Ctrl-C detach"));
@@ -600,7 +754,7 @@ fn artifact_footer_uses_the_shared_command_catalog_and_back_hint() {
     let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
     app.push_route(ContentRoute::Artifact);
     let rendered = render_to_string(&app, 100, 28);
-    assert!(rendered.contains("/mode  /model  Esc back"));
+    assert!(rendered.contains("/mode  /model  /exit  Esc back"));
 }
 
 #[test]

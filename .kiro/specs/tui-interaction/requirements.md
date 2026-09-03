@@ -4,7 +4,7 @@
 
 `tui-interaction` 定义 v0.2 本地 TUI 的界面和交互。布局与信息层级以 `docs/prototypes/ysda-tui.html` 为基准。
 
-TUI 只公开 `/mode` 和 `/model`。Query 完成后显示结果卡片；用户按 Enter 或点击卡片查看详情。
+TUI 只公开 `/mode`、`/model` 和 `/exit`。Query 完成后显示结果卡片；用户按 Enter 或点击卡片查看详情。
 
 所有展示状态和配置操作都经过 `AgentService`。TUI 不读取 Repository、配置文件或 Secret，也不自行推断产品状态。
 
@@ -65,12 +65,12 @@ TUI 只公开 `/mode` 和 `/model`。Query 完成后显示结果卡片；用户�
 
 ### Requirement 3: 最小命令面板与 Mode
 
-**Objective:** 用户只需两个命令即可选择 Mode 和 Model。
+**Objective:** 用户只需三个命令即可选择 Mode、Model 或退出应用。
 
 #### Acceptance Criteria
 
 1. Composer 为空，或 `/` 是首个非空白字符时，输入 `/` 应打开命令面板。
-2. 命令目录、面板、Footer 和帮助界面只可公开 `/mode` 与 `/model`。
+2. 命令目录、面板、Footer 和帮助界面只可公开 `/mode`、`/model` 与 `/exit`。
 3. 命令面板应支持实时搜索、↑/↓ 移动、Enter 确认和 Esc 取消。
 4. 没有匹配项时，面板应保持打开并允许继续编辑。
 5. `/mode` 只提供 `Auto` 和 `Query`，并使用与命令面板一致的键盘操作。

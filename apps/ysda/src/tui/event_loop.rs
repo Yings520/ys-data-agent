@@ -22,6 +22,7 @@ use ys_agent_core::{
     CoreError, CoreResult, OperationId, ProviderErrorCode, ProviderManagementError,
     ProviderRemediation, ProviderResult, ProviderRetryability,
 };
+use ys_agent_runtime::doctor::DoctorReport;
 
 use crate::bootstrap::AppDependencies;
 
@@ -149,7 +150,7 @@ where
         F: FnMut(OperationId, ProviderOperationCancellation) -> Fut + Send + 'static,
         Fut: Future<Output = ProviderResult<T>> + Send + 'static,
     {
-        self.schedule(kind, RouteKey::default(), operation)
+        self.schedule(OperationId::new(), kind, RouteKey::default(), operation)
     }
 
     /// Starts one route-bound Provider mutation. Production callers cannot queue a second
@@ -167,11 +168,32 @@ where
         if self.active_count() > 0 {
             return Err(AsyncOperationBusy);
         }
-        Ok(self.schedule(kind, route_key, operation))
+        Ok(self.schedule(OperationId::new(), kind, route_key, operation))
+    }
+
+    /// Resumes a service-owned operation using the same identity that began it. This is used by
+    /// browser authentication so completion, cancellation, and durable journal checks all refer
+    /// to one operation rather than an unrelated TUI wrapper ID.
+    pub fn resume_on_route<F, Fut>(
+        &mut self,
+        operation_id: OperationId,
+        kind: ProviderOperationKind,
+        route_key: RouteKey,
+        operation: F,
+    ) -> Result<OperationId, AsyncOperationBusy>
+    where
+        F: FnMut(OperationId, ProviderOperationCancellation) -> Fut + Send + 'static,
+        Fut: Future<Output = ProviderResult<T>> + Send + 'static,
+    {
+        if self.active_count() > 0 || self.operations.contains_key(&operation_id) {
+            return Err(AsyncOperationBusy);
+        }
+        Ok(self.schedule(operation_id, kind, route_key, operation))
     }
 
     fn schedule<F, Fut>(
         &mut self,
+        operation_id: OperationId,
         kind: ProviderOperationKind,
         route_key: RouteKey,
         operation: F,
@@ -180,7 +202,6 @@ where
         F: FnMut(OperationId, ProviderOperationCancellation) -> Fut + Send + 'static,
         Fut: Future<Output = ProviderResult<T>> + Send + 'static,
     {
-        let operation_id = OperationId::new();
         let (cancel, receiver) = watch::channel(false);
         self.operations.insert(
             operation_id,
@@ -345,6 +366,32 @@ where
         },
     };
     let _permit = permit;
+    if matches!(
+        kind,
+        ProviderOperationKind::Activate | ProviderOperationKind::SaveDraft
+    ) {
+        return OperationExit::Completed(ProviderOperationCompletion {
+            operation_id,
+            route_key,
+            kind,
+            attempts: 1,
+            result: operation(operation_id, cancellation).await,
+        });
+    }
+    if kind == ProviderOperationKind::OAuth {
+        let operation_cancellation = cancellation.clone();
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => return OperationExit::Cancelled(operation_id),
+            result = operation(operation_id, operation_cancellation) => result,
+        };
+        return OperationExit::Completed(ProviderOperationCompletion {
+            operation_id,
+            route_key,
+            kind,
+            attempts: 1,
+            result,
+        });
+    }
     let mut attempts = 0_u8;
     loop {
         attempts = attempts.saturating_add(1);
@@ -536,9 +583,10 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
         app.apply_active_provider_view(None);
         app.safe_warning = Some(error.code().to_owned());
     }
-    let report = controller.doctor().await?;
-    app.transient = (!report.allows_query_submission()).then_some(TransientView::Repair);
-    app.doctor_report = Some(report);
+    match controller.doctor().await {
+        Ok(report) => apply_startup_doctor_report(&mut app, report),
+        Err(error) => app.safe_warning = Some(error.code().to_owned()),
+    }
 
     let mut terminal = TerminalGuard::enter(app.mouse_enabled).map_err(terminal_error)?;
     let mut events = EventStream::new();
@@ -577,7 +625,13 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
         if controller.apply_ready_display_context(&mut app) {
             dirty = true;
         }
+        if controller.apply_ready_doctor_refresh(&mut app) {
+            dirty = true;
+        }
         if controller.apply_ready_artifact(&mut app) {
+            dirty = true;
+        }
+        if controller.apply_ready_model_candidates(&mut app) {
             dirty = true;
         }
         if controller.apply_ready_model_switch(&mut app) {
@@ -632,6 +686,11 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
     }
 }
 
+fn apply_startup_doctor_report(app: &mut TuiApp, report: DoctorReport) {
+    app.doctor_report = Some(report);
+    app.transient = None;
+}
+
 pub(crate) async fn handle_terminal_event(
     app: &mut TuiApp,
     controller: &mut TuiController,
@@ -640,11 +699,53 @@ pub(crate) async fn handle_terminal_event(
     match event {
         Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
         Event::Paste(text) => {
-            app.composer.insert_paste(&text);
-            app.sync_slash_palette();
+            if app.navigation.current() == ContentRoute::ModelSelection {
+                let pasted = text
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .collect::<String>();
+                if !pasted.is_empty() {
+                    let mut search = app.model_selection_state.search.clone();
+                    search.push_str(&pasted);
+                    controller
+                        .apply_model_selection_action(
+                            app,
+                            ModelSelectionAction::SearchChanged(search),
+                        )
+                        .await?;
+                }
+            } else if app.transient == Some(TransientView::Detail(super::DetailKind::Providers)) {
+                let step = controller.provider_screen_view().and_then(|view| view.step);
+                if step == Some(super::provider_management::ProviderManagementStep::Model) {
+                    let _ = controller.append_provider_model_filter_paste(app, &text);
+                } else {
+                    let _ = controller.append_provider_secret_paste(app, text);
+                }
+            } else {
+                app.composer.insert_paste(&text);
+                app.sync_slash_palette();
+            }
         }
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if app.navigation.current() == ContentRoute::ModelSelection {
+                    if controller.model_switch_in_flight() {
+                        controller.cancel_model_switch(app).await;
+                    } else {
+                        controller
+                            .apply_model_selection_action(app, ModelSelectionAction::Back)
+                            .await?;
+                    }
+                    return Ok(false);
+                }
+                if app.transient == Some(TransientView::Detail(super::DetailKind::Providers)) {
+                    if controller.provider_operation_in_flight() {
+                        controller.cancel_provider_operation(app).await;
+                    } else {
+                        controller.close_provider_management(app).await;
+                    }
+                    return Ok(false);
+                }
                 return Ok(true);
             }
             if key.code == KeyCode::Esc {
@@ -654,8 +755,7 @@ pub(crate) async fn handle_terminal_event(
                 }
                 if app.navigation.current() == ContentRoute::ModelSelection {
                     if controller.model_switch_in_flight() {
-                        controller.cancel_model_switch().await;
-                        app.set_runtime_status("Model activation cancelled");
+                        controller.cancel_model_switch(app).await;
                         return Ok(false);
                     }
                     controller
@@ -664,9 +764,14 @@ pub(crate) async fn handle_terminal_event(
                     return Ok(false);
                 }
                 if app.transient == Some(TransientView::Detail(super::DetailKind::Providers)) {
+                    if controller.clear_provider_model_filter(app) {
+                        return Ok(false);
+                    }
                     if controller.provider_operation_in_flight() {
                         controller.cancel_provider_operation(app).await;
                         controller.refresh_model_selection_checkpoint().await;
+                    } else if controller.return_provider_result_to_edit(app) {
+                        return Ok(false);
                     } else {
                         controller.close_provider_management(app).await;
                     }
@@ -711,6 +816,27 @@ pub(crate) async fn handle_terminal_event(
                     KeyCode::Tab | KeyCode::Right => Some(ModelSelectionAction::NextTab),
                     KeyCode::Up => Some(ModelSelectionAction::MoveUp),
                     KeyCode::Down => Some(ModelSelectionAction::MoveDown),
+                    KeyCode::PageUp => Some(ModelSelectionAction::PageUp),
+                    KeyCode::PageDown => Some(ModelSelectionAction::PageDown),
+                    KeyCode::Char('r')
+                        if key.modifiers.is_empty()
+                            && app.model_selection_state.search.is_empty()
+                            && matches!(
+                                app.model_selection_state.load_state(),
+                                super::model_selection::ModelSelectionLoadState::Empty
+                                    | super::model_selection::ModelSelectionLoadState::Failed(_)
+                            ) =>
+                    {
+                        Some(ModelSelectionAction::Retry)
+                    }
+                    KeyCode::Char('e')
+                        if key.modifiers.is_empty()
+                            && app.model_selection_state.level()
+                                == super::ModelSelectionLevel::Targets
+                            && app.model_selection_state.search.is_empty() =>
+                    {
+                        Some(ModelSelectionAction::EditCredentials)
+                    }
                     KeyCode::Enter => Some(ModelSelectionAction::Confirm),
                     KeyCode::Backspace => {
                         let mut search = app.model_selection_state.search.clone();
@@ -733,7 +859,80 @@ pub(crate) async fn handle_terminal_event(
                 let provider_view = controller.provider_screen_view();
                 let step = provider_view.as_ref().and_then(|view| view.step);
                 if key.code == KeyCode::Enter {
-                    let _ = controller.advance_provider_step(app);
+                    if provider_view
+                        .as_ref()
+                        .is_some_and(|view| view.state == ProviderManagementStateKind::Result)
+                    {
+                        let _ = controller.return_provider_result_to_edit(app);
+                        return Ok(false);
+                    }
+                    let operation = match step {
+                        Some(
+                            super::provider_management::ProviderManagementStep::Authentication,
+                        ) => {
+                            let completes_oauth = provider_view
+                                .as_ref()
+                                .and_then(|view| view.edit.as_ref())
+                                .is_some_and(|edit| {
+                                    edit.authentication == Some(ProviderAuthentication::OAuth)
+                                        && edit.profile_id.is_some()
+                                });
+                            Some(if completes_oauth {
+                                ProviderOperationKind::OAuth
+                            } else {
+                                ProviderOperationKind::SaveDraft
+                            })
+                        }
+                        Some(super::provider_management::ProviderManagementStep::Model) => {
+                            if !controller.select_highlighted_provider_model(app) {
+                                return Ok(false);
+                            }
+                            Some(ProviderOperationKind::SaveDraft)
+                        }
+                        Some(super::provider_management::ProviderManagementStep::Validate) => {
+                            Some(ProviderOperationKind::Validate)
+                        }
+                        Some(super::provider_management::ProviderManagementStep::SaveActivate) => {
+                            if let Err(error) = controller.request_provider_activation(app) {
+                                app.push_transcript(TranscriptItem::Error(user_readable_error(
+                                    &error,
+                                )));
+                            }
+                            return Ok(false);
+                        }
+                        _ => None,
+                    };
+                    if let Some(operation) = operation {
+                        if let Err(error) = controller.start_provider_operation(app, operation) {
+                            app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
+                        }
+                    } else {
+                        let _ = controller.advance_provider_step(app);
+                    }
+                    return Ok(false);
+                }
+                if key.code == KeyCode::Up
+                    && step == Some(super::provider_management::ProviderManagementStep::Model)
+                {
+                    let _ = controller.move_provider_model(app, -1);
+                    return Ok(false);
+                }
+                if key.code == KeyCode::Down
+                    && step == Some(super::provider_management::ProviderManagementStep::Model)
+                {
+                    let _ = controller.move_provider_model(app, 1);
+                    return Ok(false);
+                }
+                if key.code == KeyCode::PageUp
+                    && step == Some(super::provider_management::ProviderManagementStep::Model)
+                {
+                    let _ = controller.move_provider_model_page(app, -1);
+                    return Ok(false);
+                }
+                if key.code == KeyCode::PageDown
+                    && step == Some(super::provider_management::ProviderManagementStep::Model)
+                {
+                    let _ = controller.move_provider_model_page(app, 1);
                     return Ok(false);
                 }
                 if key.code == KeyCode::Backspace {
@@ -754,34 +953,6 @@ pub(crate) async fn handle_terminal_event(
                     let index = usize::from((digit as u8).saturating_sub(b'1'));
                     if let Some(provider) = ys_agent_core::ProviderId::ALL.get(index).copied() {
                         let _ = controller.select_provider_for_draft(app, provider);
-                    }
-                    return Ok(false);
-                }
-                if key.code == KeyCode::Char('k')
-                    && step
-                        == Some(super::provider_management::ProviderManagementStep::Authentication)
-                {
-                    let _ = controller
-                        .select_provider_authentication(app, ProviderAuthentication::ApiKey);
-                    return Ok(false);
-                }
-                if key.code == KeyCode::Char('o')
-                    && step
-                        == Some(super::provider_management::ProviderManagementStep::Authentication)
-                {
-                    let selected = provider_view
-                        .as_ref()
-                        .and_then(|view| view.edit.as_ref())
-                        .and_then(|edit| edit.authentication);
-                    if selected == Some(ProviderAuthentication::OAuth) {
-                        if let Err(error) =
-                            controller.start_provider_operation(ProviderOperationKind::OAuth)
-                        {
-                            app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
-                        }
-                    } else {
-                        let _ = controller
-                            .select_provider_authentication(app, ProviderAuthentication::OAuth);
                     }
                     return Ok(false);
                 }
@@ -815,7 +986,7 @@ pub(crate) async fn handle_terminal_event(
                     && step
                         == Some(super::provider_management::ProviderManagementStep::SaveActivate)
                 {
-                    if let Err(error) = controller.request_provider_activation() {
+                    if let Err(error) = controller.request_provider_activation(app) {
                         app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
                     }
                     return Ok(false);
@@ -825,13 +996,13 @@ pub(crate) async fn handle_terminal_event(
                         .as_ref()
                         .is_some_and(|view| view.state == ProviderManagementStateKind::Result)
                 {
-                    if let Err(error) = controller.retry_provider_operation() {
+                    if let Err(error) = controller.retry_provider_operation(app) {
                         app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
                     }
                     return Ok(false);
                 }
                 if let Some(operation) = operation {
-                    if let Err(error) = controller.start_provider_operation(operation) {
+                    if let Err(error) = controller.start_provider_operation(app, operation) {
                         app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
                     }
                     return Ok(false);
@@ -875,7 +1046,8 @@ pub(crate) async fn handle_terminal_event(
                 && mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
         {
             let (_, terminal_height) = crossterm::terminal::size().map_err(terminal_error)?;
-            let panel_height = 10_u16.min(terminal_height.saturating_sub(2));
+            let panel_height = (3_u16.saturating_add(app.slash_palette.visible_row_count() as u16))
+                .min(terminal_height.saturating_sub(2));
             let first_result_row = terminal_height
                 .saturating_sub(panel_height)
                 .saturating_add(2);
@@ -1075,13 +1247,15 @@ mod tests {
     use ys_agent_adapters::model::FakeModelProvider;
     use ys_agent_core::{
         ActivateProfileRequest, ActiveProviderView, AgentAction, CompatibilityEvidenceView,
-        CredentialMutationRequest, CredentialViewStatus, DeleteProfileRequest,
-        DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, ModelResponse,
+        CredentialGeneration, CredentialKind, CredentialMutation, CredentialMutationRequest,
+        CredentialViewStatus, DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest,
+        DiscoveredModel, ModelResponse, ModelSelectionSnapshot, OAuthConnectionStatus,
         OAuthConnectionView, OperationId, Principal, ProfileDetail, ProfileId, ProfileName,
         ProfileState, ProfileSummary, ProviderCatalogView, ProviderDoctorView, ProviderErrorCode,
-        ProviderManagementApi, ProviderManagementError, ProviderRemediation, ProviderResult,
-        ProviderSupportStatus, RemoteRevocationOutcome, SaveProfileRequest, ValidateProfileRequest,
-        ValidationId, WorkspaceId,
+        ProviderManagementApi, ProviderManagementError, ProviderPlanId, ProviderRemediation,
+        ProviderResult, ProviderSupportStatus, RemoteRevocationOutcome, SaveProfileRequest,
+        SelectionAvailability, SelectionCurrentStatus, SelectionTarget, SelectionTargetView,
+        ValidateProfileRequest, ValidationId, WorkspaceId,
     };
     use ys_agent_runtime::{
         InProcessAgentService, NoopRunScheduler, StaticRunProviderBindingSource,
@@ -1095,8 +1269,65 @@ mod tests {
 
     use super::{
         AsyncOperationRegistry, ProviderOperationPolicy, RouteKey, TuiApp, TuiController,
-        handle_terminal_event, user_readable_error,
+        apply_startup_doctor_report, handle_terminal_event, user_readable_error,
     };
+
+    #[test]
+    fn blocked_startup_keeps_the_welcome_page_visible() {
+        let mut app = TuiApp::for_principal(Principal::local_operator("first-launch"));
+        let report = DoctorReport {
+            blocker_codes: vec!["provider.no_active_profile".to_owned()],
+            warning_codes: Vec::new(),
+            ready_capabilities: Vec::new(),
+            repairs: vec!["Configure a Provider Profile".to_owned()],
+        };
+
+        apply_startup_doctor_report(&mut app, report);
+
+        assert_eq!(app.transient, None);
+        assert!(app.doctor_report.is_some());
+        let rendered = render_to_string(&app, 100, 28);
+        assert!(rendered.contains("Welcome to YS·DA"));
+        assert!(!rendered.contains("provider.no_active_profile"));
+        assert!(!rendered.contains("Workspace readiness needs repair"));
+    }
+
+    #[tokio::test]
+    async fn exit_palette_selection_quits_without_submitting_the_prefix() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let workspace_id = WorkspaceId::new();
+        let service = Arc::new(InProcessAgentService::new(
+            workspace_id,
+            store,
+            artifacts,
+            Arc::new(NoopRunScheduler),
+        ));
+        let principal = Principal::local_operator("exit-command-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+
+        for key in [KeyCode::Char('/'), KeyCode::Char('e'), KeyCode::Enter] {
+            handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            )
+            .await
+            .expect("exit key path");
+        }
+
+        assert!(app.should_quit);
+        assert!(app.composer.text().is_empty());
+        assert!(app.transcript.is_empty());
+    }
 
     fn test_active_provider() -> ActiveProviderView {
         ActiveProviderView {
@@ -1171,6 +1402,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_auth_resume_preserves_the_service_operation_identity() {
+        let mut registry = AsyncOperationRegistry::new(
+            ProviderOperationPolicy::new(Duration::from_millis(10), 0)
+                .expect("valid bounded policy"),
+        );
+        let route_key = RouteKey {
+            route: ContentRoute::ProviderManagement,
+            generation: 9,
+        };
+        let service_operation_id = OperationId::new();
+        let resumed = registry
+            .resume_on_route(
+                service_operation_id,
+                ProviderOperationKind::OAuth,
+                route_key,
+                move |operation_id, _| async move {
+                    assert_eq!(operation_id, service_operation_id);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    Ok(operation_id)
+                },
+            )
+            .expect("browser authentication resumes");
+
+        assert_eq!(resumed, service_operation_id);
+        let completion = registry.next_completion().await.expect("completion");
+        assert_eq!(completion.operation_id, service_operation_id);
+        assert_eq!(
+            completion.result.expect("successful result"),
+            service_operation_id
+        );
+    }
+
+    #[tokio::test]
     async fn retries_are_bounded_for_safe_probe_work_and_not_for_durable_saves() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let mut registry: AsyncOperationRegistry<()> = AsyncOperationRegistry::new(
@@ -1214,6 +1478,25 @@ mod tests {
         assert_eq!(save.operation_id, save_id);
         assert_eq!(save.attempts, 1);
         assert_eq!(save_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_save_is_not_dropped_at_the_generic_timeout_boundary() {
+        let mut registry = AsyncOperationRegistry::new(
+            ProviderOperationPolicy::new(Duration::from_millis(10), 0)
+                .expect("valid bounded policy"),
+        );
+        let save_id = registry.start(ProviderOperationKind::SaveDraft, |_, _| async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            Ok(())
+        });
+
+        let completion = registry.next_completion().await.expect("save completion");
+        assert_eq!(completion.operation_id, save_id);
+        assert_eq!(completion.attempts, 1);
+        completion
+            .result
+            .expect("durable save completion is delivered");
     }
 
     #[tokio::test]
@@ -1365,6 +1648,8 @@ mod tests {
     struct KeyboardProviderState {
         profile: Option<ProfileDetail>,
         active: Option<ActiveProviderView>,
+        pending_oauth: Option<(OperationId, ProfileId)>,
+        received_expected_api_key: bool,
     }
 
     /// A service-boundary fake used only to exercise the TUI's complete keyboard workflow. It
@@ -1396,12 +1681,57 @@ mod tests {
 
     #[async_trait]
     impl ProviderManagementApi for KeyboardProviderApi {
+        async fn model_selection_snapshot(&self) -> ProviderResult<ModelSelectionSnapshot> {
+            ModelSelectionSnapshot::new(vec![
+                SelectionTargetView::new(
+                    SelectionTarget::Plan {
+                        provider: ys_agent_core::ProviderId::ChatGptSubscription,
+                        plan: ProviderPlanId::new("codex").expect("valid governed plan"),
+                    },
+                    "codex",
+                    SelectionAvailability::NeedsSetup,
+                    SelectionCurrentStatus::NotCurrent,
+                )
+                .expect("valid ChatGPT plan"),
+            ])
+            .map_err(|_| fake_provider_error())
+        }
+
+        async fn switch_model(
+            &self,
+            request: ys_agent_core::SwitchModelRequest,
+        ) -> ProviderResult<ActiveProviderView> {
+            let candidate = request.candidate();
+            {
+                let state = self.state.lock().expect("test state lock");
+                let detail = state.profile.as_ref().ok_or_else(fake_provider_error)?;
+                let active_revision = state
+                    .active
+                    .as_ref()
+                    .map(|active| active.activation_revision);
+                if detail.summary.profile_id != candidate.profile_id()
+                    || detail.revision != candidate.expected_profile_revision()
+                    || detail.summary.provider != candidate.provider()
+                    || &detail.model != candidate.model()
+                    || active_revision != candidate.expected_activation_revision()
+                {
+                    return Err(fake_provider_error());
+                }
+            }
+            self.activate_current(candidate.profile_id(), request.operation_id())
+                .await
+        }
+
         async fn catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>> {
             Ok(ys_agent_core::ProviderId::ALL
                 .into_iter()
                 .map(|provider| ProviderCatalogView {
                     provider,
-                    display_name: format!("{provider:?}"),
+                    display_name: match provider {
+                        ys_agent_core::ProviderId::ChatGptSubscription => "codex".to_owned(),
+                        ys_agent_core::ProviderId::OpenCodeGo => "OpenCode Go".to_owned(),
+                        provider => format!("{provider:?}"),
+                    },
                     credential_kind: provider.required_credential_kind(),
                     support_status: ProviderSupportStatus::Candidate,
                     evidence_gaps: vec!["test_evidence_gap".to_owned()],
@@ -1430,13 +1760,18 @@ mod tests {
 
         async fn save_profile(&self, request: SaveProfileRequest) -> ProviderResult<ProfileDetail> {
             let revision = request.revision.revision;
+            let credential_status = if revision.credential_generation().is_some() {
+                CredentialViewStatus::Saved
+            } else {
+                CredentialViewStatus::Missing
+            };
             let detail = ProfileDetail {
                 summary: ProfileSummary {
                     profile_id: revision.profile_id(),
                     name: request.revision.name.as_str().to_owned(),
                     provider: revision.provider(),
                     state: ProfileState::Draft,
-                    credential_status: CredentialViewStatus::Missing,
+                    credential_status,
                     is_active: false,
                 },
                 revision: revision.revision(),
@@ -1463,6 +1798,10 @@ mod tests {
             request: CredentialMutationRequest,
         ) -> ProviderResult<ProfileDetail> {
             let mut state = self.state.lock().expect("test state lock");
+            if let CredentialMutation::Replace(write) = &request.mutation {
+                state.received_expected_api_key =
+                    write.secret.with_exposed(|secret| secret == "sk-open-key");
+            }
             let detail = state.profile.as_mut().ok_or_else(fake_provider_error)?;
             detail.revision = detail
                 .revision
@@ -1479,11 +1818,18 @@ mod tests {
 
         async fn discover_models(
             &self,
-            _request: DiscoverModelsRequest,
+            request: DiscoverModelsRequest,
         ) -> ProviderResult<Vec<DiscoveredModel>> {
+            let detail = self.profile(request.profile_id)?;
+            let (model, context_limit) = match detail.summary.provider {
+                ys_agent_core::ProviderId::ChatGptSubscription => {
+                    ("chatgpt/codex-mini-latest", Some(200_000))
+                }
+                _ => ("deepseek/keyboard", Some(32_768)),
+            };
             Ok(vec![DiscoveredModel {
-                model: "deepseek/keyboard".to_owned(),
-                context_limit: Some(32_768),
+                model: model.to_owned(),
+                context_limit,
             }])
         }
 
@@ -1551,9 +1897,16 @@ mod tests {
 
         async fn oauth_connection(
             &self,
-            _profile_id: ProfileId,
+            profile_id: ProfileId,
         ) -> ProviderResult<OAuthConnectionView> {
-            Err(fake_provider_error())
+            let detail = self.profile(profile_id)?;
+            Ok(OAuthConnectionView {
+                profile_id,
+                status: detail
+                    .oauth_status
+                    .unwrap_or(OAuthConnectionStatus::Pending),
+                remediation: None,
+            })
         }
 
         async fn doctor(&self) -> ProviderResult<ProviderDoctorView> {
@@ -1571,17 +1924,45 @@ mod tests {
 
         async fn start_oauth(
             &self,
-            _profile_id: ProfileId,
-            _operation_id: OperationId,
+            profile_id: ProfileId,
+            operation_id: OperationId,
         ) -> ProviderResult<DeviceAuthorizationView> {
-            Err(fake_provider_error())
+            let mut state = self.state.lock().expect("test state lock");
+            let detail = state.profile.as_mut().ok_or_else(fake_provider_error)?;
+            if detail.summary.profile_id != profile_id {
+                return Err(fake_provider_error());
+            }
+            detail.oauth_status = Some(OAuthConnectionStatus::Pending);
+            state.pending_oauth = Some((operation_id, profile_id));
+            Ok(DeviceAuthorizationView {
+                verification_uri: "https://auth.openai.test/device".to_owned(),
+                user_code: "ABCD-EFGH".to_owned(),
+                expires_in_seconds: 600,
+            })
         }
 
         async fn complete_oauth(
             &self,
-            _operation_id: OperationId,
+            operation_id: OperationId,
         ) -> ProviderResult<OAuthConnectionView> {
-            Err(fake_provider_error())
+            let mut state = self.state.lock().expect("test state lock");
+            let (_, profile_id) = state
+                .pending_oauth
+                .take()
+                .filter(|(pending, _)| *pending == operation_id)
+                .ok_or_else(fake_provider_error)?;
+            let detail = state.profile.as_mut().ok_or_else(fake_provider_error)?;
+            detail.oauth_status = Some(OAuthConnectionStatus::Connected);
+            detail.summary.credential_status = CredentialViewStatus::Saved;
+            detail.credential_generation = Some(
+                CredentialGeneration::new(profile_id, 1, CredentialKind::OAuthConnection)
+                    .expect("valid OAuth generation"),
+            );
+            Ok(OAuthConnectionView {
+                profile_id,
+                status: OAuthConnectionStatus::Connected,
+                remediation: None,
+            })
         }
 
         async fn refresh_oauth(
@@ -1621,6 +2002,25 @@ mod tests {
         .await
         .expect("Provider operation completes through the service boundary");
         controller.apply_provider_operation(app, completion);
+        for _ in 0..100 {
+            if controller.apply_ready_doctor_refresh(app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn apply_model_catalog_completion(controller: &mut TuiController, app: &mut TuiApp) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if controller.apply_ready_model_candidates(app) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Model Selection snapshot completes through the service boundary");
     }
 
     #[tokio::test]
@@ -1638,7 +2038,7 @@ mod tests {
         let provider_api = Arc::new(KeyboardProviderApi::default());
         let service = Arc::new(
             InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
-                .with_provider_management_api(provider_api),
+                .with_provider_management_api(provider_api.clone()),
         );
         let principal = Principal::local_operator("keyboard-provider-test");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());
@@ -1678,14 +2078,7 @@ mod tests {
         )
         .await
         .expect("advance to authentication");
-        handle_terminal_event(
-            &mut app,
-            &mut controller,
-            Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
-        )
-        .await
-        .expect("select API key authentication");
-        for character in "s3cret".chars() {
+        for character in "sk-o".chars() {
             handle_terminal_event(
                 &mut app,
                 &mut controller,
@@ -1697,81 +2090,68 @@ mod tests {
         handle_terminal_event(
             &mut app,
             &mut controller,
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Event::Paste("pen-key".to_owned()),
         )
         .await
-        .expect("advance to model");
-        for character in "deepseek/keyboard".chars() {
-            handle_terminal_event(
-                &mut app,
-                &mut controller,
-                Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-            )
-            .await
-            .expect("type manually governed model");
-        }
+        .expect("paste the remainder into the masked credential input");
+        assert!(app.composer.text().is_empty());
         handle_terminal_event(
             &mut app,
             &mut controller,
             Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         )
         .await
-        .expect("advance to parameters");
-        handle_terminal_event(
-            &mut app,
-            &mut controller,
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        )
-        .await
-        .expect("advance to validation");
-        handle_terminal_event(
-            &mut app,
-            &mut controller,
-            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
-        )
-        .await
-        .expect("save Draft before validation");
+        .expect("save the API key");
         apply_provider_completion(&mut controller, &mut app).await;
-        let saved = controller
+        apply_provider_completion(&mut controller, &mut app).await;
+        let model_picker = controller
             .provider_screen_view()
-            .expect("Provider screen remains open");
+            .expect("Provider model picker remains open");
         assert_eq!(
-            saved.step,
-            Some(super::super::provider_management::ProviderManagementStep::Validate)
+            model_picker.step,
+            Some(super::super::provider_management::ProviderManagementStep::Model)
         );
-        assert!(
-            saved
+        assert_eq!(
+            model_picker
                 .edit
                 .as_ref()
-                .expect("saved edit")
-                .profile_id
-                .is_some()
+                .and_then(|edit| edit.model.as_ref())
+                .map(ys_agent_core::ProviderModelId::as_str),
+            Some("deepseek/keyboard")
         );
         assert!(
-            !format!("{saved:?}").contains("s3cret"),
+            !format!("{model_picker:?}").contains("sk-open-key"),
             "the typed credential must not escape the mask boundary"
         );
-
-        handle_terminal_event(
-            &mut app,
-            &mut controller,
-            Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
-        )
-        .await
-        .expect("validate saved Draft");
-        apply_provider_completion(&mut controller, &mut app).await;
-        assert_eq!(
-            controller.provider_screen_view().expect("screen").step,
-            Some(super::super::provider_management::ProviderManagementStep::SaveActivate)
+        assert!(
+            provider_api
+                .state
+                .lock()
+                .expect("test state lock")
+                .received_expected_api_key,
+            "keyboard and paste input must reach the protected write without dropped k/o bytes"
         );
-
         handle_terminal_event(
             &mut app,
             &mut controller,
-            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         )
         .await
-        .expect("confirm and schedule activation");
+        .expect("select model and continue");
+        assert!(
+            controller.provider_operation_in_flight(),
+            "selecting a discovered model must save it"
+        );
+        apply_provider_completion(&mut controller, &mut app).await;
+        assert!(
+            controller.provider_operation_in_flight(),
+            "saving the selected model must start validation"
+        );
+        apply_provider_completion(&mut controller, &mut app).await;
+        assert!(
+            controller.provider_operation_in_flight(),
+            "successful validation must start activation"
+        );
         apply_provider_completion(&mut controller, &mut app).await;
         assert!(
             controller
@@ -1781,6 +2161,15 @@ mod tests {
                 .active
                 .is_some(),
             "only the committed service result may mark a Profile active"
+        );
+        assert_eq!(
+            app.header_view().current_model,
+            "deepseek/keyboard",
+            "activation must update the authoritative header without restarting the TUI"
+        );
+        assert!(
+            app.doctor_report.is_some() || app.safe_warning.is_some(),
+            "activation must refresh readiness, or expose a sanitized refresh failure, instead of silently leaving startup state stale"
         );
 
         controller
@@ -1793,7 +2182,122 @@ mod tests {
                 .expect("Provider detail")
                 .lines
                 .iter()
-                .any(|line| line.starts_with("Active · DeepSeek"))
+                .any(|line| line == "DeepSeek  ← current")
+        );
+    }
+
+    #[tokio::test]
+    async fn chatgpt_subscription_keyboard_flow_opens_browser_and_continues_to_models() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let workspace_id = WorkspaceId::new();
+        let provider_api = Arc::new(KeyboardProviderApi::default());
+        let service = Arc::new(
+            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_provider_management_api(provider_api),
+        );
+        let principal = Principal::local_operator("keyboard-chatgpt-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+
+        for character in "/model".chars() {
+            handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+            )
+            .await
+            .expect("type /model through the production keyboard path");
+        }
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("open Model Selection from /model");
+        assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
+        apply_model_catalog_completion(&mut controller, &mut app).await;
+
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("switch to Plans");
+        let selection = render_to_string(&app, 100, 28);
+        assert!(selection.contains("codex"));
+        assert!(selection.contains("[needs setup]"));
+
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("open ChatGPT Subscription setup");
+        let setup = controller
+            .provider_screen_view()
+            .expect("ChatGPT setup view");
+        assert_eq!(
+            setup.edit.as_ref().and_then(|edit| edit.authentication),
+            Some(super::super::provider_management::ProviderAuthentication::OAuth)
+        );
+        let setup_copy = app.detail.as_ref().expect("setup detail").lines.join("\n");
+        assert!(setup_copy.contains("ChatGPT Subscription"));
+        assert!(setup_copy.contains("no API key is required"));
+
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("start ChatGPT sign-in");
+        apply_provider_completion(&mut controller, &mut app).await;
+        apply_provider_completion(&mut controller, &mut app).await;
+        let authorization = app
+            .detail
+            .as_ref()
+            .expect("device authorization detail")
+            .lines
+            .join("\n");
+        assert!(authorization.contains("Browser  https://auth.openai.test/device"));
+        assert!(authorization.contains("Code     ABCD-EFGH"));
+
+        assert!(
+            controller.provider_operation_in_flight(),
+            "browser sign-in completion must be monitored automatically"
+        );
+        apply_provider_completion(&mut controller, &mut app).await;
+        assert!(
+            controller.provider_operation_in_flight(),
+            "connected ChatGPT sign-in must continue to model discovery"
+        );
+        apply_provider_completion(&mut controller, &mut app).await;
+
+        let model_picker = controller
+            .provider_screen_view()
+            .expect("ChatGPT model picker remains open");
+        assert_eq!(
+            model_picker.step,
+            Some(super::super::provider_management::ProviderManagementStep::Model)
+        );
+        assert_eq!(
+            model_picker
+                .edit
+                .as_ref()
+                .and_then(|edit| edit.model.as_ref())
+                .map(ys_agent_core::ProviderModelId::as_str),
+            Some("chatgpt/codex-mini-latest")
         );
     }
 
@@ -1832,7 +2336,7 @@ mod tests {
         assert!(matches!(
             app.transcript.last(),
             Some(super::TranscriptItem::Warning(text))
-                if text.contains("available commands: /mode  /model")
+                if text.contains("available commands: /mode  /model  /exit")
         ));
     }
 

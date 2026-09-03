@@ -463,6 +463,13 @@ pub trait ProviderManagementApi: Send + Sync {
     /// no-active management state; it never asks the caller to infer an active Profile.
     async fn active_provider(&self) -> ProviderResult<Option<ActiveProviderView>>;
 
+    /// Returns the active revision only when its current authentication is usable for a new Run.
+    /// The default preserves compatibility for Providers whose saved Credential status is the
+    /// complete readiness signal; OAuth-aware implementations additionally verify live state.
+    async fn usable_active_provider(&self) -> ProviderResult<Option<ActiveProviderView>> {
+        self.active_provider().await
+    }
+
     async fn load_profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail>;
 
     async fn save_profile(&self, request: SaveProfileRequest) -> ProviderResult<ProfileDetail>;

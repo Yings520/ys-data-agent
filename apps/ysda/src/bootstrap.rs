@@ -1747,7 +1747,7 @@ mod tests {
                 .await
                 .expect("offline catalog")
                 .len(),
-            9
+            ProviderId::ALL.len()
         );
         assert!(
             provider_runtime

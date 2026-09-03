@@ -331,6 +331,9 @@ impl ProviderManagementService {
         let current = self.profiles.load_current_revision(profile_id).await?;
         self.require_chatgpt(&current)?;
         let oauth = self.oauth_adapter()?;
+        if self.has_pending_oauth_operation(profile_id)? {
+            return oauth.view(profile_id).await;
+        }
         match current.credential_generation() {
             Some(generation) => oauth.restore(profile_id, generation).await,
             None => oauth.view(profile_id).await,
@@ -372,7 +375,10 @@ impl ProviderManagementService {
             let _ = self.oauth_connection(profile_id).await?;
         }
         self.insert_oauth_operation(operation_id, &current)?;
-        let result = self.oauth_adapter()?.reauthorize(profile_id, operation_id).await;
+        let result = self
+            .oauth_adapter()?
+            .reauthorize(profile_id, operation_id)
+            .await;
         if result.is_err() {
             self.remove_oauth_operation(operation_id)?;
         }
@@ -409,7 +415,10 @@ impl ProviderManagementService {
         let view = match self.oauth_adapter()?.complete(operation_id).await {
             Ok(view)
                 if view.profile_id == profile_id
-                    && view.status == OAuthConnectionStatus::Connected => view,
+                    && view.status == OAuthConnectionStatus::Connected =>
+            {
+                view
+            }
             Ok(_) => {
                 return Err(self
                     .rollback_oauth_mutation(operation_id, profile_id, oauth_not_connected_error())
@@ -454,7 +463,10 @@ impl ProviderManagementService {
         {
             Ok(view)
                 if view.profile_id == profile_id
-                    && view.status == OAuthConnectionStatus::Connected => view,
+                    && view.status == OAuthConnectionStatus::Connected =>
+            {
+                view
+            }
             Ok(_) => {
                 return Err(self
                     .rollback_oauth_mutation(operation_id, profile_id, oauth_not_connected_error())
@@ -594,6 +606,7 @@ impl ProviderManagementService {
             .lock()
             .map_err(|_| internal_operation_error())?
             .insert(operation_id);
+        self.remove_oauth_operation(operation_id)?;
         Ok(())
     }
 
@@ -608,9 +621,7 @@ impl ProviderManagementService {
         let summary = self.profile_summary(profile_id).await?;
         let revision = self.profiles.load_current_revision(profile_id).await?;
         let mut detail = profile_detail(summary, revision.clone());
-        if revision.provider() == ProviderId::ChatGptSubscription
-            && self.oauth.is_some()
-        {
+        if revision.provider() == ProviderId::ChatGptSubscription && self.oauth.is_some() {
             // Browsing must remain available when a platform credential store is unavailable.
             // The only safe degraded view is non-Connected; never infer connectivity from a
             // SQLite pointer alone.
@@ -756,27 +767,30 @@ impl ProviderManagementService {
         next_generation: CredentialGeneration,
     ) -> ProviderResult<()> {
         let profile_id = current.profile_id();
-        if let Err(error) = self.profiles.record_credential_vault_write(operation_id).await {
+        if let Err(error) = self
+            .profiles
+            .record_credential_vault_write(operation_id)
+            .await
+        {
             return Err(self
                 .rollback_oauth_mutation(operation_id, profile_id, error)
                 .await);
         }
         let replacement = ProfileRevision::draft(
             profile_id,
-            current.revision().checked_add(1).ok_or_else(internal_error)?,
+            current
+                .revision()
+                .checked_add(1)
+                .ok_or_else(internal_error)?,
             current.provider(),
             current.model().clone(),
             current.parameters().clone(),
             Some(next_generation),
         )
         .map_err(|_| internal_error())?;
-        let commit = CredentialPointerCommit::new(
-            operation_id,
-            profile_id,
-            current.revision(),
-            replacement,
-        )
-        .map_err(|_| internal_error())?;
+        let commit =
+            CredentialPointerCommit::new(operation_id, profile_id, current.revision(), replacement)
+                .map_err(|_| internal_error())?;
         if let Err(error) = self.profiles.commit_credential_pointer(commit).await {
             return Err(self
                 .rollback_oauth_mutation(operation_id, profile_id, error)
@@ -784,7 +798,9 @@ impl ProviderManagementService {
         }
         // The new revision deliberately remains Draft. Its existing model must pass a fresh
         // compatibility probe before the caller can explicitly activate it.
-        self.profiles.complete_credential_mutation(operation_id).await?;
+        self.profiles
+            .complete_credential_mutation(operation_id)
+            .await?;
         Ok(())
     }
 
@@ -830,9 +846,7 @@ impl ProviderManagementService {
     }
 
     fn oauth_adapter(&self) -> ProviderResult<&dyn OAuthConnectionService> {
-        self.oauth
-            .as_deref()
-            .ok_or_else(oauth_not_connected_error)
+        self.oauth.as_deref().ok_or_else(oauth_not_connected_error)
     }
 
     fn require_chatgpt(&self, revision: &ProfileRevision) -> ProviderResult<()> {
@@ -894,6 +908,15 @@ impl ProviderManagementService {
                     ProviderRemediation::WaitForCurrentOperation,
                 )
             })
+    }
+
+    fn has_pending_oauth_operation(&self, profile_id: ProfileId) -> ProviderResult<bool> {
+        Ok(self
+            .oauth_operations
+            .lock()
+            .map_err(|_| internal_operation_error())?
+            .values()
+            .any(|operation| operation.profile_id == profile_id))
     }
 
     fn remove_oauth_operation(&self, operation_id: OperationId) -> ProviderResult<()> {

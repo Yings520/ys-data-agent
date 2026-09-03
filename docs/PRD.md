@@ -1539,7 +1539,7 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 
 ## 30. 参考项目的取舍
 
-### Datus-agent
+### 外部参考实现
 
 借鉴数据领域 Workflow、Context、语义工具和 Artifact；避免复制大量彼此耦合的 Agentic Node 和巨型工厂。
 

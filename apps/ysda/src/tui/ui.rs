@@ -1,13 +1,3 @@
-use ratatui::{
-    Frame, Terminal,
-    backend::TestBackend,
-    layout::{Constraint, Direction, Layout, Margin, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
-};
-use ys_agent_runtime::QueryDisplayState;
-
 use super::{
     TransientView, TuiApp,
     app::{DetailKind, TranscriptItem},
@@ -15,6 +5,14 @@ use super::{
     navigation::ContentRoute,
     palette::{command_catalog, command_hint},
     timeline,
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::TestBackend,
+    layout::{Constraint, Direction, Layout, Margin, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,32 +50,53 @@ pub fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
         render_too_small(frame, app, area);
         return;
     }
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border)),
+        area,
+    );
+    let shell = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
     let regions = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Min(1),
-            Constraint::Length(bottom_panel_height(app, area)),
+            Constraint::Length(bottom_panel_height(app, shell)),
         ])
-        .split(area);
+        .split(shell);
     render_header(frame, app, regions[0], mode);
-    let body = if mode == LayoutMode::Wide {
-        regions[1].inner(Margin {
-            horizontal: 4,
-            vertical: 0,
-        })
-    } else {
-        regions[1]
+    let body_margin = match mode {
+        LayoutMode::Wide => 8,
+        LayoutMode::Standard => 4,
+        LayoutMode::Compact | LayoutMode::TooSmall => 1,
     };
+    let body = regions[1].inner(Margin {
+        horizontal: body_margin,
+        vertical: u16::from(mode != LayoutMode::Compact),
+    });
     render_body(frame, app, body, mode);
     render_bottom(frame, app, regions[2], mode);
 }
 
 pub fn bottom_panel_height(app: &TuiApp, area: Rect) -> u16 {
     match app.transient {
-        Some(
-            TransientView::SlashPalette | TransientView::ModePicker | TransientView::ThemePicker,
-        ) => 10_u16.min(area.height.saturating_sub(2)),
+        Some(TransientView::SlashPalette) => (3_u16
+            .saturating_add(app.slash_palette.visible_row_count() as u16))
+        .min(area.height.saturating_sub(2)),
+        Some(TransientView::ModePicker | TransientView::ThemePicker) => {
+            10_u16.min(area.height.saturating_sub(2))
+        }
+        _ if matches!(
+            app.navigation.current(),
+            ContentRoute::ModelSelection | ContentRoute::ProviderManagement
+        ) =>
+        {
+            16_u16.min(area.height.saturating_sub(4))
+        }
         _ => 4_u16.min(area.height.saturating_sub(2)),
     }
 }
@@ -87,104 +106,117 @@ fn render_header(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMo
     let header = app.header_view();
     let value_width = match mode {
         LayoutMode::Wide => 28,
-        LayoutMode::Standard => 14,
+        LayoutMode::Standard => 20,
         LayoutMode::Compact => 10,
         LayoutMode::TooSmall => 8,
     };
-    let mut spans = vec![
+    let mut left = vec![
         Span::styled(
-            "Agent",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+            "YS·DA",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
+        Span::styled("  │  ", Style::default().fg(theme.border)),
         Span::styled(
-            format!("W:{}", safe_width(header.workspace, value_width)),
-            Style::default().fg(theme.text),
+            safe_width(header.datasource, value_width),
+            Style::default().fg(theme.muted),
         ),
     ];
     if mode == LayoutMode::Compact {
-        spans.extend([
-            Span::styled(
-                format!(" · {}", mode_label(app)),
-                Style::default().fg(theme.accent),
-            ),
-            Span::styled(
-                format!(" · {}", safe_width(header.query, value_width)),
-                Style::default().fg(query_color(
-                    header.query_state,
-                    header.context_unavailable,
-                    theme,
-                )),
-            ),
+        left.extend([
+            Span::styled("  │  ", Style::default().fg(theme.border)),
+            Span::styled(mode_label(app), Style::default().fg(theme.accent)),
         ]);
     } else {
-        spans.extend([
+        left.extend([
+            Span::styled("  │  ", Style::default().fg(theme.border)),
             Span::styled(
-                format!(" · D:{}", safe_width(header.datasource, value_width)),
-                Style::default().fg(theme.muted),
-            ),
-            Span::styled(
-                format!(" · M:{}", mode_label(app)),
+                format!(" {} ", mode_label(app)),
                 Style::default().fg(theme.accent),
             ),
+            Span::styled("  │  ", Style::default().fg(theme.border)),
             Span::styled(
-                format!(" · Model:{}", safe_width(header.current_model, value_width)),
-                Style::default().fg(theme.accent),
-            ),
-            Span::styled(
-                format!(" · {}", safe_width(header.read_only, value_width)),
+                safe_width(header.current_model, value_width),
                 Style::default().fg(theme.muted),
-            ),
-            Span::styled(
-                format!(" · {}", safe_width(header.query, value_width)),
-                Style::default().fg(query_color(
-                    header.query_state,
-                    header.context_unavailable,
-                    theme,
-                )),
             ),
         ]);
     }
-    if header.context_unavailable {
-        spans.push(Span::styled(
-            " · status unavailable",
+    let (access, access_color) = if header.read_only.eq_ignore_ascii_case("read-only") {
+        ("◆ READ ONLY".to_owned(), theme.success)
+    } else {
+        ("◆ SETUP REQUIRED".to_owned(), theme.warning)
+    };
+    if header.context_unavailable && header.read_only.eq_ignore_ascii_case("read-only") {
+        left.push(Span::styled(
+            "  ·  STATUS UNAVAILABLE",
             Style::default().fg(theme.warning),
         ));
     }
+    let left_width = Line::from(left.clone()).width();
+    let access_width = access.chars().count();
+    let padding = usize::from(area.width).saturating_sub(left_width + access_width);
+    left.push(Span::raw(" ".repeat(padding)));
+    left.push(Span::styled(access, Style::default().fg(access_color)));
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.header)),
+        Paragraph::new(Line::from(left))
+            .style(Style::default().bg(theme.header))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(theme.border)),
+            ),
         area,
     );
 }
 
-fn query_color(
-    state: QueryDisplayState,
-    unavailable: bool,
-    theme: &super::theme::YsdaTheme,
-) -> ratatui::style::Color {
-    if unavailable {
-        return theme.warning;
-    }
-    match state {
-        QueryDisplayState::Ready => theme.muted,
-        QueryDisplayState::Running => theme.accent,
-        QueryDisplayState::WaitingForInput => theme.warning,
-        QueryDisplayState::Completed => theme.success,
-        QueryDisplayState::NonSuccess { .. } => theme.error,
-    }
-}
-
-fn render_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect, mode: LayoutMode) {
+fn render_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect, _mode: LayoutMode) {
     let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
-    let text = match app.transient {
-        Some(TransientView::Help) => help_lines(app),
-        Some(TransientView::Repair) => repair_lines(app),
-        _ => match app.navigation.current() {
-            ContentRoute::Timeline => match app.transient {
-                Some(TransientView::Detail(_)) => detail_lines(app),
-                _ => {
+    let text =
+        match app.transient {
+            Some(TransientView::Help) => help_lines(app),
+            Some(TransientView::Repair) => repair_lines(app),
+            _ => match app.navigation.current() {
+                ContentRoute::Timeline => match app.transient {
+                    Some(TransientView::Detail(_)) => detail_lines(app),
+                    _ => {
+                        let timeline_lines = timeline::render_lines(&app.timeline_state);
+                        if app.transcript.is_empty()
+                            && timeline_lines.is_empty()
+                            && app.safe_warning.is_none()
+                        {
+                            return render_text_body(frame, app, area, welcome_lines(app));
+                        }
+                        let mut text = transcript_lines(app);
+                        let timeline_tone = app.timeline_state.view().status.tone();
+                        text.lines.extend(timeline_lines.into_iter().map(|line| {
+                            Line::from(Span::styled(
+                                safe(&line),
+                                Style::default().fg(timeline_color(timeline_tone, theme)),
+                            ))
+                        }));
+                        text
+                    }
+                },
+                ContentRoute::Artifact => Text::from(
+                    artifact::render_lines(&app.artifact_workspace)
+                        .into_iter()
+                        .map(|line| {
+                            let color = if line.contains("restricted")
+                                || line.contains("missing")
+                                || line.contains("unavailable")
+                            {
+                                theme.error
+                            } else if line.contains("Warning") || line.contains("preview limited") {
+                                theme.warning
+                            } else if line.contains("Verification · Verified") {
+                                theme.success
+                            } else {
+                                theme.text
+                            };
+                            Line::from(Span::styled(safe(&line), Style::default().fg(color)))
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                ContentRoute::ModelSelection | ContentRoute::ProviderManagement => {
                     let mut text = transcript_lines(app);
                     let timeline_tone = app.timeline_state.view().status.tone();
                     text.lines
@@ -198,67 +230,20 @@ fn render_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect, mode: Layout
                         ));
                     text
                 }
+                ContentRoute::Diagnostics => detail_lines(app),
             },
-            ContentRoute::Artifact => Text::from(
-                artifact::render_lines(&app.artifact_workspace)
-                    .into_iter()
-                    .map(|line| {
-                        let color = if line.contains("restricted")
-                            || line.contains("missing")
-                            || line.contains("unavailable")
-                        {
-                            theme.error
-                        } else if line.contains("Warning") || line.contains("preview limited") {
-                            theme.warning
-                        } else if line.contains("Verification · Verified") {
-                            theme.success
-                        } else {
-                            theme.text
-                        };
-                        Line::from(Span::styled(safe(&line), Style::default().fg(color)))
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            ContentRoute::ModelSelection => Text::from(
-                model_selection::render_lines(&app.model_selection_state)
-                    .into_iter()
-                    .map(|line| {
-                        let color = if line.contains(" · Current") {
-                            theme.accent
-                        } else if line.contains("Needs setup")
-                            || line.contains("Needs validation")
-                            || line.contains("Validation expired")
-                        {
-                            theme.warning
-                        } else if line.contains("Unavailable")
-                            || line.contains("Capability insufficient")
-                        {
-                            theme.error
-                        } else if line.contains(" · Ready") {
-                            theme.success
-                        } else {
-                            theme.text
-                        };
-                        Line::from(Span::styled(safe(&line), Style::default().fg(color)))
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            ContentRoute::ProviderManagement | ContentRoute::Diagnostics => detail_lines(app),
-        },
-    };
-    let borders = if mode == LayoutMode::Compact {
-        Borders::NONE
-    } else {
-        Borders::BOTTOM
-    };
+        };
+    render_text_body(frame, app, area, text);
+}
+
+fn render_text_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect, text: Text<'static>) {
+    let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
     let rendered_height = text
         .lines
         .iter()
         .map(|line| line.width().max(1).div_ceil(usize::from(area.width.max(1))))
         .sum::<usize>();
-    let visible_height = area
-        .height
-        .saturating_sub(u16::from(mode != LayoutMode::Compact));
+    let visible_height = area.height.saturating_sub(0);
     let scroll = if app.scroll == u16::MAX {
         rendered_height
             .saturating_sub(usize::from(visible_height))
@@ -304,15 +289,45 @@ fn render_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect, mode: Layout
     };
     let paragraph = Paragraph::new(text)
         .style(Style::default().fg(theme.text).bg(theme.background))
-        .block(
-            Block::default()
-                .borders(borders)
-                .border_style(Style::default().fg(theme.border)),
-        )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
     app.timeline_state.result_card_hit_region = result_hit_region;
+}
+
+fn welcome_lines(app: &TuiApp) -> Text<'static> {
+    let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
+    Text::from(vec![
+        Line::from(Span::styled(
+            "Welcome to YS·DA",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Trustworthy answers from your data.",
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Get started",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("1  ", Style::default().fg(theme.muted)),
+            Span::raw("Choose an LLM provider and model  "),
+            Span::styled("/model", Style::default().fg(theme.accent)),
+        ]),
+        Line::from(vec![
+            Span::styled("2  ", Style::default().fg(theme.muted)),
+            Span::raw("Connect a read-only datasource"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Type / for commands.",
+            Style::default().fg(theme.muted),
+        )),
+    ])
 }
 
 fn timeline_color(
@@ -330,13 +345,7 @@ fn timeline_color(
 fn transcript_lines(app: &TuiApp) -> Text<'static> {
     let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
     if app.transcript.is_empty() {
-        let mut lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Ask a governed data question.",
-                Style::default().fg(theme.muted),
-            )),
-        ];
+        let mut lines = Vec::new();
         if let Some(code) = &app.safe_warning {
             lines.push(Line::from(Span::styled(
                 format!("Warning  {}", safe(code)),
@@ -486,6 +495,23 @@ fn render_bottom(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, _mode: LayoutM
     match app.transient {
         Some(TransientView::SlashPalette) => {
             frame.render_widget(Clear, area);
+            let regions = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(0)])
+                .split(area);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("› {}", safe(&app.composer.text())),
+                    Style::default().fg(theme.text),
+                )))
+                .style(Style::default().bg(theme.surface))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme.accent)),
+                ),
+                regions[0],
+            );
             let rows = app
                 .slash_palette
                 .rows()
@@ -493,7 +519,7 @@ fn render_bottom(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, _mode: LayoutM
                     let marker = if selected { "›" } else { " " };
                     Line::from(vec![
                         Span::styled(
-                            format!("{marker} /{}", command.name),
+                            format!("{marker} /{:<14}", command.name),
                             Style::default().fg(if selected { theme.accent } else { theme.text }),
                         ),
                         Span::styled(
@@ -503,25 +529,9 @@ fn render_bottom(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, _mode: LayoutM
                     ])
                 })
                 .collect::<Vec<_>>();
-            let mut lines = vec![
-                Line::from(Span::styled(
-                    "Commands",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from("Search commands"),
-            ];
-            lines.extend(rows);
             frame.render_widget(
-                Paragraph::new(Text::from(lines))
-                    .style(Style::default().bg(theme.surface))
-                    .block(
-                        Block::default()
-                            .borders(Borders::TOP)
-                            .border_style(Style::default().fg(theme.border)),
-                    ),
-                area,
+                Paragraph::new(Text::from(rows)).style(Style::default().bg(theme.surface)),
+                regions[1],
             );
         }
         Some(TransientView::ModePicker) => {
@@ -587,26 +597,210 @@ fn render_bottom(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, _mode: LayoutM
             );
         }
         _ => {
+            if matches!(
+                app.navigation.current(),
+                ContentRoute::ModelSelection | ContentRoute::ProviderManagement
+            ) {
+                render_composer_and_model_panel(frame, app, area);
+                return;
+            }
             let hint = footer_hint(app);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Length(1)])
+                .split(area);
+            let composer = if app.composer.text().is_empty() {
+                Span::styled(
+                    "› Ask a governed data question…",
+                    Style::default().fg(theme.muted),
+                )
+            } else {
+                Span::styled(
+                    format!("› {}", safe(&app.composer.text())),
+                    Style::default().fg(theme.text),
+                )
+            };
             frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(safe(&app.composer.text())),
-                    Line::from(hint),
-                ])
-                .style(Style::default().fg(theme.text).bg(theme.surface))
-                .block(
-                    Block::default()
-                        .borders(Borders::TOP)
-                        .border_style(Style::default().fg(theme.border)),
-                ),
-                area,
+                Paragraph::new(Line::from(composer))
+                    .style(Style::default().bg(theme.surface))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(theme.accent)),
+                    ),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(hint))
+                    .style(Style::default().fg(theme.muted).bg(theme.background)),
+                rows[1],
             );
         }
     }
 }
 
+fn render_composer_and_model_panel(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
+    let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(area);
+    let composer = if app.composer.text().is_empty() {
+        Span::styled(
+            "› Ask a governed data question…",
+            Style::default().fg(theme.muted),
+        )
+    } else {
+        Span::styled(
+            format!("› {}", safe(&app.composer.text())),
+            Style::default().fg(theme.text),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(composer))
+            .style(Style::default().bg(theme.surface))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent)),
+            ),
+        rows[0],
+    );
+
+    let (base_title, raw_lines, hint) = match app.navigation.current() {
+        ContentRoute::ModelSelection => (
+            " Model Selection ",
+            model_selection::render_lines(&app.model_selection_state),
+            "↑↓ navigate  Enter select  e edit credentials  Tab/←→ switch  Esc back  Ctrl+C cancel",
+        ),
+        ContentRoute::ProviderManagement => (
+            " Model Setup ",
+            app.detail
+                .as_ref()
+                .map(|detail| detail.lines.clone())
+                .unwrap_or_else(|| vec!["Provider setup unavailable".to_owned()]),
+            "↑↓ navigate  Enter select  Esc back  Ctrl+C cancel",
+        ),
+        _ => unreachable!("model panel is rendered only on model routes"),
+    };
+    let content_capacity = usize::from(rows[1].height.saturating_sub(2));
+    let title = if content_capacity <= 1 {
+        match app.navigation.current() {
+            ContentRoute::ModelSelection => " Model Selection · Esc ",
+            ContentRoute::ProviderManagement => " Model Setup · Enter/Esc ",
+            _ => base_title,
+        }
+    } else {
+        base_title
+    };
+    let fitted_lines = fit_panel_lines(
+        raw_lines
+            .into_iter()
+            .filter(|line| line != "Model Selection")
+            .collect(),
+        hint,
+        content_capacity,
+    );
+    let lines = fitted_lines
+        .into_iter()
+        .map(|line| {
+            let color = if line == hint {
+                theme.muted
+            } else if line.starts_with('→') || line.contains("← current") {
+                theme.accent
+            } else if line.contains("[needs setup]") || line.contains("Needs validation") {
+                theme.warning
+            } else if line.contains("Unavailable") || line.contains("Could not continue") {
+                theme.error
+            } else {
+                theme.text
+            };
+            Line::from(Span::styled(
+                safe_panel_line(&line),
+                Style::default().fg(color),
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, rows[1]);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(theme.surface))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .border_style(Style::default().fg(theme.border)),
+            ),
+        rows[1],
+    );
+}
+
+fn fit_panel_lines(raw_lines: Vec<String>, hint: &str, capacity: usize) -> Vec<String> {
+    if capacity == 0 {
+        return Vec::new();
+    }
+    let selected = raw_lines.iter().position(|line| line.starts_with('→'));
+    if capacity == 1 {
+        let essential = raw_lines.iter().position(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("code     ")
+                || line.contains("waiting for browser")
+                || line.contains("saved · enter")
+                || line.contains("type or paste")
+                || line.contains("enter ")
+                || line.contains("unavailable")
+                || line.contains("could not")
+                || line.contains("sign-in")
+                || line.contains("working")
+        });
+        return raw_lines
+            .get(selected.or(essential).unwrap_or_default())
+            .cloned()
+            .into_iter()
+            .collect();
+    }
+
+    let body_capacity = capacity.saturating_sub(1);
+    let mut body = if raw_lines.len() <= body_capacity {
+        raw_lines
+    } else if body_capacity == 1 {
+        vec![
+            raw_lines
+                .get(selected.unwrap_or_default())
+                .cloned()
+                .unwrap_or_default(),
+        ]
+    } else {
+        let mut fitted = vec![raw_lines.first().cloned().unwrap_or_default()];
+        let selected = selected.unwrap_or(1).max(1);
+        let window = body_capacity - 1;
+        let start = selected
+            .saturating_sub(window - 1)
+            .max(1)
+            .min(raw_lines.len().saturating_sub(window));
+        fitted.extend(raw_lines.into_iter().skip(start).take(window));
+        fitted
+    };
+    body.push(hint.to_owned());
+    body
+}
+
 fn safe(value: &str) -> String {
     safe_width(value, 240)
+}
+
+fn safe_panel_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(240)
+        .collect()
 }
 
 fn safe_width(value: &str, max_chars: usize) -> String {
@@ -656,7 +850,7 @@ fn timeline_key_hint(has_result_card: bool, submission_enabled: bool) -> &'stati
     } else if submission_enabled {
         "Enter submit · Ctrl-C detach"
     } else {
-        "readiness unavailable · Ctrl-C detach"
+        "Set up /model to begin · Ctrl-C detach"
     }
 }
 
@@ -669,7 +863,7 @@ fn render_too_small(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     };
     let text = Text::from(vec![
         Line::from(Span::styled(
-            "Agent",
+            "YS·DA",
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -714,11 +908,54 @@ fn _detail_kind_is_used(kind: DetailKind) -> DetailKind {
 
 #[cfg(test)]
 mod tests {
-    use super::timeline_key_hint;
+    use super::{fit_panel_lines, timeline_key_hint};
 
     #[test]
     fn completed_timeline_footer_prioritizes_open_results() {
         assert_eq!(timeline_key_hint(true, true), "Enter open results");
         assert_eq!(timeline_key_hint(true, false), "Enter open results");
+    }
+
+    #[test]
+    fn compact_panel_keeps_the_highlighted_row_visible() {
+        let rows = vec![
+            "[Providers]  Plans".to_owned(),
+            "  first".to_owned(),
+            "  second".to_owned(),
+            "→ selected".to_owned(),
+            "  fourth".to_owned(),
+        ];
+        assert_eq!(
+            fit_panel_lines(rows.clone(), "Esc back", 1),
+            vec!["→ selected"]
+        );
+        let fitted = fit_panel_lines(rows, "Esc back", 3);
+        assert!(fitted.iter().any(|line| line == "→ selected"));
+        assert_eq!(fitted.last().map(String::as_str), Some("Esc back"));
+    }
+
+    #[test]
+    fn compact_provider_setup_keeps_the_actionable_authentication_line_visible() {
+        let oauth = vec![
+            "Configure ChatGPT Subscription".to_owned(),
+            "Browser  https://example.invalid/device".to_owned(),
+            "Code     ABCD-EFGH".to_owned(),
+            "Waiting for browser sign-in… · Esc cancel".to_owned(),
+        ];
+        assert_eq!(
+            fit_panel_lines(oauth, "Esc back", 1),
+            vec!["Code     ABCD-EFGH"]
+        );
+
+        let api_key = vec![
+            "Configure DeepSeek".to_owned(),
+            "API Key".to_owned(),
+            "Type or paste your API key".to_owned(),
+            "Enter save and continue · Esc back".to_owned(),
+        ];
+        assert_eq!(
+            fit_panel_lines(api_key, "Esc back", 1),
+            vec!["Type or paste your API key"]
+        );
     }
 }
