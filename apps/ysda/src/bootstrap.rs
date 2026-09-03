@@ -924,6 +924,11 @@ async fn compose_provider_runtime(
         run_bindings.clone(),
         vault.clone(),
     ));
+    // No asynchronous operation survives a process restart. Intents that never acknowledged a
+    // protected write are therefore abandoned and safe to roll back. Recovery remains best
+    // effort so an unavailable native credential store still permits offline Provider browsing;
+    // the existing startup gate continues to reject Queries if cleanup could not be completed.
+    let _ = credentials.recover_abandoned_intents().await;
     let catalog = GovernedProviderCatalog::default();
     let evidence = EvidenceRegistry::new(EvidenceBaseline::for_catalog(
         &catalog,
@@ -1766,7 +1771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_runtime_rechecks_a_pending_credential_journal_before_binding_a_query() {
+    async fn provider_runtime_recovers_an_abandoned_intent_before_accepting_new_operations() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let runtime = Arc::new(
             ys_agent_store::SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -1781,13 +1786,16 @@ mod tests {
                     profile_id,
                     expected_current_revision: None,
                 },
-                name: ProfileName::new("Journal check").expect("valid profile name"),
+                name: ProfileName::new("Interrupted sign-in").expect("valid profile name"),
                 revision: ProfileRevision::draft(
                     profile_id,
                     1,
-                    ProviderId::DeepSeek,
-                    ProviderModelId::new(ProviderId::DeepSeek, "deepseek/journal-check")
-                        .expect("valid model"),
+                    ProviderId::ChatGptSubscription,
+                    ProviderModelId::new(
+                        ProviderId::ChatGptSubscription,
+                        "chatgpt/codex-mini-latest",
+                    )
+                    .expect("valid model"),
                     ProviderParameters::default(),
                     None,
                 )
@@ -1795,7 +1803,7 @@ mod tests {
             })
             .await
             .expect("save draft profile");
-        let generation = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+        let generation = CredentialGeneration::new(profile_id, 1, CredentialKind::OAuthConnection)
             .expect("valid credential generation");
         repository
             .begin_credential_mutation(
@@ -1814,13 +1822,21 @@ mod tests {
             compose_provider_runtime(runtime, Arc::new(InMemoryCredentialVault::new()))
                 .await
                 .expect("compose Provider runtime");
+        assert!(
+            repository
+                .pending_credential_mutations()
+                .await
+                .expect("read recovered journal")
+                .is_empty(),
+            "a restart must roll back an intent that never reached the Vault"
+        );
         let error = provider_runtime
             .bindings
             .bind_new_run(RunId::new())
             .await
-            .expect_err("pending credential journal must block a new Query");
+            .expect_err("the recovered draft still has no active model");
 
-        assert_eq!(error.code(), "provider.operation.stale");
+        assert_eq!(error.code(), "provider.no_active_profile");
     }
 
     #[test]

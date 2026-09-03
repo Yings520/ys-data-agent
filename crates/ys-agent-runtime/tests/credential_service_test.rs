@@ -167,6 +167,69 @@ async fn api_key_creation_records_the_journal_writes_the_vault_then_appends_a_dr
 }
 
 #[tokio::test]
+async fn cancelling_an_unacknowledged_intent_removes_its_journal_and_staged_vault_entry() {
+    let directory = TempDir::new().expect("temporary database directory");
+    let store = SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+        .await
+        .expect("open database");
+    let repository = store.provider_repository();
+    let vault = Arc::new(InMemoryCredentialVault::new());
+    let profile_id = ProfileId::new();
+    seed_draft(&repository, profile_id, "Interrupted credential").await;
+    let service = CredentialService::new(
+        Arc::new(repository.clone()),
+        Arc::new(store.run_binding_repository()),
+        vault.clone(),
+    );
+    let operation_id = OperationId::new();
+    let generation = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+        .expect("first API-key generation");
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::create(operation_id, profile_id, 1, generation)
+                .expect("valid creation intent"),
+        )
+        .await
+        .expect("record intent");
+    vault
+        .write_generation(api_key_write(
+            profile_id,
+            generation,
+            "unacknowledged-write-canary",
+        ))
+        .await
+        .expect("simulate a write immediately before interruption");
+
+    service
+        .rollback_cancelled_intent(operation_id)
+        .await
+        .expect("cancelled operation cleanup");
+
+    assert!(
+        repository
+            .pending_credential_mutations()
+            .await
+            .expect("journal state")
+            .is_empty()
+    );
+    assert_eq!(
+        vault
+            .credential_status(credential_reference(profile_id, generation))
+            .await
+            .expect("staged Vault status"),
+        CredentialViewStatus::Missing
+    );
+    assert_eq!(
+        repository
+            .load_current_revision(profile_id)
+            .await
+            .expect("unchanged profile")
+            .credential_generation(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn replace_and_delete_are_profile_scoped_and_clean_unreferenced_generations() {
     let directory = TempDir::new().expect("temporary database directory");
     let store = SqliteRuntimeStore::open(directory.path().join("runtime.db"))

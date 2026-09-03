@@ -795,7 +795,10 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
     }
 
     async fn cancel_operation(&self, operation_id: OperationId) -> ProviderResult<()> {
-        self.lifecycle.cancel_operation(operation_id)
+        self.lifecycle.cancel_operation(operation_id)?;
+        self.credentials
+            .rollback_cancelled_intent(operation_id)
+            .await
     }
 
     async fn start_oauth(

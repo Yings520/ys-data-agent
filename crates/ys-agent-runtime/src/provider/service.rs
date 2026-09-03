@@ -11,15 +11,15 @@ use std::{
 use ys_agent_core::{
     ActivateProfileRequest, ActivationConfirmation, ActiveProviderSnapshot, ActiveProviderView,
     CredentialGeneration, CredentialKind, CredentialMutation, CredentialMutationIntent,
-    CredentialMutationOperation, CredentialMutationRepository, CredentialMutationRequest,
-    CredentialPointerCommit, CredentialProtectionStatus, CredentialVault, CredentialViewStatus,
-    DeleteProfileRequest, DeviceAuthorizationView, OAuthConnectionService, OAuthConnectionStatus,
-    OAuthConnectionView, OperationId, ProfileDetail, ProfileId, ProfileName, ProfileRevision,
-    ProfileSummary, ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode,
-    ProviderField, ProviderId, ProviderManagementError, ProviderProfileRepository,
-    ProviderRemediation, ProviderResult, RemoteRevocationOutcome, RevisionPrecondition,
-    RunProviderBindingRepository, SaveProfileRequest, SaveProfileRevision, SecretValue,
-    ValidationCommit,
+    CredentialMutationOperation, CredentialMutationPhase, CredentialMutationRecord,
+    CredentialMutationRepository, CredentialMutationRequest, CredentialPointerCommit,
+    CredentialProtectionStatus, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
+    DeviceAuthorizationView, OAuthConnectionService, OAuthConnectionStatus, OAuthConnectionView,
+    OperationId, ProfileDetail, ProfileId, ProfileName, ProfileRevision, ProfileSummary,
+    ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode, ProviderField,
+    ProviderId, ProviderManagementError, ProviderProfileRepository, ProviderRemediation,
+    ProviderResult, RemoteRevocationOutcome, RevisionPrecondition, RunProviderBindingRepository,
+    SaveProfileRequest, SaveProfileRevision, SecretValue, ValidationCommit,
 };
 use zeroize::Zeroizing;
 
@@ -66,6 +66,56 @@ impl CredentialService {
             run_bindings,
             vault,
         }
+    }
+
+    /// Rolls back intents left before a protected write was acknowledged. A process restart has
+    /// no live owner for these records, so retaining them would permanently reject the next
+    /// credential or browser sign-in attempt as stale. The staged Vault locator is deleted first
+    /// to cover a crash immediately after the write but before its journal acknowledgement.
+    pub async fn recover_abandoned_intents(&self) -> ProviderResult<usize> {
+        let records = self.profiles.pending_credential_mutations().await?;
+        let mut recovered = 0;
+        for record in records
+            .into_iter()
+            .filter(|record| record.phase() == CredentialMutationPhase::IntentRecorded)
+        {
+            self.rollback_unacknowledged_intent(record).await?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    /// Cleans up the journal record owned by a cooperatively cancelled operation. Missing and
+    /// already-advanced records are safe no-ops: later phases crossed an irreversible boundary
+    /// and must remain available to the normal recovery path.
+    pub async fn rollback_cancelled_intent(&self, operation_id: OperationId) -> ProviderResult<()> {
+        let record = self
+            .profiles
+            .pending_credential_mutations()
+            .await?
+            .into_iter()
+            .find(|record| record.operation_id() == operation_id);
+        if let Some(record) = record
+            && record.phase() == CredentialMutationPhase::IntentRecorded
+        {
+            self.rollback_unacknowledged_intent(record).await?;
+        }
+        Ok(())
+    }
+
+    async fn rollback_unacknowledged_intent(
+        &self,
+        record: CredentialMutationRecord,
+    ) -> ProviderResult<()> {
+        if let Some(generation) = record.new_generation().or(record.rollback_generation()) {
+            self.vault
+                .delete_generation(credential_reference(generation))
+                .await?;
+        }
+        self.profiles
+            .rollback_credential_mutation(record.operation_id())
+            .await?;
+        Ok(())
     }
 
     /// Creates, replaces, or deletes one API-key generation. Every successful operation appends

@@ -1842,8 +1842,12 @@ impl TuiController {
             }
             ModelSelectionOutcome::Activate(key)
             | ModelSelectionOutcome::ValidateThenActivate(key) => {
-                self.request_model_switch(app, key.clone())?;
-                app.set_runtime_status("Validating and activating model…");
+                if self.model_switch_in_flight() {
+                    app.set_runtime_status("Model activation already in progress…");
+                } else {
+                    self.request_model_switch(app, key.clone())?;
+                    app.set_runtime_status("Validating and activating model…");
+                }
             }
             ModelSelectionOutcome::RevalidateThenActivate(key) => {
                 self.open_provider_setup(
@@ -4269,6 +4273,81 @@ mod event_timeline_tests {
         }
         assert_eq!(app.header_view().current_model, before);
         assert_eq!(app.model_selection_state, before_state);
+    }
+
+    #[tokio::test]
+    async fn repeated_enter_while_model_switch_is_running_keeps_the_tui_open() {
+        let workspace_id = WorkspaceId::new();
+        let profile_id = ProfileId::new();
+        let target = SelectionTarget::Provider(ProviderId::DeepSeek);
+        let model =
+            ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/repeated-enter")
+                .expect("model");
+        let key = ys_agent_core::ModelCandidateKey::new(
+            profile_id,
+            1,
+            None,
+            ProviderId::DeepSeek,
+            model.clone(),
+        )
+        .expect("candidate key");
+        let snapshot = ys_agent_core::ModelSelectionSnapshot::new(vec![
+            ys_agent_core::SelectionTargetView::new(
+                target.clone(),
+                "deepseek",
+                ys_agent_core::SelectionAvailability::Configured,
+                ys_agent_core::SelectionCurrentStatus::NotCurrent,
+            )
+            .expect("configured target"),
+        ])
+        .expect("snapshot");
+        let candidates = ys_agent_core::ModelCandidateBatch::new(
+            target,
+            vec![
+                ys_agent_core::ModelCandidateView::new(
+                    key,
+                    "deepseek",
+                    model.as_str(),
+                    ys_agent_core::ModelCandidateStatus::Ready,
+                    ys_agent_core::SelectionCurrentStatus::NotCurrent,
+                )
+                .expect("candidate"),
+            ],
+        )
+        .expect("candidate batch");
+        let service = Arc::new(CountingMissingArtifactService::default());
+        let principal = Principal::local_operator("repeated-enter-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.model_selection_state
+            .reduce(ModelSelectionAction::SnapshotLoaded(snapshot));
+        assert!(matches!(
+            app.model_selection_state
+                .reduce(ModelSelectionAction::Confirm),
+            ModelSelectionOutcome::LoadCandidates(_)
+        ));
+        app.model_selection_state
+            .reduce(ModelSelectionAction::CandidatesLoaded(candidates));
+        app.push_route(ContentRoute::ModelSelection);
+
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("first Enter starts model activation");
+        assert!(controller.model_switch_in_flight());
+
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("repeated Enter must not terminate the TUI");
+        assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
+        assert!(controller.model_switch_in_flight());
     }
 
     #[tokio::test]
