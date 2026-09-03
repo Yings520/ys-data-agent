@@ -13,6 +13,8 @@ use ys_agent_core::{
     QueryExecutionPlan, QueryPlan, RuntimeStore, SourceId, ToolCall, ToolCallId,
 };
 
+mod provider_fixture;
+
 #[derive(Debug, Clone)]
 pub enum ScriptedAction {
     Response(ModelResponse),
@@ -295,17 +297,24 @@ impl QueryWorkflowFixture {
                 .await
                 .expect("runtime store"),
         );
+        let active_provider =
+            provider_fixture::persisted_test_active_provider(runtime.as_ref()).await;
         let artifacts = Arc::new(
             ys_agent_store::LocalArtifactStore::new(directory.path()).expect("artifact store"),
         );
         let workspace_id = ys_agent_core::WorkspaceId::new();
         let principal = ys_agent_core::Principal::local_operator("tutorial");
-        let service = Arc::new(ys_agent_runtime::InProcessAgentService::new(
-            workspace_id,
-            runtime.clone(),
-            artifacts.clone(),
-            Arc::new(ys_agent_runtime::NoopRunScheduler),
-        ));
+        let service = Arc::new(
+            ys_agent_runtime::InProcessAgentService::new(
+                workspace_id,
+                runtime.clone(),
+                artifacts.clone(),
+                Arc::new(ys_agent_runtime::NoopRunScheduler),
+            )
+            .with_run_provider_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunProviderBindingSource::from_active(active_provider),
+            )),
+        );
         let session = ys_agent_runtime::AgentServiceApi::create_session(
             service.as_ref(),
             ys_agent_core::CommandId::new(),
@@ -394,8 +403,8 @@ use ys_agent_core::{
     WorkspaceId,
 };
 use ys_agent_runtime::{
-    ContextAssembler, Harness, HarnessConfig, HarnessDependencies, InMemoryQueryContextProvider,
-    LoopDriver, PromptBuilder,
+    ContextAssembler, FixedRunModelProviderResolver, Harness, HarnessConfig, HarnessDependencies,
+    InMemoryQueryContextProvider, LoopDriver, PromptBuilder,
     telemetry::TelemetryDispatcher,
     tools::{ConnectorToolAvailability, ToolCatalog, ToolRuntime, WorkspaceToolPolicy},
 };
@@ -648,15 +657,18 @@ fn build_query_dependencies(
 
     let harness = Arc::new(Harness::new(
         HarnessDependencies {
-            store: runtime_store,
+            store: runtime_store.clone(),
             artifacts: artifact_store,
-            model,
+            model_resolver: Arc::new(FixedRunModelProviderResolver::new(
+                Arc::new(runtime.run_binding_repository()),
+                model,
+            )),
             catalog,
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler,
             telemetry,
         },
-        PromptBuilder::new("fake-query-model"),
+        PromptBuilder::new(),
         HarnessConfig {
             workspace_id,
             principal,
@@ -1303,6 +1315,7 @@ async fn open_runtime_components(
 ) -> ys_agent_core::CoreResult<RuntimeComponents> {
     let runtime =
         Arc::new(ys_agent_store::SqliteRuntimeStore::open(database_path.to_path_buf()).await?);
+    let active_provider = provider_fixture::persisted_test_active_provider(runtime.as_ref()).await;
     let artifacts = Arc::new(ys_agent_store::LocalArtifactStore::new(artifact_root)?);
     let model: Arc<dyn ys_agent_core::ModelProvider> =
         Arc::new(ys_agent_adapters::model::FakeModelProvider::new({
@@ -1348,12 +1361,17 @@ async fn open_runtime_components(
         model,
         Arc::new(TelemetryDispatcher::default()),
     )?;
-    let service = Arc::new(ys_agent_runtime::InProcessAgentService::new(
-        workspace_id,
-        runtime.clone(),
-        artifacts,
-        Arc::new(ys_agent_runtime::NoopRunScheduler),
-    ));
+    let service = Arc::new(
+        ys_agent_runtime::InProcessAgentService::new(
+            workspace_id,
+            runtime.clone(),
+            artifacts,
+            Arc::new(ys_agent_runtime::NoopRunScheduler),
+        )
+        .with_run_provider_binding_source(Arc::new(
+            ys_agent_runtime::StaticRunProviderBindingSource::from_active(active_provider),
+        )),
+    );
     let recovery = Arc::new(ys_agent_runtime::RecoveryManager::new(runtime.clone()));
     Ok(RuntimeComponents {
         runtime,

@@ -4,6 +4,3 @@
 /examples/demo.db
 docs/superpowers/
 .DS_Store
-/.ralph-tui/generated/
-/.ralph-tui/iterations/
-/.ralph-tui/progress.md

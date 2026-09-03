@@ -1,22 +1,30 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
+use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
 use ys_agent_core::{
     AgentAction, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactKind, ArtifactMetadata,
-    ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult, EventActor,
-    ModelResponse, PendingRunEvent, Principal, PutArtifact, RunEventKind, RunId, RunStatus,
-    RuntimeCommandBatch, RuntimeStore, Sensitivity, StepId, TaskId, TaskStatus, WorkspaceId,
+    ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult,
+    CredentialVault, EventActor, ModelResponse, PendingRunEvent, Principal,
+    ProtectedCredentialWrite, ProviderCredentialReference, ProviderResult, PutArtifact,
+    RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
+    RunProviderBindingSource, RunStatus, RuntimeCommandBatch, RuntimeStore, SecretValue,
+    Sensitivity, StepId, TaskId, TaskStatus, WorkspaceId,
 };
 use ys_agent_runtime::{
-    AgentServiceApi, CoordinationDecision, Coordinator, CreateTaskRequest, InProcessAgentService,
-    RuleBasedCoordinator, RunScheduler, SendMessageRequest, ServiceReply,
+    ActiveRunProviderBindingSource, AgentServiceApi, CoordinationDecision, Coordinator,
+    CreateTaskRequest, InProcessAgentService, RuleBasedCoordinator, RunScheduler,
+    SendMessageRequest, ServiceReply, StaticRunProviderBindingSource,
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
+
+#[path = "support/provider_fixture.rs"]
+mod provider_fixture;
 
 #[derive(Default)]
 struct CountingScheduler {
@@ -40,6 +48,51 @@ impl RunScheduler for CountingScheduler {
     }
 }
 
+async fn seed_active_vault(
+    active: ys_agent_core::ActiveProviderSnapshot,
+) -> Arc<InMemoryCredentialVault> {
+    let vault = Arc::new(InMemoryCredentialVault::new());
+    let generation = RunProviderBinding::from_active(RunId::new(), active)
+        .expect("active snapshot creates a binding")
+        .credential_generation();
+    vault
+        .write_generation(ProtectedCredentialWrite {
+            reference: ProviderCredentialReference {
+                profile_id: generation.profile_id(),
+                generation,
+            },
+            secret: SecretValue::from_utf8("service-test-secret".to_owned()),
+        })
+        .await
+        .expect("seed protected active Credential");
+    vault
+}
+
+struct SwitchActiveAfterFirstBinding {
+    source: ActiveRunProviderBindingSource,
+    database: std::path::PathBuf,
+    switched: AtomicBool,
+}
+
+#[async_trait]
+impl RunProviderBindingSource for SwitchActiveAfterFirstBinding {
+    async fn bind_new_run(&self, run_id: RunId) -> ProviderResult<RunProviderBinding> {
+        let binding = self.source.bind_new_run(run_id).await?;
+        if !self.switched.swap(true, Ordering::SeqCst) {
+            rusqlite::Connection::open(&self.database)
+                .expect("open database to simulate a concurrent active activation")
+                .execute(
+                    "UPDATE active_provider
+                     SET activation_revision = activation_revision + 1
+                     WHERE singleton = 1",
+                    [],
+                )
+                .expect("advance the active activation revision");
+        }
+        Ok(binding)
+    }
+}
+
 struct ServiceFixture {
     _directory: TempDir,
     store: Arc<SqliteRuntimeStore>,
@@ -54,14 +107,18 @@ struct ServiceFixture {
 
 impl ServiceFixture {
     async fn new() -> Self {
-        Self::build(None).await
+        Self::build(None, true).await
     }
 
     async fn with_conversation_model(model: Arc<dyn ys_agent_core::ModelProvider>) -> Self {
-        Self::build(Some(model)).await
+        Self::build(Some(model), true).await
     }
 
-    async fn build(model: Option<Arc<dyn ys_agent_core::ModelProvider>>) -> Self {
+    async fn without_provider_binding() -> Self {
+        Self::build(None, false).await
+    }
+
+    async fn build(model: Option<Arc<dyn ys_agent_core::ModelProvider>>, bind_runs: bool) -> Self {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = Arc::new(
             SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -79,6 +136,21 @@ impl ServiceFixture {
             scheduler.clone(),
             2,
         );
+        if bind_runs {
+            service = service.with_run_provider_binding_source(Arc::new(
+                StaticRunProviderBindingSource::from_active(
+                    provider_fixture::persisted_test_active_provider(store.as_ref()).await,
+                ),
+            ));
+        } else {
+            service = service.with_run_provider_binding_source(Arc::new(
+                ActiveRunProviderBindingSource::new(
+                    Arc::new(store.provider_repository()),
+                    Arc::new(store.run_binding_repository()),
+                    Arc::new(InMemoryCredentialVault::new()),
+                ),
+            ));
+        }
         if let Some(model) = model {
             service = service.with_conversation_model(model, "test-model");
         }
@@ -155,7 +227,7 @@ impl ServiceFixture {
                 },
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: Some(metadata.clone()),
                 pending_events: Vec::new(),
                 snapshot_update: None,
@@ -164,6 +236,165 @@ impl ServiceFixture {
             .expect("index Artifact metadata");
         metadata
     }
+}
+
+#[tokio::test]
+async fn provider_management_is_available_only_through_the_service_boundary() {
+    let fixture = ServiceFixture::new().await;
+
+    let error = fixture
+        .service
+        .provider_catalog()
+        .await
+        .expect_err("an uncomposed service must not expose a repository or Vault fallback");
+
+    assert_eq!(error.code(), "provider.internal");
+}
+
+#[tokio::test]
+async fn production_run_creation_rejects_missing_provider_binding_before_persistence() {
+    let fixture = ServiceFixture::without_provider_binding().await;
+
+    let error = fixture
+        .service
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            fixture.session_id(),
+            "Query GMV",
+        ))
+        .await
+        .expect_err("production Run requires a Provider binding");
+
+    assert!(matches!(
+        error,
+        CoreError::Validation {
+            code: "provider.no_active_profile",
+            ..
+        }
+    ));
+    assert_eq!(fixture.created_run_count().await, 0);
+}
+
+#[tokio::test]
+async fn production_run_creation_retries_with_the_committed_active_snapshot() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    let store = Arc::new(
+        SqliteRuntimeStore::open(&database)
+            .await
+            .expect("runtime store"),
+    );
+    let active = provider_fixture::persisted_test_active_provider(store.as_ref()).await;
+    let profiles = store.provider_repository();
+    let bindings = store.run_binding_repository();
+    let source = Arc::new(SwitchActiveAfterFirstBinding {
+        source: ActiveRunProviderBindingSource::new(
+            Arc::new(profiles.clone()),
+            Arc::new(bindings.clone()),
+            seed_active_vault(active).await,
+        ),
+        database,
+        switched: AtomicBool::new(false),
+    });
+    let artifacts =
+        Arc::new(LocalArtifactStore::new(directory.path()).expect("local artifact store"));
+    let scheduler = Arc::new(CountingScheduler::default());
+    let workspace_id = WorkspaceId::new();
+    let service = InProcessAgentService::with_event_capacity(
+        workspace_id,
+        store.clone(),
+        artifacts,
+        scheduler.clone(),
+        2,
+    )
+    .with_run_provider_binding_source(source);
+    let session = service
+        .create_session(CommandId::new(), Principal::local_operator("Data Engineer"))
+        .await
+        .expect("create session");
+
+    let reply = service
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            session.id,
+            "Query GMV",
+        ))
+        .await
+        .expect("retry Run creation after an active-snapshot race");
+    let run_id = reply.run_id().expect("scheduled Query Run");
+    let active = profiles
+        .active()
+        .await
+        .expect("read final active snapshot")
+        .expect("active Provider remains configured");
+    let binding = bindings
+        .load_run_binding(run_id)
+        .await
+        .expect("load immutable Run binding");
+
+    let expected = RunProviderBinding::from_active(run_id, active)
+        .expect("final active snapshot creates a Run binding");
+    assert_eq!(binding, expected);
+    assert_eq!(
+        store
+            .load_events(&run_id, 0)
+            .await
+            .expect("load atomically-created events")
+            .len(),
+        3
+    );
+    assert_eq!(scheduler.count().await, 1);
+}
+
+#[tokio::test]
+async fn production_run_creation_rejects_an_unresolvable_active_generation_before_persistence() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("runtime.db");
+    let store = Arc::new(
+        SqliteRuntimeStore::open(&database)
+            .await
+            .expect("runtime store"),
+    );
+    provider_fixture::persisted_test_active_provider(store.as_ref()).await;
+    let source = Arc::new(ActiveRunProviderBindingSource::new(
+        Arc::new(store.provider_repository()),
+        Arc::new(store.run_binding_repository()),
+        Arc::new(InMemoryCredentialVault::new()),
+    ));
+    let artifacts =
+        Arc::new(LocalArtifactStore::new(directory.path()).expect("local artifact store"));
+    let scheduler = Arc::new(CountingScheduler::default());
+    let service = InProcessAgentService::with_event_capacity(
+        WorkspaceId::new(),
+        store.clone(),
+        artifacts,
+        scheduler.clone(),
+        2,
+    )
+    .with_run_provider_binding_source(source);
+    let session = service
+        .create_session(CommandId::new(), Principal::local_operator("Data Engineer"))
+        .await
+        .expect("create session");
+
+    let error = service
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            session.id,
+            "Query GMV",
+        ))
+        .await
+        .expect_err("unresolvable active generation must prevent Run creation");
+
+    assert!(matches!(
+        error,
+        CoreError::Validation {
+            code: "provider.credential.missing",
+            ..
+        }
+    ));
+    assert_eq!(store.run_count().await.expect("count Runs"), 0);
+    assert_eq!(scheduler.count().await, 0);
 }
 
 #[tokio::test]
@@ -640,7 +871,19 @@ async fn subscription_reads_durable_events_before_live_notifications() {
     let event = subscription.next().await.expect("durable event");
 
     assert_eq!(event.sequence, 1);
-    assert!(matches!(event.event.kind, RunEventKind::RunStarted));
+    assert!(matches!(
+        event.event.kind,
+        RunEventKind::ProviderBound { .. }
+    ));
+    assert!(matches!(
+        subscription
+            .next()
+            .await
+            .expect("RunStarted event")
+            .event
+            .kind,
+        RunEventKind::RunStarted
+    ));
 }
 
 #[tokio::test]

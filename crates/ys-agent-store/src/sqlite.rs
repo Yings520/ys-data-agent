@@ -11,6 +11,11 @@ use ys_agent_core::{
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_runtime.sql");
+const MIGRATION_0002: &str = include_str!("../migrations/0002_provider_management.sql");
+const MIGRATION_0003: &str = include_str!("../migrations/0003_credential_journal_recovery.sql");
+const MIGRATION_0004: &str = include_str!("../migrations/0004_run_binding_activation_revision.sql");
+const MIGRATION_0005: &str = include_str!("../migrations/0005_invalid_validation_state.sql");
+const MIGRATION_0006: &str = include_str!("../migrations/0006_profile_tombstone.sql");
 
 #[derive(Debug, Clone)]
 pub struct SqliteRuntimeStore {
@@ -59,7 +64,7 @@ impl SqliteRuntimeStore {
     }
 }
 
-fn open_connection(database: &Path) -> CoreResult<Connection> {
+pub(crate) fn open_connection(database: &Path) -> CoreResult<Connection> {
     if let Some(parent) = database.parent() {
         std::fs::create_dir_all(parent).map_err(storage_error)?;
     }
@@ -87,29 +92,118 @@ fn apply_migrations(connection: &mut Connection) -> CoreResult<()> {
         )
         .map_err(storage_error)?;
 
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(storage_error)?;
-    let applied: bool = transaction
+    {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let runtime_applied = migration_is_applied(&transaction, 1)?;
+        if !runtime_applied {
+            transaction
+                .execute_batch(MIGRATION_0001)
+                .map_err(storage_error)?;
+            record_migration(&transaction, 1)?;
+        }
+
+        if !migration_is_applied(&transaction, 2)? {
+            transaction
+                .execute_batch(MIGRATION_0002)
+                .map_err(storage_error)?;
+            record_migration(&transaction, 2)?;
+        }
+        if !migration_is_applied(&transaction, 3)? {
+            transaction
+                .execute_batch(MIGRATION_0003)
+                .map_err(storage_error)?;
+            record_migration(&transaction, 3)?;
+        }
+        if !migration_is_applied(&transaction, 4)? {
+            transaction
+                .execute_batch(MIGRATION_0004)
+                .map_err(storage_error)?;
+            record_migration(&transaction, 4)?;
+        }
+        transaction.commit().map_err(storage_error)?;
+    }
+
+    let migration_five_applied: bool = connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 1)",
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 5)",
             [],
             |row| row.get(0),
         )
         .map_err(storage_error)?;
+    if !migration_five_applied {
+        // SQLite cannot change a CHECK constraint in place. The v5 rebuild keeps the table name
+        // and all rows stable; foreign keys are verified again immediately after the rebuild.
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .map_err(storage_error)?;
+        let migration_result = apply_invalid_validation_migration(connection);
+        let foreign_key_result = connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(storage_error);
+        migration_result?;
+        foreign_key_result?;
+        verify_foreign_keys(connection)?;
+    }
+    apply_profile_tombstone_migration(connection)
+}
 
-    if !applied {
+fn apply_invalid_validation_migration(connection: &mut Connection) -> CoreResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+    transaction
+        .execute_batch(MIGRATION_0005)
+        .map_err(storage_error)?;
+    record_migration(&transaction, 5)?;
+    transaction.commit().map_err(storage_error)
+}
+
+fn verify_foreign_keys(connection: &Connection) -> CoreResult<()> {
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(storage_error)?;
+    let mut rows = statement.query([]).map_err(storage_error)?;
+    if rows.next().map_err(storage_error)?.is_some() {
+        return Err(CoreError::Storage {
+            message: "Provider schema migration left a foreign-key violation".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn apply_profile_tombstone_migration(connection: &mut Connection) -> CoreResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+    if !migration_is_applied(&transaction, 6)? {
         transaction
-            .execute_batch(MIGRATION_0001)
+            .execute_batch(MIGRATION_0006)
             .map_err(storage_error)?;
-        transaction
-            .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
-                [Utc::now().to_rfc3339()],
-            )
-            .map_err(storage_error)?;
+        record_migration(&transaction, 6)?;
     }
     transaction.commit().map_err(storage_error)
+}
+
+fn migration_is_applied(transaction: &Transaction<'_>, version: i64) -> CoreResult<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            [version],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)
+}
+
+fn record_migration(transaction: &Transaction<'_>, version: i64) -> CoreResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![version, Utc::now().to_rfc3339()],
+        )
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 fn storage_error(error: impl std::fmt::Display) -> CoreError {
@@ -205,6 +299,61 @@ fn insert_run(transaction: &Transaction<'_>, snapshot: &RunSnapshot) -> CoreResu
         )
         .map_err(storage_error)?;
     Ok(())
+}
+
+fn provider_parameters_json(parameters: &ys_agent_core::ProviderParameters) -> CoreResult<String> {
+    let mut value = serde_json::to_value(parameters).map_err(storage_error)?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| CoreError::Storage {
+            message: "Provider parameters must serialize as an object".to_owned(),
+        })?
+        .insert("schema_version".to_owned(), serde_json::Value::from(1));
+    serde_json::to_string(&value).map_err(storage_error)
+}
+
+fn insert_run_provider_binding(
+    transaction: &Transaction<'_>,
+    binding: &ys_agent_core::RunProviderBinding,
+) -> CoreResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO run_provider_bindings(
+                run_id, profile_id, revision, provider, model_id, parameters_json,
+                credential_generation, validation_id, validation_digest,
+                fingerprint_json, fingerprint_hash, created_at, activation_revision
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                binding.run_id().to_string(),
+                binding.profile_id().to_string(),
+                i64::try_from(binding.profile_revision()).map_err(storage_error)?,
+                serialized_name(&binding.provider())?,
+                binding.model().as_str(),
+                provider_parameters_json(binding.parameters())?,
+                i64::try_from(binding.credential_generation().number()).map_err(storage_error)?,
+                binding.validation_id().to_string(),
+                binding.validation_digest().as_str(),
+                binding.fingerprint().canonical_json(),
+                binding.fingerprint().digest(),
+                Utc::now().to_rfc3339(),
+                i64::try_from(binding.activation_revision()).map_err(storage_error)?,
+            ],
+        )
+        .map_err(run_binding_error)?;
+    Ok(())
+}
+
+fn run_binding_error(error: rusqlite::Error) -> CoreError {
+    if error
+        .to_string()
+        .contains("Run Provider binding requires the current active snapshot")
+    {
+        return CoreError::validation(
+            "active_provider_snapshot_changed",
+            "the active Provider changed before the new Run could be committed",
+        );
+    }
+    storage_error(error)
 }
 
 fn insert_artifact(transaction: &Transaction<'_>, metada: &ArtifactMetadata) -> CoreResult<()> {
@@ -436,10 +585,16 @@ fn commit_command_on_connection(
         });
     }
 
-    if batch.new_run_snapshot.is_some() && batch.snapshot_update.is_some() {
+    if batch.create_run.is_some() && batch.snapshot_update.is_some() {
         return Err(CoreError::Validation {
             code: "ambiguous_snapshot_mutation",
             message: "one command cannot create and update a run snapshot".to_owned(),
+        });
+    }
+    if batch.create_run.is_some() && !batch.pending_events.is_empty() {
+        return Err(CoreError::Validation {
+            code: "run_creation_events_outside_command",
+            message: "Run creation lifecycle events must be carried by CreateRunCommand".to_owned(),
         });
     }
 
@@ -449,16 +604,18 @@ fn commit_command_on_connection(
     if let Some(task) = &batch.new_task {
         insert_task(&transaction, task)?;
     }
-    if let Some(snapshot) = &batch.new_run_snapshot {
-        insert_run(&transaction, snapshot)?;
+    if let Some(command) = &batch.create_run {
+        insert_run(&transaction, command.snapshot())?;
+        insert_run_provider_binding(&transaction, command.provider_binding())?;
     }
     if let Some(metadata) = &batch.new_artifact {
         insert_artifact(&transaction, metadata)?;
     }
 
-    match (&batch.new_run_snapshot, &batch.snapshot_update) {
-        (Some(snapshot), None) => {
-            let mut events = batch.pending_events;
+    match (&batch.create_run, &batch.snapshot_update) {
+        (Some(command), None) => {
+            let snapshot = command.snapshot();
+            let mut events = command.initial_events().to_vec();
             events.push(projection_event(snapshot));
             insert_events(&transaction, &snapshot.run_id, events)?;
         }

@@ -287,7 +287,7 @@ fn help_lines() -> Text<'static> {
         Line::from("Commands"),
         Line::from("/new · /tasks · /task new TEXT · /resume TASK_ID · /cancel RUN_ID"),
         Line::from("/metrics · /query · /checks · /artifact [ARTIFACT_ID] · /sql · /details"),
-        Line::from("/export ARTIFACT_ID json|csv|markdown · /doctor · /theme · /quit"),
+        Line::from("/export ARTIFACT_ID json|csv|markdown · /doctor · /providers · /theme · /quit"),
     ])
 }
 

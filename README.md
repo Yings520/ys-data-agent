@@ -35,10 +35,10 @@ A suitable v0.2 Pilot has:
 - one queryable SQLite or PostgreSQL source;
 - a database-enforced least-privilege read-only identity;
 - an owner for metric meaning, timezone, Freshness, and sensitivity policy;
-- an OpenAI-compatible model endpoint with Tool Calls, Tool Call IDs, multi-turn Tool Result messages, and a known context limit;
+- a Provider Profile validated through the TUI for Tool Calls, Tool Call IDs, multi-turn Tool Result messages, and a known context limit;
 - local owner-only storage for Runtime state and Artifacts.
 
-Run `ysda doctor` before the first query. Doctor checks the configured path to a trusted answer and prints safe repair instructions. Its model check makes two small synthetic calls once per process: first a harmless Tool Call, then a Tool Result continuation using the provider's original call ID. The probe contains no business data, is cached for the life of the process, and never prints credential values. An invalid or unreachable response produces the `model_protocol_incompatible` blocker and disables query submission.
+Run `ysda doctor` before the first query. Doctor checks the configured Query path plus the active Provider Profile's persisted validation, credential state, native Vault protection, and credential journal. It prints safe repair instructions, never exposes credential values, and disables query submission until the active Profile is ready.
 
 ## Task-centric architecture
 
@@ -140,9 +140,6 @@ rtk cp .env.example .env
 Edit `.env` locally. Never commit it. Required keys are:
 
 ```text
-YSDA_LLM_BASE_URL
-YSDA_LLM_API_KEY
-YSDA_LLM_MODEL
 YSDA_DATA_SOURCE_KIND
 YSDA_DATA_SOURCE_ID
 YSDA_DATA_SOURCE_URL or YSDA_SQLITE_PATH
@@ -157,7 +154,7 @@ YSDA_QUERY_MAX_ESTIMATED_COST_UNITS (optional; Connector must support preflight 
 YSDA_ARTIFACT_RETENTION_DAYS
 ```
 
-An OpenAI-compatible provider must support Tool Calls, Tool Call IDs, multi-turn Tool Result messages, and a known context limit.
+Configure credentials and select a model through `/providers`; a Profile must pass validation for Tool Calls, Tool Call IDs, multi-turn Tool Result messages, and a known context limit before activation.
 
 `YSDA_QUERY_MAX_ESTIMATED_COST_UNITS` is optional. When set to a positive integer, it is enforced by connectors that provide preflight cost estimates. `YSDA_ARTIFACT_RETENTION_DAYS` is required and must be a positive integer; it controls expiry for day-retained clarification evidence and exported Artifacts. Invalid values fail bootstrap instead of silently falling back.
 
@@ -273,10 +270,9 @@ The gate uses Fake, Replay, or Wiremock model providers, including a focused two
 
 ## Agentic development workflow
 
-For the complete step-by-step operating guide—including which commands belong in
-the Codex chat versus the terminal, approval checkpoints, Ralph recovery, and a
-copyable example—see
-[BMAD + cc-sdd + Ralph TUI 使用手册](docs/BMAD-CC-SDD-RALPH-USAGE.md).
+For the complete step-by-step operating guide—including approval checkpoints,
+direct Feature execution, resumability, and a copyable example—see
+[BMAD + cc-sdd 使用手册](docs/BMAD-CC-SDD-USAGE.md).
 
 [`docs/PRD.md`](docs/PRD.md) is the single project-wide product, stable architecture, and evolution design for ys-data-agent. Every Change is routed by impact:
 
@@ -287,9 +283,9 @@ Change
   ├── small change → direct Code Agent → code + test + review + fresh verification
   └── Feature      → cc-sdd requirements.md → design.md → tasks.md
                                       ↓
-                                  Ralph TUI
+                              $kiro-impl <feature>
                                       ↓
-                              one-task Code Agent Loop
+                       dependency-ordered task loop
 ```
 
 Use BMAD only when project-wide product intent, stable architecture, release boundaries, or evolution direction changes:
@@ -307,15 +303,15 @@ $kiro-spec-design <feature>
 $kiro-spec-tasks <feature>
 ```
 
-Human-review each document in order and record its approval in `spec.json`. Start Ralph only after task approval:
+Human-review each document in order and record its approval in `spec.json`. Start direct implementation only after task approval:
 
-```bash
-rtk ./scripts/ralph-cc-sdd.sh <feature>
+```text
+$kiro-impl <feature>
 ```
 
-`docs/PRD.md` is the project-design source of truth. A Feature keeps only `requirements.md`, `design.md`, and `tasks.md` as human-maintained engineering documents; `spec.json` stores approval state. Feature requirements never move into the project PRD. The launcher compiles authoritative `tasks.md` into `.ralph-tui/generated/<feature>.json`, which is disposable and must not be edited. Ralph invokes `$run-cc-sdd-task` for exactly one task per iteration. A task completes only after scoped implementation, tests, independent review, and fresh verification. The final `VALIDATE` item runs Feature-level validation; a human accepts the outcome against `docs/PRD.md` and the approved Feature spec before merge or release.
+`docs/PRD.md` is the project-design source of truth. A Feature keeps only `requirements.md`, `design.md`, and `tasks.md` as human-maintained engineering documents; `spec.json` stores approval state. Feature requirements never move into the project PRD. `$kiro-impl` reads the authoritative dependency graph directly, completes one task through TDD, independent review, fresh verification, commit and push, and then continues with the next eligible task. All task commits reuse one Draft Feature PR. Final validation may mark it Ready but never merges it; a human accepts the outcome against `docs/PRD.md` and the approved Feature spec before merge or release.
 
-A small change that preserves product behavior, public contracts, persistent state, and responsibility boundaries goes directly to a bounded Code Agent. It creates no BMAD or cc-sdd documents and does not start Ralph, but still closes with tests, diff review, and fresh verification.
+A small change that preserves product behavior, public contracts, persistent state, and responsibility boundaries goes directly to a bounded Code Agent. It creates no BMAD or cc-sdd documents and does not invoke `$kiro-impl`, but still closes with tests, diff review, and fresh verification.
 
 ## Recovery promise
 

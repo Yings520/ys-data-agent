@@ -93,6 +93,11 @@ impl SlashPalette {
                 requires_arguments: false,
             },
             CommandSpec {
+                name: "providers",
+                description: "manage Provider Profiles",
+                requires_arguments: false,
+            },
+            CommandSpec {
                 name: "model",
                 description: "show provider and model",
                 requires_arguments: false,

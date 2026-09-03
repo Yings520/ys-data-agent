@@ -73,8 +73,8 @@ For **Validate**, report `READY` or `NEEDS_REVISION` with concrete findings. Do 
 
 Do not send every Change through cc-sdd. Classify it after checking whether it alters `docs/PRD.md`:
 
-- **Small change:** product scope unchanged, no new user-visible capability, no public contract or persistent-state change, one responsibility boundary, and safely completable in one bounded Agent session. Route directly to a Code Agent with scoped tests, review, and fresh verification. BMAD, cc-sdd documents, and Ralph are unnecessary.
-- **Feature:** new or materially changed user behavior, public contract, persistent state, cross-boundary integration, or multiple independently verifiable tasks. Route through cc-sdd and Ralph. Do not invoke BMAD unless the Feature also changes one of the four project-level facts above.
+- **Small change:** product scope unchanged, no new user-visible capability, no public contract or persistent-state change, one responsibility boundary, and safely completable in one bounded Agent session. Route directly to a Code Agent with scoped tests, review, and fresh verification. BMAD, cc-sdd documents, and `$kiro-impl` are unnecessary.
+- **Feature:** new or materially changed user behavior, public contract, persistent state, cross-boundary integration, or multiple independently verifiable tasks. Route through cc-sdd, then execute approved tasks with `$kiro-impl`. Do not invoke BMAD unless the Feature also changes one of the four project-level facts above.
 
 For a new Feature that does not require a project-level update, provide the next command immediately:
 

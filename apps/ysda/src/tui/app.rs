@@ -1,11 +1,14 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use tokio::task::JoinHandle;
 
 use ys_agent_core::{
-    ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, CommandId, EventEnvelope,
-    ExportFormat, Principal, RunEventKind, RunId, RunStatus, Sensitivity, SessionId, StepId,
-    TaskId, WorkspaceId,
+    ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, CommandId, CredentialGeneration,
+    CredentialKind, CredentialMutation, CredentialMutationIntent, CredentialMutationRequest,
+    EventEnvelope, ExportFormat, OperationId, Principal, ProfileId, ProfileName, ProfileRevision,
+    ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode, ProviderField,
+    ProviderId, ProviderManagementError, ProviderRemediation, RunEventKind, RunId, RunStatus,
+    SaveProfileRequest, SaveProfileRevision, Sensitivity, SessionId, StepId, TaskId, WorkspaceId,
 };
 use ys_agent_runtime::{
     AgentServiceApi, CreateTaskRequest, EventSubscription, QueryArtifact, SendMessageRequest,
@@ -14,8 +17,13 @@ use ys_agent_runtime::{
 
 use super::input::{DetailRequest, InputAction};
 use super::{
+    AsyncOperationRegistry, ProviderOperationCompletion, ProviderOperationPolicy,
     composer::ComposerState,
     palette::SlashPalette,
+    provider_management::{
+        ProviderManagementScreen, ProviderManagementScreenView, ProviderManagementStep,
+        ProviderManagementView, ProviderOperationKind, ProviderProfileView, ProviderResultOutcome,
+    },
     theme::{ThemeRegistry, UiPreferences, YsdaTheme},
 };
 
@@ -36,6 +44,7 @@ pub enum DetailKind {
     Diagnostics,
     Tasks,
     Connections,
+    Providers,
     Model,
 }
 
@@ -282,6 +291,8 @@ pub struct TuiController {
     subscription: Option<EventSubscription>,
     pending_command_id: Option<CommandId>,
     pending_submission: Option<JoinHandle<ys_agent_core::CoreResult<SubmissionCompletion>>>,
+    provider_screen: Option<ProviderManagementScreen>,
+    provider_operations: AsyncOperationRegistry<ProviderOperationPayload>,
 }
 
 pub(super) enum SubmissionCompletion {
@@ -290,6 +301,16 @@ pub(super) enum SubmissionCompletion {
         reply: ServiceReply,
     },
     ClarificationAnswered,
+}
+
+pub(super) enum ProviderOperationPayload {
+    Discovery(Vec<ys_agent_core::DiscoveredModel>),
+    Saved {
+        browse: ProviderManagementView,
+        profile_id: ProfileId,
+        resume_step: ProviderManagementStep,
+    },
+    Committed(ProviderManagementView),
 }
 
 impl TuiController {
@@ -308,11 +329,331 @@ impl TuiController {
             subscription: None,
             pending_command_id: None,
             pending_submission: None,
+            provider_screen: None,
+            provider_operations: AsyncOperationRegistry::new(
+                ProviderOperationPolicy::new(Duration::from_secs(30), 2)
+                    .expect("fixed Provider operation policy is valid"),
+            ),
         }
     }
 
     pub fn submission_in_flight(&self) -> bool {
         self.pending_submission.is_some()
+    }
+
+    pub fn provider_operation_in_flight(&self) -> bool {
+        self.provider_operations.active_count() > 0
+    }
+
+    /// Schedules a Provider operation outside the render loop. The reducer owns the operation ID
+    /// and receives only its committed result; all data access remains behind `AgentServiceApi`.
+    pub fn start_provider_operation(
+        &mut self,
+        kind: ProviderOperationKind,
+    ) -> ys_agent_core::CoreResult<OperationId> {
+        let (command, secret, resume_step) = {
+            let screen = self.provider_screen.as_mut().ok_or_else(|| {
+                ys_agent_core::CoreError::validation(
+                    "provider_screen_not_open",
+                    "Open /providers before starting a Provider operation",
+                )
+            })?;
+            let command = screen.edit_command().ok_or_else(|| {
+                ys_agent_core::CoreError::validation(
+                    "provider_edit_incomplete",
+                    "Complete the Provider edit fields before starting an operation",
+                )
+            })?;
+            let secret = (kind == ProviderOperationKind::SaveDraft)
+                .then(|| screen.take_secret_input())
+                .flatten();
+            (command, secret, screen.view().step)
+        };
+        let profile_id = command.profile_id;
+        if kind != ProviderOperationKind::SaveDraft && profile_id.is_none() {
+            return Err(ys_agent_core::CoreError::validation(
+                "provider_profile_not_persisted",
+                "Save the Provider Draft before discovery, validation, OAuth, or activation",
+            ));
+        }
+        let resume_step = resume_step.ok_or_else(|| {
+            ys_agent_core::CoreError::validation(
+                "provider_operation_not_requested",
+                "The current Provider screen state does not allow this operation",
+            )
+        })?;
+        let service = self.service.clone();
+        let mut secret = secret;
+        let operation_id = self
+            .provider_operations
+            .start(kind, move |operation_id, _| {
+                let service = service.clone();
+                let command = command.clone();
+                let secret = secret.take();
+                async move {
+                    let payload = match kind {
+                        ProviderOperationKind::DiscoverModels => {
+                            let profile_id =
+                                profile_id.expect("non-save operations require a Profile");
+                            let detail = service.provider_load_profile(profile_id).await?;
+                            let generation = detail.credential_generation.ok_or_else(|| {
+                                ys_agent_core::ProviderManagementError::new(
+                                    ys_agent_core::ProviderErrorCode::CredentialMissing,
+                                    Some(ys_agent_core::ProviderField::Credential),
+                                    ys_agent_core::ProviderRemediation::ConfigureCredentialStore,
+                                )
+                            })?;
+                            let models = service
+                                .provider_discover_models(ys_agent_core::DiscoverModelsRequest {
+                                    operation_id,
+                                    profile_id,
+                                    profile_revision: detail.revision,
+                                    provider: command.provider,
+                                    credential_generation: generation,
+                                })
+                                .await?;
+                            ProviderOperationPayload::Discovery(models)
+                        }
+                        ProviderOperationKind::Validate => {
+                            let profile_id =
+                                profile_id.expect("non-save operations require a Profile");
+                            let detail = service.provider_load_profile(profile_id).await?;
+                            service
+                                .provider_validate(ys_agent_core::ValidateProfileRequest {
+                                    operation_id,
+                                    profile_id,
+                                    revision: detail.revision,
+                                    observed_context_limit: command.observed_context_limit,
+                                })
+                                .await?;
+                            ProviderOperationPayload::Committed(
+                                load_provider_management_view(service.as_ref()).await?,
+                            )
+                        }
+                        ProviderOperationKind::Activate => {
+                            let profile_id =
+                                profile_id.expect("non-save operations require a Profile");
+                            service
+                                .provider_activate_current(profile_id, operation_id)
+                                .await?;
+                            ProviderOperationPayload::Committed(
+                                load_provider_management_view(service.as_ref()).await?,
+                            )
+                        }
+                        ProviderOperationKind::OAuth => {
+                            let profile_id =
+                                profile_id.expect("non-save operations require a Profile");
+                            service
+                                .provider_start_oauth(profile_id, operation_id)
+                                .await?;
+                            ProviderOperationPayload::Committed(
+                                load_provider_management_view(service.as_ref()).await?,
+                            )
+                        }
+                        ProviderOperationKind::SaveDraft => {
+                            let detail = save_provider_draft(
+                                service.as_ref(),
+                                command,
+                                secret,
+                                operation_id,
+                                resume_step,
+                            )
+                            .await?;
+                            ProviderOperationPayload::Saved {
+                                browse: load_provider_management_view(service.as_ref()).await?,
+                                profile_id: detail.summary.profile_id,
+                                resume_step,
+                            }
+                        }
+                    };
+                    Ok(payload)
+                }
+            });
+        let screen = self
+            .provider_screen
+            .as_mut()
+            .expect("screen was present while scheduling operation");
+        if !screen.start_operation(operation_id, kind) {
+            let _ = self.provider_operations.cancel(operation_id);
+            return Err(ys_agent_core::CoreError::validation(
+                "provider_operation_not_requested",
+                "The current Provider screen state does not allow this operation",
+            ));
+        }
+        Ok(operation_id)
+    }
+
+    pub fn advance_provider_step(&mut self, app: &mut TuiApp) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let advanced = screen.next_step();
+        if advanced {
+            refresh_provider_detail(app, screen);
+        }
+        advanced
+    }
+
+    pub(super) fn provider_screen_view(&self) -> Option<ProviderManagementScreenView> {
+        self.provider_screen
+            .as_ref()
+            .map(ProviderManagementScreen::view)
+    }
+
+    pub(super) fn start_provider_draft(&mut self, app: &mut TuiApp) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let sequence = screen.view().browse.profiles.len().saturating_add(1);
+        let started = screen.start_create(format!("Provider Profile {sequence}"));
+        if started {
+            refresh_provider_detail(app, screen);
+        }
+        started
+    }
+
+    pub(super) fn select_provider_for_draft(
+        &mut self,
+        app: &mut TuiApp,
+        provider: ProviderId,
+    ) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let selected = screen.select_provider(provider);
+        if selected {
+            refresh_provider_detail(app, screen);
+        }
+        selected
+    }
+
+    pub(super) fn select_provider_authentication(
+        &mut self,
+        app: &mut TuiApp,
+        authentication: super::provider_management::ProviderAuthentication,
+    ) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let selected = screen.select_authentication(authentication);
+        if selected {
+            refresh_provider_detail(app, screen);
+        }
+        selected
+    }
+
+    pub(super) fn append_provider_text(&mut self, app: &mut TuiApp, character: char) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let changed = match screen.view().step {
+            Some(ProviderManagementStep::Authentication) => {
+                screen.append_secret_character(character)
+            }
+            Some(ProviderManagementStep::Model) => screen.append_manual_model_character(character),
+            _ => false,
+        };
+        if changed {
+            refresh_provider_detail(app, screen);
+        }
+        changed
+    }
+
+    pub(super) fn delete_provider_text(&mut self, app: &mut TuiApp) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let changed = match screen.view().step {
+            Some(ProviderManagementStep::Authentication) => screen.delete_secret_character(),
+            Some(ProviderManagementStep::Model) => screen.delete_manual_model_character(),
+            _ => false,
+        };
+        if changed {
+            refresh_provider_detail(app, screen);
+        }
+        changed
+    }
+
+    pub fn request_provider_activation(&mut self) -> ys_agent_core::CoreResult<OperationId> {
+        let screen = self.provider_screen.as_mut().ok_or_else(|| {
+            ys_agent_core::CoreError::validation(
+                "provider_screen_not_open",
+                "Open /providers before activating a Provider",
+            )
+        })?;
+        if !screen.request_activation() || screen.confirm_activation().is_none() {
+            return Err(ys_agent_core::CoreError::validation(
+                "provider_activation_not_ready",
+                "Validate the current Provider revision before activation",
+            ));
+        }
+        self.start_provider_operation(ProviderOperationKind::Activate)
+    }
+
+    pub fn retry_provider_operation(&mut self) -> ys_agent_core::CoreResult<Option<OperationId>> {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return Ok(None);
+        };
+        let Some(request) = screen.retry() else {
+            return Ok(None);
+        };
+        let super::provider_management::ProviderScreenRequest::Operation(kind) = request;
+        self.start_provider_operation(kind).map(Some)
+    }
+
+    pub(super) fn take_ready_provider_operation(
+        &mut self,
+    ) -> Option<ProviderOperationCompletion<ProviderOperationPayload>> {
+        self.provider_operations.try_next_completion()
+    }
+
+    pub(super) fn apply_provider_operation(
+        &mut self,
+        app: &mut TuiApp,
+        completion: ProviderOperationCompletion<ProviderOperationPayload>,
+    ) {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return;
+        };
+        match completion.result {
+            Ok(ProviderOperationPayload::Discovery(models)) => {
+                let _ = screen.complete_discovery(completion.operation_id, models);
+            }
+            Ok(ProviderOperationPayload::Saved {
+                browse,
+                profile_id,
+                resume_step,
+            }) => {
+                let _ =
+                    screen.complete_saved_draft(completion.operation_id, profile_id, resume_step);
+                screen.replace_browse(browse);
+                app.set_runtime_status("Provider Draft saved; run Validate before activation");
+            }
+            Ok(ProviderOperationPayload::Committed(browse)) => {
+                let _ = screen
+                    .complete_operation(completion.operation_id, ProviderResultOutcome::Succeeded);
+                screen.replace_browse(browse);
+            }
+            Err(error) => {
+                let _ = screen.complete_operation(
+                    completion.operation_id,
+                    ProviderResultOutcome::Failed(error),
+                );
+            }
+        }
+        refresh_provider_detail(app, screen);
+    }
+
+    pub async fn cancel_provider_operation(&mut self, app: &mut TuiApp) {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return;
+        };
+        let Some(operation_id) = screen.cancel_busy() else {
+            return;
+        };
+        let _ = self.provider_operations.cancel(operation_id);
+        let _ = self.service.cancel_provider_operation(operation_id).await;
+        refresh_provider_detail(app, screen);
     }
 
     pub(super) async fn take_ready_submission(
@@ -433,13 +774,8 @@ impl TuiController {
                     )],
                 },
             ),
-            InputAction::Model => app.show_detail(
-                DetailKind::Model,
-                DetailView {
-                    title: "Model".to_owned(),
-                    lines: vec![app.model_label.clone()],
-                },
-            ),
+            InputAction::Providers => self.open_provider_management(app, false).await?,
+            InputAction::Model => self.open_provider_management(app, true).await?,
             InputAction::Doctor => {
                 let report = self.service.doctor().await?;
                 app.transient =
@@ -511,6 +847,72 @@ impl TuiController {
                 lines,
             },
         );
+        Ok(())
+    }
+
+    /// Loads only masked, local Provider-management views through `AgentServiceApi`. No TUI path
+    /// receives a repository, Vault, discovery client, or raw credential. `/model` calls this
+    /// same route and advances the one reducer to its Model step instead of opening legacy UI.
+    async fn open_provider_management(
+        &mut self,
+        app: &mut TuiApp,
+        open_model_step: bool,
+    ) -> ys_agent_core::CoreResult<()> {
+        let catalog = self
+            .service
+            .provider_catalog()
+            .await
+            .map_err(provider_to_core)?;
+        let active = self
+            .service
+            .provider_active()
+            .await
+            .map_err(provider_to_core)?;
+        let summaries = self
+            .service
+            .provider_list_profiles()
+            .await
+            .map_err(provider_to_core)?;
+        let mut profiles = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            let detail = self
+                .service
+                .provider_load_profile(summary.profile_id)
+                .await
+                .map_err(provider_to_core)?;
+            profiles.push(ProviderProfileView::from_detail(detail, None));
+        }
+        let browse = ProviderManagementView::new(catalog, profiles, active, false);
+        let mut screen = ProviderManagementScreen::new(browse);
+        if open_model_step {
+            let view = screen.view();
+            let profile = view
+                .browse
+                .active
+                .as_ref()
+                .and_then(|active| {
+                    view.browse.profiles.iter().find(|profile| {
+                        profile.profile_id == active.profile_id
+                            && profile.revision == active.profile_revision
+                    })
+                })
+                .or_else(|| view.browse.profiles.first());
+            if let Some(profile) = profile
+                && screen.start_edit(profile)
+            {
+                let _ = screen.next_step();
+                let _ = screen.next_step();
+            }
+        }
+        let view = screen.view();
+        app.show_detail(
+            DetailKind::Providers,
+            DetailView {
+                title: "Provider management".to_owned(),
+                lines: provider_management_lines(&view),
+            },
+        );
+        self.provider_screen = Some(screen);
         Ok(())
     }
 
@@ -1025,6 +1427,239 @@ impl TuiController {
     }
 }
 
+fn provider_management_lines(
+    view: &super::provider_management::ProviderManagementScreenView,
+) -> Vec<String> {
+    let mut lines = match &view.browse.active {
+        Some(active) => vec![format!(
+            "Active · {:?} · {} · {}",
+            active.provider,
+            active.model.as_str(),
+            active.profile_revision
+        )],
+        None => vec!["No active Provider Profile".to_owned()],
+    };
+    lines.extend(view.browse.profiles.iter().map(|profile| {
+        let marker = if profile.is_active { "active" } else { "saved" };
+        format!(
+            "{marker} · {} · {:?} · {} · {:?} · {:?}",
+            profile.name,
+            profile.provider,
+            profile.model.as_str(),
+            profile.state,
+            profile.credential_status,
+        )
+    }));
+    if view.browse.profiles.is_empty() {
+        lines.push(
+            "Create a Profile to configure Provider, authentication, model, and validation"
+                .to_owned(),
+        );
+    }
+    if let Some(step) = view.step {
+        lines.push(format!("Editing step · {step:?}"));
+    }
+    if let Some(edit) = &view.edit {
+        lines.push(format!("Draft · {} · {:?}", edit.name, edit.provider));
+        lines.push(format!(
+            "Authentication · {:?} · credential {}",
+            edit.authentication,
+            edit.credential_mask.unwrap_or("not entered")
+        ));
+        lines.push(format!(
+            "Model · {} · parameters {:?}",
+            edit.model
+                .as_ref()
+                .map_or("not selected", ys_agent_core::ProviderModelId::as_str),
+            edit.parameters,
+        ));
+    }
+    if let Some(busy) = &view.busy {
+        lines.push(format!("Operation in progress · {:?}", busy.kind));
+    }
+    if let Some(result) = &view.result
+        && let ProviderResultOutcome::Failed(error) = &result.outcome
+    {
+        lines.push(format!(
+            "Provider field error · {} · {:?}",
+            error.code(),
+            error.field()
+        ));
+        lines.push(format!("Remediation · {:?}", error.remediation()));
+    }
+    lines.push(
+        "Keys: n new · 1-9 Provider · k API key · o OAuth · Enter next · s save Draft · v validate · a activate · Esc cancel"
+            .to_owned(),
+    );
+    lines
+}
+
+fn refresh_provider_detail(app: &mut TuiApp, screen: &ProviderManagementScreen) {
+    let view = screen.view();
+    app.show_detail(
+        DetailKind::Providers,
+        DetailView {
+            title: "Provider management".to_owned(),
+            lines: provider_management_lines(&view),
+        },
+    );
+}
+
+async fn load_provider_management_view(
+    service: &dyn AgentServiceApi,
+) -> ys_agent_core::ProviderResult<ProviderManagementView> {
+    let catalog = service.provider_catalog().await?;
+    let active = service.provider_active().await?;
+    let summaries = service.provider_list_profiles().await?;
+    let mut profiles = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let detail = service.provider_load_profile(summary.profile_id).await?;
+        profiles.push(ProviderProfileView::from_detail(detail, None));
+    }
+    Ok(ProviderManagementView::new(
+        catalog, profiles, active, false,
+    ))
+}
+
+/// Saves one reducer edit through the application boundary. New and changed profiles are first
+/// persisted as Draft so validation can bind its evidence to an immutable revision. A supplied
+/// API key moves directly into the protected credential command and is never retained by the
+/// screen, view, or retry closure.
+async fn save_provider_draft(
+    service: &dyn AgentServiceApi,
+    command: super::provider_management::ProviderEditCommand,
+    secret: Option<ys_agent_core::SecretValue>,
+    operation_id: OperationId,
+    resume_step: ProviderManagementStep,
+) -> ys_agent_core::ProviderResult<ys_agent_core::ProfileDetail> {
+    let required_kind = command.provider.required_credential_kind();
+    let selected_kind = match command.authentication {
+        super::provider_management::ProviderAuthentication::ApiKey => CredentialKind::ApiKey,
+        super::provider_management::ProviderAuthentication::OAuth => {
+            CredentialKind::OAuthConnection
+        }
+    };
+    if selected_kind != required_kind {
+        return Err(provider_edit_error(
+            ProviderErrorCode::AuthenticationInvalid,
+            ProviderField::Credential,
+        ));
+    }
+
+    // Validation already committed the exact revision used by activation. Its later Save Draft
+    // button is an explicit acknowledgement, not a second write that would invalidate evidence.
+    if resume_step == ProviderManagementStep::SaveActivate
+        && secret.is_none()
+        && let Some(profile_id) = command.profile_id
+    {
+        return service.provider_load_profile(profile_id).await;
+    }
+
+    let existing = match command.profile_id {
+        Some(profile_id) => Some(service.provider_load_profile(profile_id).await?),
+        None => None,
+    };
+    let profile_id = existing
+        .as_ref()
+        .map(|detail| detail.summary.profile_id)
+        .unwrap_or_else(ProfileId::new);
+    let expected_current_revision = existing.as_ref().map(|detail| detail.revision);
+    let revision_number = expected_current_revision
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| provider_edit_error(ProviderErrorCode::Internal, ProviderField::Provider))?;
+    let carried_generation = existing.as_ref().and_then(|detail| {
+        (detail.summary.provider == command.provider)
+            .then_some(detail.credential_generation)
+            .flatten()
+    });
+    let name = ProfileName::new(command.name).map_err(|_| {
+        provider_edit_error(
+            ProviderErrorCode::ProfileNameConflict,
+            ProviderField::ProfileName,
+        )
+    })?;
+    let revision = ProfileRevision::draft(
+        profile_id,
+        revision_number,
+        command.provider,
+        command.model,
+        command.parameters,
+        carried_generation,
+    )
+    .map_err(|_| {
+        provider_edit_error(ProviderErrorCode::InvalidModelPrefix, ProviderField::Model)
+    })?;
+    let saved = service
+        .provider_save_profile(SaveProfileRequest {
+            operation_id,
+            revision: SaveProfileRevision {
+                precondition: ys_agent_core::RevisionPrecondition {
+                    profile_id,
+                    expected_current_revision,
+                },
+                name,
+                revision,
+            },
+        })
+        .await?;
+
+    let Some(secret) = secret else {
+        return Ok(saved);
+    };
+    if required_kind != CredentialKind::ApiKey {
+        return Err(provider_edit_error(
+            ProviderErrorCode::OAuthNotConnected,
+            ProviderField::OAuth,
+        ));
+    }
+    let old_generation = saved.credential_generation;
+    let generation_number = old_generation
+        .map(CredentialGeneration::number)
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            provider_edit_error(ProviderErrorCode::Internal, ProviderField::Credential)
+        })?;
+    let generation =
+        CredentialGeneration::new(profile_id, generation_number, CredentialKind::ApiKey).map_err(
+            |_| provider_edit_error(ProviderErrorCode::Internal, ProviderField::Credential),
+        )?;
+    let intent = match old_generation {
+        Some(old_generation) => CredentialMutationIntent::replace(
+            operation_id,
+            profile_id,
+            saved.revision,
+            old_generation,
+            generation,
+        ),
+        None => {
+            CredentialMutationIntent::create(operation_id, profile_id, saved.revision, generation)
+        }
+    }
+    .map_err(|_| provider_edit_error(ProviderErrorCode::Internal, ProviderField::Credential))?;
+    service
+        .provider_mutate_credential(CredentialMutationRequest {
+            intent,
+            mutation: CredentialMutation::Replace(ProtectedCredentialWrite {
+                reference: ProviderCredentialReference {
+                    profile_id,
+                    generation,
+                },
+                secret,
+            }),
+        })
+        .await
+}
+
+fn provider_edit_error(code: ProviderErrorCode, field: ProviderField) -> ProviderManagementError {
+    ProviderManagementError::new(code, Some(field), ProviderRemediation::ReturnToEdit)
+}
+
+fn provider_to_core(error: ys_agent_core::ProviderManagementError) -> ys_agent_core::CoreError {
+    ys_agent_core::CoreError::validation(error.code(), error.code())
+}
+
 impl Drop for TuiController {
     fn drop(&mut self) {
         if let Some(handle) = self.pending_submission.take() {
@@ -1076,4 +1711,142 @@ fn user_readable_run_failure(snapshot: &ys_agent_core::RunSnapshot) -> String {
     format!(
         "What happened: {what_happened}. Required action: {required_action}. Use /details for retry and Evidence diagnostics."
     )
+}
+
+#[cfg(test)]
+mod provider_management_tests {
+    use std::sync::Arc;
+
+    use ys_agent_adapters::{
+        credential::keyring::InMemoryCredentialVault,
+        model::{discovery::LiterModelDiscovery, liter::LiterProviderFactory},
+    };
+    use ys_agent_core::{
+        CredentialKind, ProfileId, ProfileName, ProfileRevision, ProviderCatalogView, ProviderId,
+        ProviderProfileRepository, ProviderSupportStatus, RevisionPrecondition,
+        RunProviderBindingRepository, SaveProfileRevision, WorkspaceId,
+    };
+    use ys_agent_runtime::{
+        InProcessAgentService, NoopRunScheduler,
+        provider::{
+            api::InProcessProviderManagementApi,
+            catalog::GovernedProviderCatalog,
+            service::{CredentialService, ProviderManagementService},
+        },
+    };
+    use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
+
+    use super::*;
+
+    fn catalog_views() -> Vec<ProviderCatalogView> {
+        ProviderId::ALL
+            .into_iter()
+            .map(|provider| ProviderCatalogView {
+                provider,
+                display_name: format!("{provider:?}"),
+                credential_kind: provider.required_credential_kind(),
+                support_status: ProviderSupportStatus::Candidate,
+                evidence_gaps: vec!["evidence_pending".to_owned()],
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn providers_and_legacy_model_use_one_masked_service_route() {
+        let directory = tempfile::tempdir().expect("temporary runtime directory");
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("open runtime store"),
+        );
+        let profile_id = ProfileId::new();
+        let repository = store.provider_repository();
+        repository
+            .save_revision(SaveProfileRevision {
+                precondition: RevisionPrecondition {
+                    profile_id,
+                    expected_current_revision: None,
+                },
+                name: ProfileName::new("TUI managed Profile").expect("valid Profile name"),
+                revision: ProfileRevision::draft(
+                    profile_id,
+                    1,
+                    ProviderId::DeepSeek,
+                    ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/tui")
+                        .expect("valid governed model"),
+                    ys_agent_core::ProviderParameters::default(),
+                    None,
+                )
+                .expect("valid Draft"),
+            })
+            .await
+            .expect("persist Draft");
+        let profiles: Arc<dyn ProviderProfileRepository> = Arc::new(repository);
+        let run_bindings: Arc<dyn RunProviderBindingRepository> =
+            Arc::new(store.run_binding_repository());
+        let vault = Arc::new(InMemoryCredentialVault::new());
+        let lifecycle = Arc::new(ProviderManagementService::new(profiles.clone()));
+        let credentials = Arc::new(CredentialService::new(
+            profiles.clone(),
+            run_bindings.clone(),
+            vault.clone(),
+        ));
+        let provider_api = Arc::new(InProcessProviderManagementApi::new(
+            GovernedProviderCatalog::default(),
+            catalog_views(),
+            profiles,
+            vault,
+            run_bindings,
+            lifecycle,
+            credentials,
+            Arc::new(LiterModelDiscovery::new()),
+            Arc::new(LiterProviderFactory::new()),
+        ));
+        let workspace_id = WorkspaceId::new();
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let service = Arc::new(
+            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_provider_management_api(provider_api),
+        );
+        let principal = Principal::local_operator("tui-provider-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+
+        controller
+            .apply(&mut app, InputAction::Providers)
+            .await
+            .expect("Provider manager opens through AgentServiceApi");
+        assert_eq!(
+            app.transient,
+            Some(TransientView::Detail(DetailKind::Providers))
+        );
+        assert!(
+            app.detail
+                .as_ref()
+                .expect("Provider detail")
+                .lines
+                .iter()
+                .any(|line| line.contains("TUI managed Profile"))
+        );
+
+        controller
+            .apply(&mut app, InputAction::Model)
+            .await
+            .expect("legacy model command reuses Provider manager");
+        let detail = app.detail.expect("same Provider detail");
+        assert_eq!(detail.title, "Provider management");
+        assert!(
+            detail
+                .lines
+                .iter()
+                .any(|line| line.contains("Editing step · Model"))
+        );
+        assert!(!format!("{detail:?}").contains("api_key"));
+        assert_eq!(
+            CredentialKind::ApiKey,
+            ProviderId::DeepSeek.required_credential_kind()
+        );
+    }
 }

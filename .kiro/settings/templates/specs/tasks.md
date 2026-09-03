@@ -21,8 +21,8 @@ Use whichever pattern fits the work breakdown:
   - _Boundary: {{FILE_OR_COMPONENT_BOUNDARIES}}_
   - _Depends: {{TASK_IDS_OR_NONE}}_ *(Use `none` when the task has no prerequisites.)*
 
-> **Ralph dispatch contract**: Every executable task must carry `_Requirements:_`, `_Boundary:_`, `_Depends:_`, and at least one observable completion bullet. These fields are machine-checked before Ralph starts. A task without them is not dispatchable.
+> **Direct execution contract**: Every executable task must carry `_Requirements:_`, `_Boundary:_`, `_Depends:_`, and at least one observable completion bullet. These fields are machine-checked before `$kiro-impl` starts. A task without them is not executable.
 
 > **Parallel marker**: Append ` (P)` only to tasks that can be executed in parallel. Omit the marker when running in `--sequential` mode.
 >
-> **Optional test coverage**: When a sub-task is deferrable test work tied to acceptance criteria, mark the checkbox as `- [ ]*` and explain the referenced requirements in the detail bullets. Optional tasks still enter the Ralph projection unless explicitly removed during human task approval.
+> **Optional test coverage**: When a sub-task is deferrable test work tied to acceptance criteria, mark the checkbox as `- [ ]*` and explain the referenced requirements in the detail bullets. Optional tasks remain in the authoritative graph unless explicitly removed during human task approval.

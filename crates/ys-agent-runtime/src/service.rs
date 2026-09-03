@@ -7,12 +7,22 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use ys_agent_core::{
-    ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, ArtifactKind, ArtifactMetadata,
-    ArtifactRef, ArtifactStore, CommandId, CommandReceipt, CommandResultKind, ContextManifest,
-    CoreError, CoreResult, EventActor, EventEnvelope, ExportFormat, ModelMessage, ModelProvider,
-    ModelRequest, ModelRole, PendingRunEvent, Principal, PutArtifact, RetentionPolicy, Run,
-    RunEventKind, RunId, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore, Sensitivity,
-    Session, SessionId, Task, TaskId, WorkflowKind, WorkspaceId,
+    ActivateProfileRequest, ActiveProviderView, ArtifactAccessContext, ArtifactAccessPurpose,
+    ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore, CommandId,
+    CommandReceipt, CommandResultKind, CompatibilityEvidence, CompatibilityEvidenceView,
+    ContextManifest, CoreError, CoreResult, CredentialGeneration, CredentialKind,
+    CredentialMutationRequest, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
+    DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, EventActor, EventEnvelope,
+    ExportFormat, ModelMessage, ModelProvider, ModelRequest, ModelRole, OAuthConnectionView,
+    OperationId, PendingRunEvent, Principal, ProfileDetail, ProfileId, ProfileName,
+    ProfileRevision, ProfileRevisionRepository, ProfileSummary, ProviderCatalogView,
+    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId,
+    ProviderManagementApi, ProviderManagementError, ProviderModelId, ProviderParameters,
+    ProviderRemediation, ProviderResult, PutArtifact, RemoteRevocationOutcome, RetentionPolicy,
+    Run, RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
+    RunProviderBindingSource, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore,
+    Sensitivity, Session, SessionId, Task, TaskId, ValidateProfileRequest, ValidationVersions,
+    WorkflowKind, WorkspaceId,
 };
 
 use crate::{
@@ -24,6 +34,7 @@ use crate::{
 const DEFAULT_EVENT_CAPACITY: usize = 64;
 const ARTIFACT_PREVIEW_LIMIT: usize = 4_096;
 const DEFAULT_ARTIFACT_RETENTION_DAYS: u32 = 7;
+const ACTIVE_SNAPSHOT_RETRY_LIMIT: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateTaskRequest {
@@ -247,6 +258,154 @@ pub trait AgentServiceApi: Send + Sync {
 
     async fn doctor(&self) -> CoreResult<DoctorReport>;
 
+    /// Returns the composed Provider-management boundary when this process has been bootstrapped
+    /// for Provider management. TUI callers use only the default forwarding methods below.
+    fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
+        None
+    }
+
+    async fn provider_catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>> {
+        provider_api(self)?.catalog().await
+    }
+
+    async fn provider_list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>> {
+        provider_api(self)?.list_profiles().await
+    }
+
+    async fn provider_active(&self) -> ProviderResult<Option<ActiveProviderView>> {
+        provider_api(self)?.active_provider().await
+    }
+
+    async fn provider_load_profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail> {
+        provider_api(self)?.load_profile(profile_id).await
+    }
+
+    async fn provider_save_profile(
+        &self,
+        request: ys_agent_core::SaveProfileRequest,
+    ) -> ProviderResult<ProfileDetail> {
+        provider_api(self)?.save_profile(request).await
+    }
+
+    async fn provider_copy_profile(
+        &self,
+        source: ProfileId,
+        name: ProfileName,
+    ) -> ProviderResult<ProfileDetail> {
+        provider_api(self)?.copy_profile(source, name).await
+    }
+
+    async fn provider_mutate_credential(
+        &self,
+        request: CredentialMutationRequest,
+    ) -> ProviderResult<ProfileDetail> {
+        provider_api(self)?.mutate_credential(request).await
+    }
+
+    async fn provider_delete_profile(&self, request: DeleteProfileRequest) -> ProviderResult<()> {
+        provider_api(self)?.delete_profile(request).await
+    }
+
+    async fn provider_discover_models(
+        &self,
+        request: DiscoverModelsRequest,
+    ) -> ProviderResult<Vec<DiscoveredModel>> {
+        provider_api(self)?.discover_models(request).await
+    }
+
+    async fn provider_validate(
+        &self,
+        request: ValidateProfileRequest,
+    ) -> ProviderResult<CompatibilityEvidenceView> {
+        provider_api(self)?.validate_profile(request).await
+    }
+
+    async fn provider_activate(
+        &self,
+        request: ActivateProfileRequest,
+    ) -> ProviderResult<ActiveProviderView> {
+        provider_api(self)?.activate(request).await
+    }
+
+    async fn provider_activate_current(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<ActiveProviderView> {
+        provider_api(self)?
+            .activate_current(profile_id, operation_id)
+            .await
+    }
+
+    async fn provider_credential_status(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<CredentialViewStatus> {
+        provider_api(self)?.credential_status(profile_id).await
+    }
+
+    async fn provider_oauth_connection(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<OAuthConnectionView> {
+        provider_api(self)?.oauth_connection(profile_id).await
+    }
+
+    async fn provider_doctor(&self) -> ProviderResult<ProviderDoctorView> {
+        provider_api(self)?.doctor().await
+    }
+
+    async fn cancel_provider_operation(&self, operation_id: OperationId) -> ProviderResult<()> {
+        provider_api(self)?.cancel_operation(operation_id).await
+    }
+
+    async fn provider_start_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<DeviceAuthorizationView> {
+        provider_api(self)?
+            .start_oauth(profile_id, operation_id)
+            .await
+    }
+
+    async fn provider_complete_oauth(
+        &self,
+        operation_id: OperationId,
+    ) -> ProviderResult<OAuthConnectionView> {
+        provider_api(self)?.complete_oauth(operation_id).await
+    }
+
+    async fn provider_refresh_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<OAuthConnectionView> {
+        provider_api(self)?
+            .refresh_oauth(profile_id, operation_id)
+            .await
+    }
+
+    async fn provider_reauthorize_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<DeviceAuthorizationView> {
+        provider_api(self)?
+            .reauthorize_oauth(profile_id, operation_id)
+            .await
+    }
+
+    async fn provider_logout_oauth(
+        &self,
+        profile_id: ProfileId,
+        operation_id: OperationId,
+    ) -> ProviderResult<RemoteRevocationOutcome> {
+        provider_api(self)?
+            .logout_oauth(profile_id, operation_id)
+            .await
+    }
+
     async fn export_artifact(
         &self,
         command_id: CommandId,
@@ -254,6 +413,18 @@ pub trait AgentServiceApi: Send + Sync {
         format: ExportFormat,
         access: ArtifactAccessContext,
     ) -> CoreResult<ArtifactMetadata>;
+}
+
+fn provider_api<T: AgentServiceApi + ?Sized>(
+    service: &T,
+) -> ProviderResult<&dyn ProviderManagementApi> {
+    service.provider_management_api().ok_or_else(|| {
+        ProviderManagementError::new(
+            ProviderErrorCode::Internal,
+            Some(ProviderField::Provider),
+            ProviderRemediation::ContactSupport,
+        )
+    })
 }
 
 pub struct InProcessAgentService {
@@ -267,6 +438,123 @@ pub struct InProcessAgentService {
     event_sender: broadcast::Sender<ServiceEvent>,
     artifact_retention_days: u32,
     front_door: Option<FrontDoorAgent>,
+    run_provider_bindings: Arc<dyn RunProviderBindingSource>,
+    provider_management: Option<Arc<dyn ProviderManagementApi>>,
+}
+
+#[derive(Debug, Default)]
+pub struct UnavailableRunProviderBindingSource;
+
+#[async_trait]
+impl RunProviderBindingSource for UnavailableRunProviderBindingSource {
+    async fn bind_new_run(&self, _run_id: RunId) -> ProviderResult<RunProviderBinding> {
+        Err(no_active_profile_error())
+    }
+}
+
+/// Production binding source. It reads the durable active Ready snapshot for every new Run and
+/// verifies the exact credential generation in both durable metadata and the protected vault.
+/// SQLite rejects a snapshot changed after this read; `InProcessAgentService` then retries the
+/// complete read-and-create operation rather than mixing snapshots.
+#[derive(Clone)]
+pub struct ActiveRunProviderBindingSource {
+    profiles: Arc<dyn ProfileRevisionRepository>,
+    bindings: Arc<dyn RunProviderBindingRepository>,
+    vault: Arc<dyn CredentialVault>,
+}
+
+impl ActiveRunProviderBindingSource {
+    pub fn new(
+        profiles: Arc<dyn ProfileRevisionRepository>,
+        bindings: Arc<dyn RunProviderBindingRepository>,
+        vault: Arc<dyn CredentialVault>,
+    ) -> Self {
+        Self {
+            profiles,
+            bindings,
+            vault,
+        }
+    }
+}
+
+#[async_trait]
+impl RunProviderBindingSource for ActiveRunProviderBindingSource {
+    async fn bind_new_run(&self, run_id: RunId) -> ProviderResult<RunProviderBinding> {
+        let active = self
+            .profiles
+            .active()
+            .await?
+            .ok_or_else(no_active_profile_error)?;
+        let binding = RunProviderBinding::from_active(run_id, active).map_err(|_| {
+            ProviderManagementError::new(
+                ProviderErrorCode::ActivationPreconditionFailed,
+                Some(ProviderField::Activation),
+                ProviderRemediation::WaitForCurrentOperation,
+            )
+        })?;
+        let reference = ProviderCredentialReference {
+            profile_id: binding.profile_id(),
+            generation: binding.credential_generation(),
+        };
+        ensure_usable_credential(
+            self.bindings
+                .credential_status(reference.generation)
+                .await?,
+        )?;
+        ensure_usable_credential(self.vault.credential_status(reference).await?)?;
+        Ok(binding)
+    }
+}
+
+/// Deterministic non-network binding source for Fake/Replay test assemblies only.
+#[derive(Clone)]
+pub struct StaticRunProviderBindingSource {
+    active: ys_agent_core::ActiveProviderSnapshot,
+}
+
+impl StaticRunProviderBindingSource {
+    pub fn from_active(active: ys_agent_core::ActiveProviderSnapshot) -> Self {
+        Self { active }
+    }
+
+    pub fn for_test() -> Self {
+        let profile_id = ProfileId::new();
+        let versions =
+            ValidationVersions::new("test-catalog", "test-probe", "test-liter", "test-codec");
+        let credential = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+            .expect("test credential generation is valid");
+        let mut revision = ProfileRevision::draft(
+            profile_id,
+            1,
+            ProviderId::DeepSeek,
+            ProviderModelId::new(ProviderId::DeepSeek, "deepseek/test-model")
+                .expect("test model prefix is valid"),
+            ProviderParameters::default(),
+            Some(credential),
+        )
+        .expect("test provider revision is valid");
+        let evidence = CompatibilityEvidence::passing(revision.validation_inputs(versions.clone()));
+        revision
+            .accept_validation(evidence, versions)
+            .expect("test validation evidence matches");
+        Self::from_active(
+            ys_agent_core::ActiveProviderSnapshot::from_ready(&revision, 1)
+                .expect("test active snapshot is valid"),
+        )
+    }
+}
+
+#[async_trait]
+impl RunProviderBindingSource for StaticRunProviderBindingSource {
+    async fn bind_new_run(&self, run_id: RunId) -> ProviderResult<RunProviderBinding> {
+        RunProviderBinding::from_active(run_id, self.active.clone()).map_err(|_| {
+            ProviderManagementError::new(
+                ProviderErrorCode::Internal,
+                None,
+                ProviderRemediation::Retry,
+            )
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -403,6 +691,8 @@ impl InProcessAgentService {
             event_sender,
             artifact_retention_days: options.artifact_retention_days,
             front_door: None,
+            run_provider_bindings: Arc::new(UnavailableRunProviderBindingSource),
+            provider_management: None,
         }
     }
 
@@ -424,6 +714,25 @@ impl InProcessAgentService {
         model_name: impl Into<String>,
     ) -> Self {
         self.with_front_door_agent(provider, model_name)
+    }
+
+    pub fn with_run_provider_binding_source(
+        mut self,
+        source: Arc<dyn RunProviderBindingSource>,
+    ) -> Self {
+        self.run_provider_bindings = source;
+        self
+    }
+
+    /// Attaches the single masked Provider-management façade. Composition roots supply this after
+    /// repositories, Vault, adapters, and reconciliation are ready; TUI code never receives any
+    /// of those implementation dependencies.
+    pub fn with_provider_management_api(
+        mut self,
+        provider_management: Arc<dyn ProviderManagementApi>,
+    ) -> Self {
+        self.provider_management = Some(provider_management);
+        self
     }
 
     async fn classify_front_door(&self, input: &str) -> CoreResult<FrontDoorDecision> {
@@ -541,7 +850,7 @@ impl InProcessAgentService {
                 receipt: receipt.clone(),
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: vec![],
                 snapshot_update: None,
@@ -633,24 +942,83 @@ impl InProcessAgentService {
             message: None,
             capability: None,
         };
-        self.store
-            .commit_command(RuntimeCommandBatch {
-                command_id,
-                command_fingerprint: fingerprint,
-                receipt,
-                new_session: None,
-                new_task: task,
-                new_run_snapshot: Some(snapshot),
-                new_artifact: None,
-                pending_events: events,
-                snapshot_update: None,
-            })
-            .await
+        for attempt in 0..=ACTIVE_SNAPSHOT_RETRY_LIMIT {
+            let binding = self
+                .run_provider_bindings
+                .bind_new_run(snapshot.run_id)
+                .await
+                .map_err(|error| CoreError::validation(error.code(), error.to_string()))?;
+            let create_run =
+                ys_agent_core::CreateRunCommand::new(snapshot.clone(), binding, events.clone())?;
+            let result = self
+                .store
+                .commit_command(RuntimeCommandBatch {
+                    command_id,
+                    command_fingerprint: fingerprint.clone(),
+                    receipt: receipt.clone(),
+                    new_session: None,
+                    new_task: task.clone(),
+                    create_run: Some(create_run),
+                    new_artifact: None,
+                    pending_events: Vec::new(),
+                    snapshot_update: None,
+                })
+                .await;
+            match result {
+                Err(error)
+                    if attempt < ACTIVE_SNAPSHOT_RETRY_LIMIT && active_snapshot_changed(&error) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the bounded active snapshot retry loop always returns")
     }
+}
+
+fn no_active_profile_error() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::NoActiveProfile,
+        Some(ProviderField::Activation),
+        ProviderRemediation::EnterNoActiveProvider,
+    )
+}
+
+fn ensure_usable_credential(status: CredentialViewStatus) -> ProviderResult<()> {
+    match status {
+        CredentialViewStatus::Saved => Ok(()),
+        CredentialViewStatus::Missing => Err(ProviderManagementError::new(
+            ProviderErrorCode::CredentialMissing,
+            Some(ProviderField::Credential),
+            ProviderRemediation::ConfigureCredentialStore,
+        )),
+        CredentialViewStatus::Expired | CredentialViewStatus::Revoked => {
+            Err(ProviderManagementError::new(
+                ProviderErrorCode::AuthenticationInvalid,
+                Some(ProviderField::Credential),
+                ProviderRemediation::Reauthorize,
+            ))
+        }
+        CredentialViewStatus::ProtectionUnavailable
+        | CredentialViewStatus::ReconciliationRequired => Err(ProviderManagementError::new(
+            ProviderErrorCode::CredentialProtectionUnavailable,
+            Some(ProviderField::Credential),
+            ProviderRemediation::ConfigureCredentialStore,
+        )),
+    }
+}
+
+fn active_snapshot_changed(error: &CoreError) -> bool {
+    error.code() == "active_provider_snapshot_changed"
 }
 
 #[async_trait]
 impl AgentServiceApi for InProcessAgentService {
+    fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
+        self.provider_management.as_deref()
+    }
+
     async fn create_session(
         &self,
         command_id: CommandId,
@@ -691,7 +1059,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: Some(session),
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: vec![],
                 snapshot_update: None,
@@ -741,7 +1109,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: None,
                 new_task: Some(task),
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: vec![],
                 snapshot_update: None,
@@ -950,30 +1318,14 @@ impl AgentServiceApi for InProcessAgentService {
                 primary_artifact_id: None,
                 last_completed_step_id: None,
             };
-            let receipt = CommandReceipt {
+            self.commit_run(
                 command_id,
-                command_fingerprint: fingerprint.clone(),
-                result_kind: CommandResultKind::RunStarted,
-                session_id: None,
-                task_id: Some(*task_id),
-                run_id: Some(retry.run_id),
-                artifact_id: None,
-                message: None,
-                capability: None,
-            };
-            self.store
-                .commit_command(RuntimeCommandBatch {
-                    command_id,
-                    command_fingerprint: fingerprint,
-                    receipt,
-                    new_session: None,
-                    new_task: None,
-                    new_run_snapshot: Some(retry.clone()),
-                    new_artifact: None,
-                    pending_events: vec![system_event(RunEventKind::RunStarted)],
-                    snapshot_update: None,
-                })
-                .await?;
+                fingerprint,
+                None,
+                retry.clone(),
+                vec![system_event(RunEventKind::RunStarted)],
+            )
+            .await?;
             self.scheduler.schedule(retry.run_id).await?;
             self.event_publisher().notify(retry.run_id, u64::MAX);
             return Ok(retry.run_id);
@@ -1007,7 +1359,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: Vec::new(),
                 snapshot_update: None,
@@ -1169,7 +1521,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: Some(metadata.clone()),
                 pending_events: vec![
                     system_event(RunEventKind::ClarificationAnswered {
@@ -1234,7 +1586,7 @@ impl AgentServiceApi for InProcessAgentService {
                 receipt,
                 new_session: None,
                 new_task: None,
-                new_run_snapshot: None,
+                create_run: None,
                 new_artifact: None,
                 pending_events: vec![system_event(RunEventKind::RunCancelled { reason })],
                 snapshot_update: Some(cancelled),

@@ -8,29 +8,45 @@ use std::{
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, OnceCell};
-use ys_agent_adapters::model::{
-    OpenAiCompatibleConfig, OpenAiCompatibleProvider, ReplayModelProvider, SecretString,
-};
+use tokio::sync::Mutex as AsyncMutex;
 use ys_agent_adapters::{
     ConnectorRegistry, DbtManifestAdapter, FileMetricRegistry, InspectSchemaTool, MetricSqlDialect,
     PostgresConnector, PostgresConnectorConfig, QueryDataTool, ReadFreshnessTool,
     ResolveMetricTool, ResultPolicy, RuntimeArtifactLookup, SqlReadOnlyPolicy, SqliteConnector,
     SqliteConnectorConfig, SupportedDialect,
+    credential::keyring::KeyringCredentialVault,
+    model::{ReplayModelProvider, discovery::LiterModelDiscovery, liter::LiterProviderFactory},
+    oauth::chatgpt::ChatGptOAuthManager,
 };
 use ys_agent_core::{
-    AgentAction, ArtifactId, ArtifactStore, AssistantToolCall, ContextManifest, CoreError,
-    CoreResult, CredentialReference, MetricDefinition, MetricProvider, ModelCapabilities,
-    ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelRole, QueryBudget,
-    QueryContextProvider, QueryExecutionPlan, RunId, RuntimeStore, Sensitivity, SideEffect,
-    SourceId, ToolRisk, ToolSpec, WorkspaceId,
+    AgentAction, ArtifactId, ArtifactStore, CoreError, CoreResult, CredentialMutationRepository,
+    CredentialProtectionStatus, CredentialReference, CredentialVault, MetricDefinition,
+    MetricProvider, ModelCapabilities, ModelProvider, ModelRequest, ModelResponse,
+    ProfileRevisionRepository, ProviderClientFactory, ProviderErrorCode, ProviderField,
+    ProviderManagementApi, ProviderManagementError, ProviderProfileRepository, ProviderRemediation,
+    ProviderResult, QueryBudget, QueryContextProvider, QueryExecutionPlan, RunId,
+    RunModelProviderResolver, RunProviderBindingRepository, RunProviderBindingSource, RuntimeStore,
+    SourceId, WorkspaceId,
 };
 use ys_agent_runtime::{
-    AgentServiceApi, ContextAssembler, Harness, HarnessConfig, HarnessDependencies,
-    InMemoryQueryContextProvider, InProcessAgentService, LoopDriver, PromptBuilder, RunScheduler,
-    ServiceEventPublisher,
-    doctor::{DoctorInputs, DoctorProbe, ModelReadiness, SourceReadiness, WorkspaceDoctor},
+    ActiveRunProviderBindingSource, AgentServiceApi, ContextAssembler,
+    FixedRunModelProviderResolver, Harness, HarnessConfig, HarnessDependencies,
+    InMemoryQueryContextProvider, InProcessAgentService, LoopDriver, PromptBuilder,
+    RunBoundProviderResolver, RunScheduler, ServiceEventPublisher, StaticRunProviderBindingSource,
+    doctor::{
+        DoctorInputs, DoctorProbe, DoctorReport, DoctorRunner, ModelReadiness, SourceReadiness,
+        WorkspaceDoctor,
+    },
     export::{ArtifactExporter, DefaultExportPolicy, ExportWriter, WrittenExport},
+    provider::{
+        api::InProcessProviderManagementApi,
+        catalog::GovernedProviderCatalog,
+        evidence::{
+            EvidenceBaseline, EvidenceRegistry, GOVERNED_CODEC_DIGEST, GOVERNED_LITER_LLM_VERSION,
+        },
+        service::{CredentialService, ProviderManagementService},
+        validation::COMPATIBILITY_PROBE_SCHEMA_VERSION,
+    },
     telemetry::{TelemetryDispatcher, TracingTelemetrySink},
     tools::{
         ConnectorToolAvailability, QueryPhase, ToolCatalog, ToolRuntime, ToolViewBuilder,
@@ -226,9 +242,6 @@ impl RunScheduler for DeterministicRunScheduler {
 #[derive(Debug, Clone)]
 struct AppConfig {
     workspace_name: String,
-    llm_base_url_ref: CredentialReference,
-    llm_api_key_ref: CredentialReference,
-    llm_model: String,
     source_kind: String,
     source_id: SourceId,
     source_url_ref: Option<CredentialReference>,
@@ -257,9 +270,6 @@ impl AppConfig {
         let artifact_retention_days = artifact_retention_days_from_lookup(&nonempty_env)?;
         Ok(Self {
             workspace_name: optional_env("YSDA_WORKSPACE_NAME", "local"),
-            llm_base_url_ref: CredentialReference::new("env:YSDA_LLM_BASE_URL")?,
-            llm_api_key_ref: CredentialReference::new("env:YSDA_LLM_API_KEY")?,
-            llm_model: optional_env("YSDA_LLM_MODEL", "unconfigured"),
             source_kind,
             source_id: SourceId::new(optional_env("YSDA_DATA_SOURCE_ID", "local")),
             source_url_ref: nonempty_env("YSDA_DATA_SOURCE_URL")
@@ -288,9 +298,6 @@ impl AppConfig {
 
 fn required_config_keys(source_kind: &str) -> Vec<&'static str> {
     let mut keys = vec![
-        "YSDA_LLM_BASE_URL",
-        "YSDA_LLM_API_KEY",
-        "YSDA_LLM_MODEL",
         "YSDA_QUERY_POLICY_PATH",
         "YSDA_TIMEZONE",
         "YSDA_QUERY_TIMEOUT_SECONDS",
@@ -666,16 +673,12 @@ fn storage_error(context: &'static str) -> impl FnOnce(std::io::Error) -> CoreEr
 struct RuntimeDoctorProbe {
     config: AppConfig,
     readiness: DoctorInputs,
-    model_protocol: Option<ModelProtocolProbe>,
 }
 
 #[async_trait]
 impl DoctorProbe for RuntimeDoctorProbe {
     async fn inspect(&self) -> CoreResult<DoctorInputs> {
         let mut inputs = self.readiness.clone();
-        if let Some(model_protocol) = &self.model_protocol {
-            inputs.model = model_protocol.readiness().await;
-        }
         inputs.query_policy_valid = fs::read(&self.config.query_policy_path)
             .ok()
             .and_then(|bytes| ResultPolicy::from_json_bytes(&bytes).ok())
@@ -701,248 +704,6 @@ impl DoctorProbe for RuntimeDoctorProbe {
         inputs.source.freshness_capability &= inputs.source.reachable;
         Ok(inputs)
     }
-}
-
-const DOCTOR_TOOL_NAME: &str = "ysda_doctor_probe";
-const DOCTOR_DECOY_TOOL_NAME: &str = "ysda_doctor_decoy";
-
-#[derive(Clone)]
-struct ModelProtocolProbe {
-    model: Arc<dyn ModelProvider>,
-    model_name: String,
-    cached: Arc<OnceCell<ModelReadiness>>,
-}
-
-impl ModelProtocolProbe {
-    fn new(model: Arc<dyn ModelProvider>, model_name: String) -> Self {
-        Self {
-            model,
-            model_name,
-            cached: Arc::new(OnceCell::new()),
-        }
-    }
-
-    async fn readiness(&self) -> ModelReadiness {
-        self.cached
-            .get_or_init(|| async {
-                match tokio::time::timeout(
-                    Duration::from_secs(45),
-                    probe_model_protocol(self.model.as_ref(), &self.model_name),
-                )
-                .await
-                {
-                    Ok(Ok(readiness)) => readiness,
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            code = error.code(),
-                            "model protocol readiness probe failed"
-                        );
-                        incompatible_model_readiness()
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            code = "model_protocol_probe_timeout",
-                            "model protocol readiness probe timed out"
-                        );
-                        incompatible_model_readiness()
-                    }
-                }
-            })
-            .await
-            .clone()
-    }
-}
-
-async fn probe_model_protocol(
-    model: &dyn ModelProvider,
-    model_name: &str,
-) -> CoreResult<ModelReadiness> {
-    let tool = doctor_probe_tool();
-    let first = model
-        .complete(ModelRequest {
-            model: model_name.to_owned(),
-            messages: vec![
-                ModelMessage {
-                    role: ModelRole::System,
-                    content: "This is a YSDA protocol readiness probe. It contains no business data. Call exactly the supplied ysda_doctor_probe tool with an empty object."
-                        .to_owned(),
-                    tool_call_id: None,
-                    name: None,
-                    assistant_tool_call: None,
-                },
-                ModelMessage {
-                    role: ModelRole::User,
-                    content: "Call ysda_doctor_probe now.".to_owned(),
-                    tool_call_id: None,
-                    name: None,
-                    assistant_tool_call: None,
-                },
-            ],
-            tools: vec![tool.clone(), doctor_decoy_tool()],
-            context_manifest: ContextManifest::empty(512),
-            temperature: Some(0.0),
-        })
-        .await?;
-    let AgentAction::CallTool { call } = first.action else {
-        return Err(model_protocol_error(
-            "probe response did not contain a structured Tool Call",
-        ));
-    };
-    if call.name != DOCTOR_TOOL_NAME {
-        return Err(model_protocol_error(
-            "probe response called a different tool",
-        ));
-    }
-    let provider_call_id = call
-        .provider_call_id
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| model_protocol_error("probe Tool Call had no provider call ID"))?;
-
-    let second = model
-        .complete(ModelRequest {
-            model: model_name.to_owned(),
-            messages: vec![
-                ModelMessage {
-                    role: ModelRole::System,
-                    content: r#"This is a YSDA protocol readiness probe with no business data. After the Tool result, return exactly this JSON and nothing else: {"type":"propose_completion","summary":"protocol probe complete","primary_artifact_hint":null}. Do not call another tool."#
-                        .to_owned(),
-                    tool_call_id: None,
-                    name: None,
-                    assistant_tool_call: None,
-                },
-                ModelMessage {
-                    role: ModelRole::Assistant,
-                    content: String::new(),
-                    tool_call_id: None,
-                    name: None,
-                    assistant_tool_call: Some(AssistantToolCall {
-                        provider_call_id: provider_call_id.clone(),
-                        name: DOCTOR_TOOL_NAME.to_owned(),
-                        arguments: call.arguments,
-                    }),
-                },
-                ModelMessage {
-                    role: ModelRole::Tool,
-                    content: r#"{"ready":true}"#.to_owned(),
-                    tool_call_id: Some(provider_call_id),
-                    name: Some(DOCTOR_TOOL_NAME.to_owned()),
-                    assistant_tool_call: None,
-                },
-            ],
-            tools: vec![tool, doctor_decoy_tool()],
-            context_manifest: ContextManifest::empty(512),
-            temperature: Some(0.0),
-        })
-        .await?;
-    match second.action {
-        AgentAction::ProposeCompletion {
-            summary,
-            primary_artifact_hint,
-        } if summary == "protocol probe complete" && primary_artifact_hint.is_none() => {}
-        AgentAction::CallTool { .. } => {
-            return Err(model_protocol_error(
-                "probe follow-up response called another tool",
-            ));
-        }
-        AgentAction::Respond { .. } => {
-            return Err(model_protocol_error(
-                "probe follow-up response used respond instead of propose_completion",
-            ));
-        }
-        AgentAction::RequestClarification { .. } => {
-            return Err(model_protocol_error(
-                "probe follow-up response used request_clarification instead of propose_completion",
-            ));
-        }
-        _ => {
-            return Err(model_protocol_error(
-                "probe follow-up response was not the required propose_completion action",
-            ));
-        }
-    }
-
-    let capabilities = model.capabilities();
-    if capabilities.max_context_tokens == 0 {
-        return Err(model_protocol_error(
-            "model reported an unknown context limit",
-        ));
-    }
-    Ok(ModelReadiness {
-        reachable: true,
-        supports_tool_calls: true,
-        supports_tool_call_ids: true,
-        supports_multi_turn_tool_results: true,
-        context_limit: Some(u64::from(capabilities.max_context_tokens)),
-    })
-}
-
-fn doctor_decoy_tool() -> ToolSpec {
-    ToolSpec {
-        name: DOCTOR_DECOY_TOOL_NAME.to_owned(),
-        description: "A decoy protocol probe that must never be called".to_owned(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }),
-        output_schema: serde_json::json!({
-            "type": "object",
-            "properties": { "ready": { "type": "boolean" } },
-            "required": ["ready"],
-            "additionalProperties": false
-        }),
-        risk: ToolRisk::Low,
-        side_effect: SideEffect::None,
-        idempotent: true,
-        timeout_ms: 1_000,
-        max_output_bytes: 128,
-        required_permissions: Vec::new(),
-        input_sensitivity: Sensitivity::Internal,
-        output_sensitivity: Sensitivity::Internal,
-        version: "1.0.0".to_owned(),
-    }
-}
-
-fn doctor_probe_tool() -> ToolSpec {
-    ToolSpec {
-        name: DOCTOR_TOOL_NAME.to_owned(),
-        description: "A harmless protocol-only readiness probe that returns no business data"
-            .to_owned(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }),
-        output_schema: serde_json::json!({
-            "type": "object",
-            "properties": { "ready": { "type": "boolean" } },
-            "required": ["ready"],
-            "additionalProperties": false
-        }),
-        risk: ToolRisk::Low,
-        side_effect: SideEffect::None,
-        idempotent: true,
-        timeout_ms: 1_000,
-        max_output_bytes: 128,
-        required_permissions: Vec::new(),
-        input_sensitivity: Sensitivity::Internal,
-        output_sensitivity: Sensitivity::Internal,
-        version: "1.0.0".to_owned(),
-    }
-}
-
-fn incompatible_model_readiness() -> ModelReadiness {
-    ModelReadiness {
-        reachable: false,
-        supports_tool_calls: false,
-        supports_tool_call_ids: false,
-        supports_multi_turn_tool_results: false,
-        context_limit: None,
-    }
-}
-
-fn model_protocol_error(message: &'static str) -> CoreError {
-    CoreError::validation("model_protocol_incompatible", message)
 }
 
 #[cfg(unix)]
@@ -1063,31 +824,206 @@ impl RunScheduler for BackgroundScheduler {
     }
 }
 
+/// Production-only gate around the immutable active-profile binding source.  The journal is
+/// inspected before bootstrap returns and again before every new Run, so a process restart or a
+/// late credential operation cannot start a Query against an unconfirmed cross-store state.
+struct JournalCheckedRunProviderBindingSource {
+    active: ActiveRunProviderBindingSource,
+    journal: Arc<dyn CredentialMutationRepository>,
+    vault: Arc<dyn CredentialVault>,
+}
+
+#[async_trait]
+impl RunProviderBindingSource for JournalCheckedRunProviderBindingSource {
+    async fn bind_new_run(
+        &self,
+        run_id: RunId,
+    ) -> ProviderResult<ys_agent_core::RunProviderBinding> {
+        verify_provider_startup_state(self.vault.as_ref(), self.journal.as_ref()).await?;
+        self.active.bind_new_run(run_id).await
+    }
+}
+
+struct ProviderBootstrapDoctor {
+    workspace: Arc<dyn DoctorRunner>,
+    management: Arc<dyn ProviderManagementApi>,
+    journal: Arc<dyn CredentialMutationRepository>,
+    vault: Arc<dyn CredentialVault>,
+}
+
+#[async_trait]
+impl DoctorRunner for ProviderBootstrapDoctor {
+    async fn run(&self) -> CoreResult<DoctorReport> {
+        let mut report = self.workspace.run().await?;
+        let mut provider_blockers = Vec::new();
+
+        match self.management.doctor().await {
+            Ok(view) => {
+                provider_blockers.extend(view.blockers);
+                for warning in view.warnings {
+                    report.warning_codes.push(warning.code().to_owned());
+                }
+            }
+            Err(error) => provider_blockers.push(error),
+        }
+        if let Err(error) =
+            verify_provider_startup_state(self.vault.as_ref(), self.journal.as_ref()).await
+        {
+            provider_blockers.push(error);
+        }
+
+        for blocker in provider_blockers {
+            report.blocker_codes.push(blocker.code().to_owned());
+        }
+        report.blocker_codes.sort();
+        report.blocker_codes.dedup();
+        report.warning_codes.sort();
+        report.warning_codes.dedup();
+        if report
+            .blocker_codes
+            .iter()
+            .any(|code| code.starts_with("provider."))
+        {
+            report
+                .repairs
+                .push("Open /providers and follow the Provider Doctor remediation".to_owned());
+            report.ready_capabilities.clear();
+        }
+        report.repairs.sort();
+        report.repairs.dedup();
+        Ok(report)
+    }
+}
+
+struct ProviderRuntimeComposition {
+    management: Arc<dyn ProviderManagementApi>,
+    bindings: Arc<dyn RunProviderBindingSource>,
+    resolver: Arc<dyn RunModelProviderResolver>,
+    journal: Arc<dyn CredentialMutationRepository>,
+    vault: Arc<dyn CredentialVault>,
+}
+
+async fn compose_provider_runtime(
+    runtime_store: Arc<ys_agent_store::SqliteRuntimeStore>,
+    vault: Arc<dyn CredentialVault>,
+) -> CoreResult<ProviderRuntimeComposition> {
+    let repository = Arc::new(runtime_store.provider_repository());
+    let profiles: Arc<dyn ProviderProfileRepository> = repository.clone();
+    let revisions: Arc<dyn ProfileRevisionRepository> = repository.clone();
+    let journal: Arc<dyn CredentialMutationRepository> = repository;
+    let run_bindings: Arc<dyn RunProviderBindingRepository> =
+        Arc::new(runtime_store.run_binding_repository());
+    let oauth: Arc<dyn ys_agent_core::OAuthConnectionService> =
+        Arc::new(ChatGptOAuthManager::new(vault.clone()).map_err(provider_bootstrap_error)?);
+    let lifecycle = Arc::new(ProviderManagementService::with_oauth(
+        profiles.clone(),
+        oauth,
+    ));
+    let credentials = Arc::new(CredentialService::new(
+        journal.clone(),
+        run_bindings.clone(),
+        vault.clone(),
+    ));
+    let catalog = GovernedProviderCatalog::default();
+    let evidence = EvidenceRegistry::new(EvidenceBaseline::for_catalog(
+        &catalog,
+        COMPATIBILITY_PROBE_SCHEMA_VERSION,
+        GOVERNED_CODEC_DIGEST,
+        GOVERNED_LITER_LLM_VERSION,
+    ));
+    let factory: Arc<dyn ProviderClientFactory> = Arc::new(LiterProviderFactory::new());
+    let management: Arc<dyn ProviderManagementApi> = Arc::new(InProcessProviderManagementApi::new(
+        catalog.clone(),
+        evidence.catalog_views(&catalog),
+        profiles,
+        vault.clone(),
+        run_bindings.clone(),
+        lifecycle,
+        credentials,
+        Arc::new(LiterModelDiscovery::new()),
+        factory.clone(),
+    ));
+
+    // This forces the native-vault probe and reads the journal during startup.  A failed or
+    // incomplete result keeps Provider browsing available, while the binding gate below rejects
+    // every new Query until the same check becomes healthy.
+    let _ = verify_provider_startup_state(vault.as_ref(), journal.as_ref()).await;
+    let bindings: Arc<dyn RunProviderBindingSource> =
+        Arc::new(JournalCheckedRunProviderBindingSource {
+            active: ActiveRunProviderBindingSource::new(
+                revisions,
+                run_bindings.clone(),
+                vault.clone(),
+            ),
+            journal: journal.clone(),
+            vault: vault.clone(),
+        });
+    let resolver: Arc<dyn RunModelProviderResolver> = Arc::new(RunBoundProviderResolver::new(
+        run_bindings,
+        vault.clone(),
+        factory,
+    ));
+    Ok(ProviderRuntimeComposition {
+        management,
+        bindings,
+        resolver,
+        journal,
+        vault,
+    })
+}
+
+async fn compose_production_provider_runtime(
+    runtime_store: Arc<ys_agent_store::SqliteRuntimeStore>,
+) -> CoreResult<ProviderRuntimeComposition> {
+    compose_provider_runtime(runtime_store, Arc::new(KeyringCredentialVault::new())).await
+}
+
+async fn verify_provider_startup_state(
+    vault: &dyn CredentialVault,
+    journal: &dyn CredentialMutationRepository,
+) -> ProviderResult<()> {
+    if vault.protection_status().await? != CredentialProtectionStatus::ConfirmedNative {
+        return Err(provider_protection_unavailable());
+    }
+    if journal
+        .pending_credential_mutations()
+        .await?
+        .iter()
+        .any(ys_agent_core::CredentialMutationRecord::requires_reconciliation)
+    {
+        return Err(provider_journal_pending());
+    }
+    Ok(())
+}
+
+fn provider_protection_unavailable() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::CredentialProtectionUnavailable,
+        Some(ProviderField::Credential),
+        ProviderRemediation::ConfigureCredentialStore,
+    )
+}
+
+fn provider_journal_pending() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::OperationStale,
+        Some(ProviderField::Credential),
+        ProviderRemediation::WaitForCurrentOperation,
+    )
+}
+
+fn provider_bootstrap_error(error: ProviderManagementError) -> CoreError {
+    CoreError::validation(error.code(), error.code())
+}
+
 async fn assemble_scheduler(
     config: &AppConfig,
     workspace_id: WorkspaceId,
     principal: ys_agent_core::Principal,
-    runtime_store: Arc<dyn RuntimeStore>,
+    runtime_store: Arc<ys_agent_store::SqliteRuntimeStore>,
     artifact_store: Arc<dyn ArtifactStore>,
-) -> CoreResult<(
-    Arc<BackgroundScheduler>,
-    DoctorInputs,
-    Arc<dyn ModelProvider>,
-)> {
-    let base_url = resolve_env_reference(&config.llm_base_url_ref)?;
-    let api_key = resolve_env_reference(&config.llm_api_key_ref)?;
-    let model: Arc<dyn ModelProvider> =
-        Arc::new(OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
-            base_url,
-            api_key: SecretString::new(api_key),
-            model: config.llm_model.clone(),
-            supports_tool_calls: true,
-            supports_tool_call_ids: true,
-            supports_multi_turn_tool_results: true,
-            context_window_tokens: 32_768,
-            max_tool_schema_bytes: 65_536,
-            request_timeout: Duration::from_secs(30),
-        })?);
+    model_resolver: Arc<dyn RunModelProviderResolver>,
+) -> CoreResult<(Arc<BackgroundScheduler>, DoctorInputs)> {
     let policy_bytes = tokio::fs::read(&config.query_policy_path)
         .await
         .map_err(|error| CoreError::validation("query_policy_read_failed", error.to_string()))?;
@@ -1205,15 +1141,15 @@ async fn assemble_scheduler(
     let telemetry = Arc::new(TelemetryDispatcher::new(Arc::new(TracingTelemetrySink)));
     let harness = Arc::new(Harness::new(
         HarnessDependencies {
-            store: runtime_store,
+            store: runtime_store.clone(),
             artifacts: artifact_store,
-            model: model.clone(),
+            model_resolver,
             catalog: Arc::new(catalog),
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler: Arc::new(ContextAssembler::new(metrics, dbt_context, run_context)),
             telemetry,
         },
-        PromptBuilder::new(config.llm_model.clone()),
+        PromptBuilder::new(),
         HarnessConfig {
             workspace_id,
             principal,
@@ -1262,7 +1198,6 @@ async fn assemble_scheduler(
             LoopDriver::with_defaults(harness),
         ))),
         readiness,
-        model,
     ))
 }
 
@@ -1284,10 +1219,11 @@ pub async fn assemble_deterministic_query_runtime(
     let source_id = SourceId::new("sqlite_demo");
     let query_budget = QueryBudget::default();
     let runtime = Arc::new(ys_agent_store::SqliteRuntimeStore::open(&config.runtime_path).await?);
+    let active_provider = seed_deterministic_active_provider(runtime.as_ref()).await?;
     let artifacts = Arc::new(ys_agent_store::LocalArtifactStore::new(
         &config.artifact_path,
     )?);
-    let runtime_store: Arc<dyn RuntimeStore> = runtime;
+    let runtime_store: Arc<dyn RuntimeStore> = runtime.clone();
     let artifact_store: Arc<dyn ArtifactStore> = artifacts;
     let policy_bytes = tokio::fs::read(&config.query_policy_path)
         .await
@@ -1362,13 +1298,16 @@ pub async fn assemble_deterministic_query_runtime(
         HarnessDependencies {
             store: runtime_store.clone(),
             artifacts: artifact_store.clone(),
-            model: Arc::new(model.clone()),
+            model_resolver: Arc::new(FixedRunModelProviderResolver::new(
+                Arc::new(runtime.run_binding_repository()),
+                Arc::new(model.clone()),
+            )),
             catalog,
             tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
             context_assembler: Arc::new(ContextAssembler::new(metrics, dbt_context, run_context)),
             telemetry,
         },
-        PromptBuilder::new("deterministic-query-eval"),
+        PromptBuilder::new(),
         HarnessConfig {
             workspace_id,
             principal: principal.clone(),
@@ -1385,18 +1324,132 @@ pub async fn assemble_deterministic_query_runtime(
         driver: Arc::new(LoopDriver::with_defaults(harness)),
         model,
     });
-    let service: Arc<dyn AgentServiceApi> = Arc::new(InProcessAgentService::new(
-        workspace_id,
-        runtime_store,
-        artifact_store,
-        scheduler,
-    ));
+    let service: Arc<dyn AgentServiceApi> = Arc::new(
+        InProcessAgentService::new(workspace_id, runtime_store, artifact_store, scheduler)
+            .with_run_provider_binding_source(Arc::new(
+                StaticRunProviderBindingSource::from_active(active_provider),
+            )),
+    );
     Ok(DeterministicRuntimeAssembly {
         service,
         workspace_id,
         principal,
         phase_tool_view_hashes,
     })
+}
+
+async fn seed_deterministic_active_provider(
+    runtime: &ys_agent_store::SqliteRuntimeStore,
+) -> CoreResult<ys_agent_core::ActiveProviderSnapshot> {
+    fn fixture_error(error: ys_agent_core::ProviderManagementError) -> CoreError {
+        CoreError::validation("deterministic_provider_fixture_failed", error.code())
+    }
+
+    let repository = runtime.provider_repository();
+    let profile_id = ys_agent_core::ProfileId::new();
+    let name = ys_agent_core::ProfileName::new("Deterministic Replay Provider")?;
+    let model = ys_agent_core::ProviderModelId::new(
+        ys_agent_core::ProviderId::DeepSeek,
+        "deepseek/deterministic-replay",
+    )?;
+    repository
+        .save_revision(ys_agent_core::SaveProfileRevision {
+            precondition: ys_agent_core::RevisionPrecondition {
+                profile_id,
+                expected_current_revision: None,
+            },
+            name,
+            revision: ys_agent_core::ProfileRevision::draft(
+                profile_id,
+                1,
+                ys_agent_core::ProviderId::DeepSeek,
+                model.clone(),
+                ys_agent_core::ProviderParameters::default(),
+                None,
+            )?,
+        })
+        .await
+        .map_err(fixture_error)?;
+
+    let credential = ys_agent_core::CredentialGeneration::new(
+        profile_id,
+        1,
+        ys_agent_core::CredentialKind::ApiKey,
+    )?;
+    let mutation_id = ys_agent_core::OperationId::new();
+    repository
+        .begin_credential_mutation(ys_agent_core::CredentialMutationIntent::create(
+            mutation_id,
+            profile_id,
+            1,
+            credential,
+        )?)
+        .await
+        .map_err(fixture_error)?;
+    repository
+        .record_credential_vault_write(mutation_id)
+        .await
+        .map_err(fixture_error)?;
+    let candidate = ys_agent_core::ProfileRevision::draft(
+        profile_id,
+        2,
+        ys_agent_core::ProviderId::DeepSeek,
+        model,
+        ys_agent_core::ProviderParameters::default(),
+        Some(credential),
+    )?;
+    repository
+        .commit_credential_pointer(ys_agent_core::CredentialPointerCommit::new(
+            mutation_id,
+            profile_id,
+            1,
+            candidate.clone(),
+        )?)
+        .await
+        .map_err(fixture_error)?;
+    repository
+        .complete_credential_mutation(mutation_id)
+        .await
+        .map_err(fixture_error)?;
+
+    let versions = ys_agent_core::ValidationVersions::new(
+        "deterministic-catalog",
+        "deterministic-probe",
+        "deterministic-liter",
+        "deterministic-codec",
+    );
+    let evidence = ys_agent_core::CompatibilityEvidence::passing(
+        candidate.validation_inputs(versions.clone()),
+    );
+    let validation_id = evidence.id();
+    let validation_digest = evidence.digest();
+    repository
+        .save_validation(ys_agent_core::ValidationCommit {
+            precondition: ys_agent_core::ValidationCommitPrecondition {
+                operation_id: ys_agent_core::OperationId::new(),
+                profile_id,
+                revision: 2,
+                credential_generation: credential,
+                validation_digest: validation_digest.clone(),
+            },
+            evidence,
+            versions,
+        })
+        .await
+        .map_err(fixture_error)?;
+    repository
+        .activate(ys_agent_core::ActivateProfileRequest {
+            operation_id: ys_agent_core::OperationId::new(),
+            precondition: ys_agent_core::ActivationPrecondition {
+                profile_id,
+                revision: 2,
+                validation_id,
+                validation_digest,
+                expected_activation_revision: None,
+            },
+        })
+        .await
+        .map_err(fixture_error)
 }
 
 fn query_phase_tool_view_hashes(
@@ -1466,50 +1519,48 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
     );
     let display = DisplayMetadata {
         workspace_name: config.workspace_name.clone(),
-        model_label: format!("openai-compatible/{}", config.llm_model),
+        model_label: "Provider Profile".to_owned(),
         connection_label: config.source_kind.clone(),
         permission_label: "read-only".to_owned(),
     };
     let runtime_store =
         Arc::new(ys_agent_store::SqliteRuntimeStore::open(".ysda/runtime.db").await?);
+    let provider_runtime = compose_production_provider_runtime(runtime_store.clone()).await?;
     let artifact_store = Arc::new(ys_agent_store::LocalArtifactStore::new(
         &config.artifact_root,
     )?);
     let runtime_port: Arc<dyn RuntimeStore> = runtime_store.clone();
     let artifact_port: Arc<dyn ArtifactStore> = artifact_store.clone();
-    let (scheduler, readiness, background, model_protocol, conversation_model) =
-        match assemble_scheduler(
-            &config,
-            workspace_id,
-            principal.clone(),
-            runtime_port.clone(),
-            artifact_port.clone(),
-        )
-        .await
-        {
-            Ok((background, readiness, model)) => {
-                let scheduler: Arc<dyn RunScheduler> = background.clone();
-                (
-                    scheduler,
-                    readiness,
-                    Some(background),
-                    Some(ModelProtocolProbe::new(
-                        model.clone(),
-                        config.llm_model.clone(),
-                    )),
-                    Some(model),
-                )
-            }
-            Err(_) => {
-                let scheduler: Arc<dyn RunScheduler> = Arc::new(ys_agent_runtime::NoopRunScheduler);
-                (scheduler, safe_readiness_inputs(&config), None, None, None)
-            }
-        };
-    let doctor = Arc::new(WorkspaceDoctor::new(Arc::new(RuntimeDoctorProbe {
-        config: config.clone(),
-        readiness,
-        model_protocol,
-    })));
+    let (scheduler, readiness, background) = match assemble_scheduler(
+        &config,
+        workspace_id,
+        principal.clone(),
+        runtime_store.clone(),
+        artifact_port.clone(),
+        provider_runtime.resolver.clone(),
+    )
+    .await
+    {
+        Ok((background, readiness)) => {
+            let scheduler: Arc<dyn RunScheduler> = background.clone();
+            (scheduler, readiness, Some(background))
+        }
+        Err(_) => {
+            let scheduler: Arc<dyn RunScheduler> = Arc::new(ys_agent_runtime::NoopRunScheduler);
+            (scheduler, safe_readiness_inputs(&config), None)
+        }
+    };
+    let workspace_doctor: Arc<dyn DoctorRunner> =
+        Arc::new(WorkspaceDoctor::new(Arc::new(RuntimeDoctorProbe {
+            config: config.clone(),
+            readiness,
+        })));
+    let doctor: Arc<dyn DoctorRunner> = Arc::new(ProviderBootstrapDoctor {
+        workspace: workspace_doctor,
+        management: provider_runtime.management.clone(),
+        journal: provider_runtime.journal.clone(),
+        vault: provider_runtime.vault.clone(),
+    });
     let exporter = Arc::new(ArtifactExporter::with_retention_days(
         runtime_port.clone(),
         artifact_port.clone(),
@@ -1517,7 +1568,7 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
         Arc::new(DefaultExportPolicy),
         config.artifact_retention_days,
     ));
-    let mut service = InProcessAgentService::with_dependencies_and_retention(
+    let service = InProcessAgentService::with_dependencies_and_retention(
         workspace_id,
         runtime_port,
         artifact_port,
@@ -1525,10 +1576,9 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
         doctor,
         exporter,
         config.artifact_retention_days,
-    );
-    if let Some(model) = conversation_model {
-        service = service.with_conversation_model(model, config.llm_model.clone());
-    }
+    )
+    .with_run_provider_binding_source(provider_runtime.bindings)
+    .with_provider_management_api(provider_runtime.management);
     let service = Arc::new(service);
     if let Some(background) = background {
         background.set_publisher(service.event_publisher());
@@ -1544,7 +1594,6 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
         fs,
         sync::{
             Arc, Barrier,
@@ -1556,18 +1605,19 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use serde_json::json;
-    use tokio::sync::{Mutex as AsyncMutex, Notify};
+    use tokio::sync::Notify;
 
     use super::{
-        BackgroundScheduler, ModelProtocolProbe, acquire_workspace_id_lock,
-        artifact_retention_days_from_lookup, create_private_directory, query_budget_from_lookup,
+        BackgroundScheduler, acquire_workspace_id_lock, artifact_retention_days_from_lookup,
+        compose_provider_runtime, create_private_directory, query_budget_from_lookup,
         required_config_keys, resolve_workspace_id,
     };
+    use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
     use ys_agent_core::{
-        AgentAction, CoreError, CoreResult, ModelCapabilities, ModelProvider, ModelRequest,
-        ModelResponse, RunId, RunSnapshot, RunStatus, TaskId, ToolCall, ToolCallId, WorkflowKind,
-        WorkspaceId,
+        CoreError, CoreResult, CredentialGeneration, CredentialKind, CredentialMutationIntent,
+        ProfileId, ProfileName, ProfileRevision, ProviderId, ProviderModelId, ProviderParameters,
+        RevisionPrecondition, RunId, RunSnapshot, RunStatus, SaveProfileRevision, TaskId,
+        WorkflowKind, WorkspaceId,
     };
     use ys_agent_runtime::{HarnessStep, LoopDriver, RunScheduler, StepAccounting, StepOutcome};
 
@@ -1637,183 +1687,6 @@ mod tests {
         assert_eq!(harness.calls.load(Ordering::SeqCst), 2);
     }
 
-    #[derive(Clone)]
-    struct ScriptedDoctorModel {
-        responses: Arc<AsyncMutex<VecDeque<ModelResponse>>>,
-        requests: Arc<AsyncMutex<Vec<ModelRequest>>>,
-    }
-
-    impl ScriptedDoctorModel {
-        fn new(responses: Vec<ModelResponse>) -> Self {
-            Self {
-                responses: Arc::new(AsyncMutex::new(responses.into())),
-                requests: Arc::new(AsyncMutex::new(Vec::new())),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl ModelProvider for ScriptedDoctorModel {
-        fn capabilities(&self) -> ModelCapabilities {
-            ModelCapabilities {
-                tool_calling: true,
-                structured_outputs: true,
-                max_context_tokens: 32_768,
-                parallel_tool_calls: false,
-                streaming: false,
-            }
-        }
-
-        async fn complete(&self, request: ModelRequest) -> CoreResult<ModelResponse> {
-            self.requests.lock().await.push(request);
-            self.responses
-                .lock()
-                .await
-                .pop_front()
-                .ok_or(CoreError::ReplayExhausted)
-        }
-    }
-
-    fn doctor_tool_call(name: &str, provider_call_id: Option<&str>) -> ModelResponse {
-        ModelResponse {
-            action: AgentAction::CallTool {
-                call: ToolCall {
-                    id: ToolCallId::new(),
-                    provider_call_id: provider_call_id.map(str::to_owned),
-                    name: name.to_owned(),
-                    arguments: json!({}),
-                    version: "1.0.0".to_owned(),
-                },
-            },
-            raw_content: None,
-            usage: None,
-        }
-    }
-
-    fn doctor_completion() -> ModelResponse {
-        ModelResponse {
-            action: AgentAction::ProposeCompletion {
-                summary: "protocol probe complete".to_owned(),
-                primary_artifact_hint: None,
-            },
-            raw_content: None,
-            usage: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn model_protocol_probe_uses_the_original_tool_call_id_and_caches_success() {
-        let model = Arc::new(ScriptedDoctorModel::new(vec![
-            doctor_tool_call("ysda_doctor_probe", Some("call_probe_1")),
-            doctor_completion(),
-        ]));
-        let probe = ModelProtocolProbe::new(model.clone(), "test-model".to_owned());
-
-        let first = probe.readiness().await;
-        let second = probe.readiness().await;
-
-        assert_eq!(first, second);
-        assert!(first.reachable);
-        assert!(first.supports_tool_calls);
-        assert!(first.supports_tool_call_ids);
-        assert!(first.supports_multi_turn_tool_results);
-        assert_eq!(first.context_limit, Some(32_768));
-        let requests = model.requests.lock().await;
-        assert_eq!(
-            requests.len(),
-            2,
-            "cached probe must not call the model again"
-        );
-        assert_eq!(requests[0].tools.len(), 2);
-        assert_eq!(requests[0].tools[0].name, "ysda_doctor_probe");
-        assert_eq!(requests[0].tools[1].name, "ysda_doctor_decoy");
-        assert_eq!(requests[1].tools.len(), 2);
-        let tool_result = requests[1]
-            .messages
-            .iter()
-            .find(|message| message.role == ys_agent_core::ModelRole::Tool)
-            .expect("second request contains a Tool result");
-        assert_eq!(tool_result.tool_call_id.as_deref(), Some("call_probe_1"));
-        assert_eq!(tool_result.name.as_deref(), Some("ysda_doctor_probe"));
-        let assistant_call = requests[1]
-            .messages
-            .iter()
-            .find_map(|message| message.assistant_tool_call.as_ref())
-            .expect("second request replays the assistant Tool Call");
-        assert_eq!(assistant_call.provider_call_id, "call_probe_1");
-        assert_eq!(assistant_call.name, "ysda_doctor_probe");
-    }
-
-    #[tokio::test]
-    async fn model_protocol_probe_fails_closed_when_the_second_turn_responds() {
-        let model = Arc::new(ScriptedDoctorModel::new(vec![
-            doctor_tool_call("ysda_doctor_probe", Some("call_probe_respond")),
-            ModelResponse {
-                action: AgentAction::Respond {
-                    message: "ready".to_owned(),
-                },
-                raw_content: None,
-                usage: None,
-            },
-        ]));
-        let probe = ModelProtocolProbe::new(model, "test-model".to_owned());
-
-        let readiness = probe.readiness().await;
-
-        assert!(!readiness.reachable);
-        assert!(!readiness.supports_tool_calls);
-    }
-
-    #[tokio::test]
-    async fn model_protocol_probe_fails_closed_when_the_second_turn_is_not_exact_completion() {
-        let model = Arc::new(ScriptedDoctorModel::new(vec![
-            doctor_tool_call("ysda_doctor_probe", Some("call_probe_wrong")),
-            ModelResponse {
-                action: AgentAction::ProposeCompletion {
-                    summary: "almost".to_owned(),
-                    primary_artifact_hint: None,
-                },
-                raw_content: None,
-                usage: None,
-            },
-        ]));
-        let probe = ModelProtocolProbe::new(model, "test-model".to_owned());
-
-        let readiness = probe.readiness().await;
-
-        assert!(!readiness.reachable);
-    }
-
-    #[tokio::test]
-    async fn model_protocol_probe_fails_closed_when_the_first_turn_calls_the_decoy() {
-        let model = Arc::new(ScriptedDoctorModel::new(vec![
-            doctor_tool_call("ysda_doctor_decoy", Some("call_decoy")),
-            doctor_completion(),
-        ]));
-        let probe = ModelProtocolProbe::new(model, "test-model".to_owned());
-
-        let readiness = probe.readiness().await;
-
-        assert!(!readiness.reachable);
-    }
-
-    #[tokio::test]
-    async fn model_protocol_probe_fails_closed_when_the_second_turn_calls_a_tool_again() {
-        let model = Arc::new(ScriptedDoctorModel::new(vec![
-            doctor_tool_call("ysda_doctor_probe", Some("call_probe_2")),
-            doctor_tool_call("ysda_doctor_probe", Some("call_probe_3")),
-        ]));
-        let probe = ModelProtocolProbe::new(model, "test-model".to_owned());
-
-        let readiness = probe.readiness().await;
-
-        assert!(!readiness.reachable);
-        assert!(!readiness.supports_tool_calls);
-        assert!(!readiness.supports_tool_call_ids);
-        assert!(!readiness.supports_multi_turn_tool_results);
-        assert_eq!(readiness.context_limit, None);
-    }
-
     #[test]
     fn documented_query_cost_limit_is_parsed_into_the_runtime_budget() {
         let lookup = |key: &str| match key {
@@ -1843,6 +1716,111 @@ mod tests {
             .expect("artifact retention"),
             19
         );
+    }
+
+    #[test]
+    fn legacy_llm_environment_variables_are_not_a_bootstrap_configuration_path() {
+        let required = required_config_keys("sqlite");
+
+        assert!(!required.contains(&"YSDA_LLM_BASE_URL"));
+        assert!(!required.contains(&"YSDA_LLM_API_KEY"));
+        assert!(!required.contains(&"YSDA_LLM_MODEL"));
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_starts_manageable_but_blocks_queries_without_an_active_profile() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let runtime = Arc::new(
+            ys_agent_store::SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("open runtime store"),
+        );
+        let provider_runtime =
+            compose_provider_runtime(runtime, Arc::new(InMemoryCredentialVault::new()))
+                .await
+                .expect("compose Provider runtime");
+
+        assert_eq!(
+            provider_runtime
+                .management
+                .catalog()
+                .await
+                .expect("offline catalog")
+                .len(),
+            9
+        );
+        assert!(
+            provider_runtime
+                .management
+                .active_provider()
+                .await
+                .expect("active Provider")
+                .is_none()
+        );
+        let error = provider_runtime
+            .bindings
+            .bind_new_run(RunId::new())
+            .await
+            .expect_err("no-active installation must reject a Query binding");
+        assert_eq!(error.code(), "provider.no_active_profile");
+    }
+
+    #[tokio::test]
+    async fn provider_runtime_rechecks_a_pending_credential_journal_before_binding_a_query() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let runtime = Arc::new(
+            ys_agent_store::SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("open runtime store"),
+        );
+        let profile_id = ProfileId::new();
+        let repository = runtime.provider_repository();
+        repository
+            .save_revision(SaveProfileRevision {
+                precondition: RevisionPrecondition {
+                    profile_id,
+                    expected_current_revision: None,
+                },
+                name: ProfileName::new("Journal check").expect("valid profile name"),
+                revision: ProfileRevision::draft(
+                    profile_id,
+                    1,
+                    ProviderId::DeepSeek,
+                    ProviderModelId::new(ProviderId::DeepSeek, "deepseek/journal-check")
+                        .expect("valid model"),
+                    ProviderParameters::default(),
+                    None,
+                )
+                .expect("valid draft"),
+            })
+            .await
+            .expect("save draft profile");
+        let generation = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+            .expect("valid credential generation");
+        repository
+            .begin_credential_mutation(
+                CredentialMutationIntent::create(
+                    ys_agent_core::OperationId::new(),
+                    profile_id,
+                    1,
+                    generation,
+                )
+                .expect("valid journal intent"),
+            )
+            .await
+            .expect("record incomplete credential journal");
+
+        let provider_runtime =
+            compose_provider_runtime(runtime, Arc::new(InMemoryCredentialVault::new()))
+                .await
+                .expect("compose Provider runtime");
+        let error = provider_runtime
+            .bindings
+            .bind_new_run(RunId::new())
+            .await
+            .expect_err("pending credential journal must block a new Query");
+
+        assert_eq!(error.code(), "provider.operation.stale");
     }
 
     #[test]

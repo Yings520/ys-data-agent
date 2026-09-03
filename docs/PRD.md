@@ -24,14 +24,14 @@ Change
   ├── 小改动 → 直接 Code Agent → Code + Test + Review + Fresh Verification
   └── Feature  → cc-sdd requirements.md → design.md → tasks.md
                                       ↓
-                                  Ralph TUI
+                              $kiro-impl <feature>
                                       ↓
-                              Code Agent Loop
+                       依赖有序的 Code Agent Loop
 ~~~
 
-小改动必须保持本文的产品行为、公共契约、持久状态形状和稳定架构边界不变，并能由一个有界 Agent 会话安全完成。它不创建 BMAD 或 cc-sdd 文档，也不启动 Ralph，但仍需与风险相称的测试、实际 Diff Review 和新鲜验证。
+小改动必须保持本文的产品行为、公共契约、持久状态形状和稳定架构边界不变，并能由一个有界 Agent 会话安全完成。它不创建 BMAD 或 cc-sdd 文档，也不调用 `$kiro-impl`，但仍需与风险相称的测试、实际 Diff Review 和新鲜验证。
 
-Feature 包括新增或显著改变用户行为、公共契约、持久状态、外部集成、跨模块责任或需要多个可独立验收任务的 Change。只有当 Feature 同时改变项目方向、稳定架构、发布边界或演进顺序时才先更新本文；Feature 自身始终进入 cc-sdd 三文档，Tasks 人工批准后才交给 Ralph。
+Feature 包括新增或显著改变用户行为、公共契约、持久状态、外部集成、跨模块责任或需要多个可独立验收任务的 Change。只有当 Feature 同时改变项目方向、稳定架构、发布边界或演进顺序时才先更新本文；Feature 自身始终进入 cc-sdd 三文档，Tasks 人工批准后才可调用 `$kiro-impl` 直接执行。
 
 ## 2. 产品定位
 
@@ -184,7 +184,7 @@ v0.2 遇到未实现能力时返回 `UnsupportedCapability`，说明当前边界
 └──────────────┬──────────────────────┬───────────────────────┬────────────────┘
                │                      │                       │
        deterministic calls       ModelProvider       model/effectful actions
-               │              OpenAI-compatible first          │
+               │             unified governed providers         │
                │                                              ▼
                │                                      Tool Runtime
                │                                ToolCatalog → ToolView
@@ -1089,17 +1089,15 @@ v0.2 Query Eval 必须覆盖 GovernedMetric、AdHocRead、Metadata、歧义澄�
 
 Core 定义自己的 ModelRequest、ModelAction、ModelUsage 和 ModelFailure，不暴露具体厂商消息类型。
 
-v0.2 实现：
+ModelProvider 是 Runtime 面向模型能力的统一受治理边界。受支持 Provider 通过同一产品模型接入和管理；具体厂商协议、认证差异和 SDK 类型留在 Adapter 侧，Workflow、Tool Runtime、Policy、Completion Gate 和 QueryArtifact 不因 Provider 改变而分叉。
 
-- OpenAICompatibleProvider；
-- FakeModelProvider；
-- ReplayModelProvider。
+v0.2 支持技术用户在本地产品入口管理经过明确验证的 Provider 与模型，并继续提供 FakeModelProvider 和 ReplayModelProvider 作为无网络测试与可复现运行能力。Provider Catalog 只表达当前产品承诺的受支持范围，不把依赖或注册表中存在的所有 Provider、模型自动声明为可用。
 
-OpenAI-compatible Adapter 支持配置 base_url、api_key 和 model，并要求 Tool Calling、Tool Call ID、结构化参数和多轮 Tool Result 回传。Provider 不满足能力时，在 Run 启动前拒绝。
+每个待使用的 Provider 与模型必须在 Run 启动前证明满足当前 Workflow 所需的模型协议能力。未知、未经验证或能力不足的组合必须 fail closed，不能通过自由文本、降低 Tool 或验证要求、静默换用其他 Provider 等方式绕过门禁。
 
-“OpenAI-compatible”只表示通过 v0.2 明确测试的协议子集，不表示所有兼容服务都可用。v0.2 禁用并行 Tool Call、Streaming 和 Provider-specific reasoning 参数；Provider Profile 必须声明 context window、Tool Schema 上限和错误语义。未知能力 fail closed。
+活动 Provider 配置只影响之后启动的 Run。每个 Run 绑定不可变的非敏感 Provider 配置证据；配置编辑或切换不得改变进行中 Run 的 Provider、模型、凭证或关键行为参数。Provider Credential 与普通配置、Event、Artifact 和 Telemetry 分离，并遵循 §13.4 与架构不变量中的 Secret 约束。
 
-后续可以新增 AnthropicProvider、GeminiProvider 或 LocalProvider，不修改 Workflow。
+具体支持范围、管理行为、认证流程、能力验证、错误语义和验收证据由 `provider-management` Feature 的 cc-sdd Requirements、Design 和 Tasks 定义；本节只固定跨 Feature 的 Runtime、治理和演进边界。
 
 ## 22. AgentService 与产品入口
 
@@ -1236,6 +1234,8 @@ Runtime、Store 和 Adapters 互不直接形成循环依赖，由 apps/ysda 负�
 
 公共 Runtime 只实现 Query 真正使用的能力。v0.2 的成功不以未来类型数量衡量，而以用户能否更快、更安全地获得可信答案衡量。
 
+v0.2 同时允许技术用户在本地管理并选择经过验证的 Model Provider，使 Provider 差异不再要求修改代码或改变 Query Workflow。该扩展只改变模型接入与配置边界，不扩大 QueryIntent、数据权限、Workflow、Completion Gate 或可信交付承诺。
+
 ### 26.2 首个用户、前置条件与支持场景
 
 直接用户、Workspace 前置条件和产品承诺遵循 §2.3。Pilot 至少覆盖：
@@ -1261,7 +1261,7 @@ v0.2 只实例化 Semantic & Metric、Metadata/Freshness、Query Planning & Veri
 - Query/Clarification/UnsupportedCapability 的确定性 Coordinator；
 - ToolCatalog、按 QueryPhase 生成的静态 ToolView、Tool Runtime 和 QueryBudget；
 - SQL AST、数据库只读身份、Source ACL、成本/行数/字节/超时与敏感结果防线；
-- OpenAICompatibleProvider、FakeProvider 和 ReplayProvider；
+- 统一 ModelProvider 接入、受支持 Provider 的本地管理与能力门禁，以及 FakeProvider 和 ReplayProvider；
 - SQLite 测试数据源；
 - Postgres 第一个真实数据源；
 - dbt manifest 第一个工程 Context Adapter；
@@ -1294,7 +1294,9 @@ Workspace Bootstrap、WorkspaceReadinessReport、Starter Data Stack Profile、Pr
 - Lance/LanceDB Adapter、Embedding、向量索引与全量 RAG Pipeline；
 - 完整语义引擎；
 - Dashboard 生成；
-- 多种非 OpenAI 协议 Provider；
+- 任意自定义 Provider 协议、未经产品验证的 Provider 或模型，以及把依赖目录中的全部 Provider 自动视为受支持；
+- Provider 自动回退、负载均衡、基于成本或延迟的隐式路由；
+- Embedding、Image、Audio、Moderation 等非 Chat 模态的模型能力；
 - Workspace Bootstrap、客户成熟度自动诊断和非技术治理向导；
 - Excel、CSV、SaaS Connector 和增量数据接入；
 - Starter Data Stack 的 Provision、配置、升级和托管运维；
@@ -1303,7 +1305,8 @@ Workspace Bootstrap、WorkspaceReadinessReport、Starter Data Stack Profile、Pr
 ### 26.6 v0.2 首次使用与可信查询闭环
 
 ~~~text
-ysda doctor 检查 Model、Connector、只读权限、Metric、dbt 和 Freshness
+用户在本地产品入口配置或选择受支持的 Model Provider
+→ ysda doctor 检查所选模型能力、Connector、只读权限、Metric、dbt 和 Freshness
 → 用户在 TUI 输入问题
 → AgentService 创建或继续 Task
 → Coordinator 分类为 Query、Clarification 或 UnsupportedCapability
@@ -1392,6 +1395,10 @@ Pilot 的项目级结果门槛是：
 ## 27. 后续演进顺序
 
 以下版本表达产品演进顺序，不表示一次实现长期愿景。每个版本都必须形成可独立使用、可测试和可发布的垂直切片；未列入该版本的长期概念不得提前创建空 Trait、状态或基础设施。
+
+### v0.2 当前扩展：统一 Model Provider 管理
+
+在进入 v0.3 前，v0.2 通过一个独立 Feature 增加受控的多 Provider 管理垂直切片：技术用户可以从本地产品入口选择经过验证的 Provider 与模型，而 Runtime 保持厂商无关的模型契约、能力门禁、Run 证据和 Query 治理。该里程碑不新增业务 Workflow，不引入自动路由或静默回退；具体范围和退出证据由 `provider-management` 的 cc-sdd 文档定义。
 
 ### Agent Context Lakehouse：按条件启用的横向里程碑
 
@@ -1528,6 +1535,7 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 20. 业务数据责任人负责业务确认和高风险授权，但批准身份不能自动获得实际生产执行权限。
 21. YS Data Agent 可以 Provision 和管理成熟基础设施，但不能重新实现数据库、计算引擎、转换框架或调度器。
 22. 托管控制平面不能默认复制客户原始业务数据；任何数据出境都必须经过 Workspace Policy 和敏感级别检查。
+23. Model Provider 或模型的配置、验证和切换不能改变 Policy、Tool Runtime、Workflow 或 Completion Gate 的权威；每个 Run 必须绑定不可变的 Provider 配置证据，未知能力必须 fail closed。
 
 ## 30. 参考项目的取舍
 

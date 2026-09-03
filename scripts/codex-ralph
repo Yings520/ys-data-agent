@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Ralph TUI 0.12 still emits the removed Codex `--full-auto` flag. The project
-# disables that adapter mode and uses the current global approval flag instead.
-# Do not route JSONL through RTK here: Ralph must receive Codex's raw event stream.
-exec codex -a never "$@"

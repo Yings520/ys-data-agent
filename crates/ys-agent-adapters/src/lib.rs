@@ -1,8 +1,10 @@
 //! Adapters for external systems and infrastructure.
 
 pub mod context;
+pub mod credential;
 pub mod data;
 pub mod model;
+pub mod oauth;
 pub mod tools;
 
 pub use context::{DbtManifestAdapter, FileMetricRegistry};

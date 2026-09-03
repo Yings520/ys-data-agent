@@ -1,6 +1,9 @@
 use ys_agent_core::{
-    AgentAction, ArtifactMetadata, ContextEvidence, ContextManifest, CredentialReference,
-    InstructionTrust, RunEventKind, Sensitivity, ToolOutcome, VersionedRunEvent,
+    ActiveProviderSlot, AgentAction, ArtifactMetadata, CompatibilityEvidence, ContextEvidence,
+    ContextManifest, CreateRunCommand, CredentialGeneration, CredentialKind, CredentialReference,
+    InstructionTrust, PendingRunEvent, ProfileId, ProfileRevision, ProviderId, ProviderModelId,
+    ProviderParameters, Run, RunEventKind, Sensitivity, ToolOutcome, ValidationVersions,
+    VersionedRunEvent, WorkflowKind,
 };
 
 #[test]
@@ -43,9 +46,9 @@ fn core_serializes_a_credential_reference_not_a_secret() {
 
 #[test]
 fn credential_reference_exposes_only_its_environment_variable_name() {
-    let reference = CredentialReference::new("env:YSDA_LLM_API_KEY").expect("valid ref");
+    let reference = CredentialReference::new("env:TEST_CREDENTIAL").expect("valid ref");
 
-    assert_eq!(reference.environment_variable_name(), "YSDA_LLM_API_KEY");
+    assert_eq!(reference.environment_variable_name(), "TEST_CREDENTIAL");
 }
 
 #[test]
@@ -60,4 +63,67 @@ fn sensitive_query_artifacts_require_retention_metadata() {
         .build()
         .expect_err("restricted artifacts need retention and expiry");
     assert_eq!(error.code(), "missing_retention_policy");
+}
+
+fn binding_for(run_id: ys_agent_core::RunId) -> ys_agent_core::RunProviderBinding {
+    let profile_id = ProfileId::new();
+    let versions = ValidationVersions::new("catalog-v1", "probe-v1", "liter-v1", "codec-v1");
+    let credential = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+        .expect("valid credential generation");
+    let mut revision = ProfileRevision::draft(
+        profile_id,
+        1,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/test-model")
+            .expect("model prefix is valid"),
+        ProviderParameters::default(),
+        Some(credential),
+    )
+    .expect("valid provider revision");
+    let evidence = CompatibilityEvidence::passing(revision.validation_inputs(versions.clone()));
+    revision
+        .accept_validation(evidence, versions)
+        .expect("matching validation evidence");
+
+    let mut active = ActiveProviderSlot::empty();
+    active
+        .activate(&revision)
+        .expect("ready revision activates");
+    ys_agent_core::RunProviderBinding::from_active(
+        run_id,
+        active.current().expect("active provider").clone(),
+    )
+    .expect("binding is valid")
+}
+
+#[test]
+fn production_run_command_requires_matching_binding_and_emits_provider_bound_first() {
+    let run = Run::new(ys_agent_core::TaskId::new(), WorkflowKind::Query);
+    let snapshot = run.snapshot(serde_json::json!({}), None, None, None);
+    let command = CreateRunCommand::new(
+        snapshot,
+        binding_for(run.id),
+        vec![PendingRunEvent {
+            actor: ys_agent_core::EventActor::System,
+            kind: RunEventKind::RunStarted,
+        }],
+    )
+    .expect("a production Run needs one complete binding");
+
+    assert!(matches!(
+        command.initial_events().first().map(|event| &event.kind),
+        Some(RunEventKind::ProviderBound { .. })
+    ));
+    let event = serde_json::to_string(&command.initial_events()[0]).expect("event serializes");
+    assert!(event.contains("provider_bound"));
+    assert!(!event.contains("credential_generation"));
+
+    let other_run = Run::new(ys_agent_core::TaskId::new(), WorkflowKind::Query);
+    let mismatch = CreateRunCommand::new(
+        other_run.snapshot(serde_json::json!({}), None, None, None),
+        binding_for(run.id),
+        Vec::new(),
+    )
+    .expect_err("a binding cannot be attached to a different Run");
+    assert_eq!(mismatch.code(), "run_provider_binding_mismatch");
 }

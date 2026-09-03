@@ -136,8 +136,9 @@ async fn dbt_text_cannot_become_a_system_instruction_or_add_a_tool() {
         .assemble(&request, &view)
         .await
         .expect("assemble context");
-    let model_request = PromptBuilder::new("test-model")
+    let model_request = PromptBuilder::new()
         .build(
+            "test-model",
             &request.task_goal,
             QueryPhase::ResolveContext,
             &assembled.manifest,

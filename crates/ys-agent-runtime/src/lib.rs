@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod export;
 mod harness;
 mod loop_driver;
+pub mod provider;
 mod recovery;
 mod service;
 
@@ -22,11 +23,13 @@ pub use harness::{Harness, HarnessConfig, HarnessDependencies};
 pub use loop_driver::{
     HarnessStep, LoopBudget, LoopDriver, LoopResult, LoopUsage, StepAccounting, StepOutcome,
 };
+pub use provider::resolver::{FixedRunModelProviderResolver, RunBoundProviderResolver};
 pub use recovery::{RecoveryDecision, RecoveryManager, RecoveryRequest};
 pub use service::{
-    AgentServiceApi, ArtifactView, CreateTaskRequest, EventSubscription, InProcessAgentService,
-    NoopRunScheduler, RunScheduler, SendMessageRequest, ServiceEvent, ServiceEventPublisher,
-    ServiceReply,
+    ActiveRunProviderBindingSource, AgentServiceApi, ArtifactView, CreateTaskRequest,
+    EventSubscription, InProcessAgentService, NoopRunScheduler, RunScheduler, SendMessageRequest,
+    ServiceEvent, ServiceEventPublisher, ServiceReply, StaticRunProviderBindingSource,
+    UnavailableRunProviderBindingSource,
 };
 pub use workflow::query::{
     ClarificationNeed, FreshnessState, MetricReference, ParameterKind, QUERY_SYSTEM_PROMPT_VERSION,

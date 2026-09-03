@@ -2,6 +2,7 @@
 set -euo pipefail
 
 rtk node --test tools/workflow/*.test.mjs
+rtk node tools/workflow/provider-management-release-gate.mjs
 
 compose_file="fixtures/postgres/compose.yaml"
 compose_project="ysda-v02-release-gate"
@@ -40,8 +41,10 @@ rtk cargo test -p ysda --test query_eval_test
 rtk cargo test -p ysda model_protocol_probe --lib
 rtk cargo test \
   -p ys-agent-adapters \
-  --test model_provider_test \
-  returns_the_original_tool_call_id_with_a_tool_result
+  tool_call_and_result_round_trip_preserves_the_provider_id
+rtk cargo test \
+  -p ys-agent-adapters \
+  request_and_multi_turn_tool_result_preserve_the_provider_call_id
 rtk cargo test -p ysda --test doctor_test
 rtk cargo test -p ysda --test export_test
 rtk cargo test -p ysda --test tui_test

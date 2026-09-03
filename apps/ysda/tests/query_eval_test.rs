@@ -826,6 +826,7 @@ fn observe_events(events: &[ys_agent_core::EventEnvelope]) -> ObservedEvents {
 
 fn event_name(event: &RunEventKind) -> &'static str {
     match event {
+        RunEventKind::ProviderBound { .. } => "provider_bound",
         RunEventKind::RunStarted => "run_started",
         RunEventKind::StepStarted { .. } => "step_started",
         RunEventKind::ModelRequested { .. } => "model_requested",

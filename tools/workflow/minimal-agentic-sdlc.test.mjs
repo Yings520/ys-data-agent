@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -47,15 +47,15 @@ async function readTree(root) {
 test("project exposes only the six workflow entry skills", async () => {
   assert.deepEqual(await projectSkillNames(), [
     "bmad-prd",
+    "kiro-impl",
     "kiro-spec-design",
     "kiro-spec-init",
     "kiro-spec-requirements",
     "kiro-spec-tasks",
-    "run-cc-sdd-task",
   ]);
 
-  const runner = await readFile(
-    path.join(skillsRoot, "run-cc-sdd-task/SKILL.md"),
+  const implementationSkill = await readFile(
+    path.join(skillsRoot, "kiro-impl/SKILL.md"),
     "utf8",
   );
   for (const reference of [
@@ -65,10 +65,19 @@ test("project exposes only the six workflow entry skills", async () => {
     "validation.md",
   ]) {
     await readFile(
-      path.join(skillsRoot, "run-cc-sdd-task/references", reference),
+      path.join(skillsRoot, "kiro-impl/references", reference),
       "utf8",
     );
-    assert.match(runner, new RegExp(`references/${reference}`));
+    assert.match(implementationSkill, new RegExp(`references/${reference}`));
+  }
+  for (const contract of [
+    /\$kiro-impl <feature>/,
+    /cc-sdd-task-state\.mjs <feature> --next/,
+    /one task commit/i,
+    /repeat|continue/i,
+    /VALIDATE/,
+  ]) {
+    assert.match(implementationSkill, contract);
   }
 });
 
@@ -111,7 +120,7 @@ test("ordinary Features skip BMAD while project-boundary changes update the PRD"
     "utf8",
   );
   const guide = await readFile(
-    path.join(projectRoot, "docs/BMAD-CC-SDD-RALPH-USAGE.md"),
+    path.join(projectRoot, "docs/BMAD-CC-SDD-USAGE.md"),
     "utf8",
   );
 
@@ -125,7 +134,7 @@ test("ordinary Features skip BMAD while project-boundary changes update the PRD"
   assert.match(guide, /只修改项目级 Provider 架构、v0\.2 发布边界和演进计划/);
 });
 
-test("a new Provider capability starts as a cc-sdd Feature input", async () => {
+test("provider management remains an approved cc-sdd Feature", async () => {
   const featureRoot = path.join(
     projectRoot,
     ".kiro/specs/provider-management",
@@ -139,24 +148,18 @@ test("a new Provider capability starts as a cc-sdd Feature input", async () => {
   );
 
   assert.equal(control.feature_name, "provider-management");
-  assert.equal(control.phase, "initialized");
-  assert.equal(control.approvals.requirements.generated, false);
-  assert.equal(control.approvals.requirements.approved, false);
-  assert.equal(control.approvals.design.generated, false);
-  assert.equal(control.approvals.design.approved, false);
-  assert.equal(control.approvals.tasks.generated, false);
-  assert.equal(control.approvals.tasks.approved, false);
-  assert.equal(control.ready_for_implementation, false);
-  assert.match(requirements, /统一 LLM Provider 接入与管理/);
-  assert.match(requirements, /FR-18/);
-  assert.match(requirements, /NFR-17/);
-  assert.match(requirements, /AC-13/);
-  assert.match(requirements, /\$kiro-spec-requirements provider-management/);
+  assert.equal(control.phase, "tasks-generated");
+  assert.equal(control.approvals.requirements.approved, true);
+  assert.equal(control.approvals.design.approved, true);
+  assert.equal(control.approvals.tasks.approved, true);
+  assert.equal(control.ready_for_implementation, true);
+  assert.match(requirements, /本地、受治理的 LLM Provider 管理能力/);
+  assert.match(requirements, /Requirement 11: 安全、隐私与发布证据/);
+  assert.match(requirements, /ChatGPT Subscription OAuth Connection/);
+  assert.match(requirements, /Provider Catalog/);
   await Promise.all(
     ["design.md", "tasks.md"].map((file) =>
-      assert.rejects(readFile(path.join(featureRoot, file), "utf8"), {
-        code: "ENOENT",
-      }),
+      readFile(path.join(featureRoot, file), "utf8"),
     ),
   );
 });
@@ -179,7 +182,6 @@ test("cc-sdd persists only requirements, design, and tasks as feature documents"
     "brief.md",
     "research.md",
     "$kiro-discovery",
-    "$kiro-impl",
     "$kiro-spec-quick",
     "$kiro-spec-batch",
     "$kiro-validate-gap",
@@ -198,7 +200,7 @@ test("cc-sdd persists only requirements, design, and tasks as feature documents"
 
 test("repository guidance documents the minimal source-of-truth chain", async () => {
   const guidance = await Promise.all(
-    ["AGENTS.md", "README.md", "docs/BMAD-CC-SDD-RALPH-USAGE.md"].map(
+    ["AGENTS.md", "README.md", "docs/BMAD-CC-SDD-USAGE.md"].map(
       (file) => readFile(path.join(projectRoot, file), "utf8"),
     ),
   );
@@ -217,13 +219,15 @@ test("repository guidance documents the minimal source-of-truth chain", async ()
     "brief.md",
     "research.md",
     "$kiro-discovery",
-    "$kiro-impl",
     "$kiro-spec-quick",
     "$kiro-spec-batch",
     "$kiro-spec-status",
     "$kiro-validate-gap",
     "$kiro-validate-design",
     "$kiro-validate-impl",
+    "$run-cc-sdd-task",
+    "Ralph",
+    ".ralph-tui",
     "planning-artifacts/prds",
     "root PRD.md",
     "root `PRD.md`",
@@ -241,9 +245,8 @@ test("repository guidance documents the minimal source-of-truth chain", async ()
     "$kiro-spec-requirements",
     "$kiro-spec-design",
     "$kiro-spec-tasks",
-    "$run-cc-sdd-task",
+    "$kiro-impl",
     "tasks.md",
-    ".ralph-tui/generated/",
     "小改动",
     "直接 Code Agent",
     "Feature",
@@ -254,4 +257,42 @@ test("repository guidance documents the minimal source-of-truth chain", async ()
       new RegExp(required.replaceAll("$", "\\$").replaceAll(".", "\\.")),
     );
   }
+});
+
+test("direct implementation requires both repository execution policies", async () => {
+  const enforcement = await Promise.all(
+    ["AGENTS.md", ".agents/skills/kiro-impl/SKILL.md"].map((file) =>
+      readFile(path.join(projectRoot, file), "utf8"),
+    ),
+  );
+  for (const contents of enforcement) {
+    for (const policyPath of [
+      ".ysda/agents/rust-engineer.md",
+      ".ysda/agents/code-change-pr-workflow.md",
+    ]) {
+      assert.match(contents, new RegExp(policyPath.replaceAll(".", "\\.")));
+    }
+    assert.match(contents, /read completely|完整读取/i);
+    assert.match(contents, /blocked|stop|阻塞/i);
+  }
+});
+
+test("repository has no Ralph runtime or compatibility assets", async () => {
+  for (const relativePath of [
+    ".ralph-tui",
+    ".ralph-tui-prompt.hbs",
+    "scripts/ralph-cc-sdd.sh",
+    "scripts/codex-ralph",
+    "tools/workflow/ralph-cc-sdd-launcher.test.mjs",
+    "docs/superpowers/plans/2026-09-02-ralph-task-policy-publishing.md",
+    "docs/superpowers/specs/2026-09-02-ralph-task-policy-publishing-design.md",
+  ]) {
+    await assert.rejects(stat(path.join(projectRoot, relativePath)), {
+      code: "ENOENT",
+    });
+  }
+  assert.doesNotMatch(
+    await readFile(path.join(projectRoot, ".gitignore"), "utf8"),
+    /ralph/i,
+  );
 });
