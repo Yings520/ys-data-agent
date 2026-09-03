@@ -65,7 +65,7 @@
   - _Requirements: 3.5, 3.6, 3.7, 3.8_
   - _Boundary: TUI Mode Picker state_
   - _Depends: 2.1_
-- [ ] 2.3 建立 View、Overlay、焦点与输入优先级状态
+- [x] 2.3 建立 View、Overlay、焦点与输入优先级状态
   - 建立以 Timeline 为根的页面栈，并为 Artifact、Model Selection 和既有 Provider Management 保存独立的搜索、高亮、滚动与焦点状态。
   - 保证同一时刻最多一个 Overlay，输入处理顺序固定为 Overlay、当前 View、Composer。
   - 为结果卡片建立键盘焦点和可选鼠标命中区域，但把实际 Artifact 读取留给后续集成任务。

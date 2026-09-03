@@ -1,9 +1,11 @@
 use ratatui::layout::Rect;
 use ys_agent_core::Principal;
 use ysda::tui::{
-    ColorSpec, DetailKind, DetailView, InputAction, LayoutMode, ModePickerAction,
-    ModePickerOutcome, ModePickerState, ThemeRegistry, TransientView, TuiApp, TuiQueryMode,
-    UiPreferences, bottom_panel_height, parse_input, render_to_string,
+    ArtifactWorkspaceState, ColorSpec, ContentRoute, DetailKind, DetailView, FocusTarget,
+    HitRegion, InputAction, InputLayer, LayoutMode, ModePickerAction, ModePickerOutcome,
+    ModePickerState, ModelSelectionState, NavigationState, Overlay, ThemeRegistry, TimelineState,
+    TransientView, TuiApp, TuiQueryMode, UiPreferences, bottom_panel_height, parse_input,
+    render_to_string,
 };
 
 #[test]
@@ -107,6 +109,67 @@ fn cancelling_mode_picker_restores_mode_composer_and_page() {
     assert_eq!(app.composer.text(), "kept question");
     assert_eq!(app.transient, Some(TransientView::Detail(DetailKind::Sql)));
     assert_eq!(app.detail.as_ref().expect("restored detail").title, "SQL");
+}
+
+#[test]
+fn route_overlay_and_focus_state_is_local_reversible_and_independent() {
+    let mut navigation = NavigationState::new();
+    assert_eq!(navigation.routes(), [ContentRoute::Timeline]);
+    assert_eq!(navigation.current(), ContentRoute::Timeline);
+    assert_eq!(navigation.input_layer(), InputLayer::View);
+
+    navigation.push(ContentRoute::Artifact);
+    assert_eq!(navigation.current(), ContentRoute::Artifact);
+    assert!(navigation.open_overlay(Overlay::CommandPalette));
+    assert!(!navigation.open_overlay(Overlay::Help));
+    assert_eq!(navigation.input_layer(), InputLayer::Overlay);
+    assert_eq!(navigation.close_overlay(), Some(Overlay::CommandPalette));
+    assert_eq!(navigation.pop(), Some(ContentRoute::Artifact));
+    assert_eq!(navigation.current(), ContentRoute::Timeline);
+    assert_eq!(
+        NavigationState::input_priority(),
+        [InputLayer::Overlay, InputLayer::View, InputLayer::Composer]
+    );
+
+    let artifact = ArtifactWorkspaceState {
+        search: "revenue".to_owned(),
+        highlighted: Some(3),
+        scroll: 9,
+        focus: FocusTarget::ArtifactContent,
+    };
+    let models = ModelSelectionState {
+        search: "deepseek".to_owned(),
+        highlighted: Some(1),
+        scroll: 4,
+        focus: FocusTarget::ModelSelectionList,
+    };
+    assert_ne!(artifact.search, models.search);
+    assert_ne!(artifact.highlighted, models.highlighted);
+
+    let mut timeline = TimelineState::default();
+    timeline.focus_result_card(HitRegion::new(2, 3, 20, 4));
+    assert_eq!(timeline.focus, FocusTarget::TimelineResultCard);
+    assert!(
+        timeline
+            .result_card_hit_region
+            .expect("hit region")
+            .contains(4, 5)
+    );
+    assert!(
+        !timeline
+            .result_card_hit_region
+            .expect("hit region")
+            .contains(40, 5)
+    );
+
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    app.artifact_workspace = artifact;
+    app.model_selection_state = models;
+    app.push_route(ContentRoute::Artifact);
+    assert!(render_to_string(&app, 100, 28).contains("Search · revenue"));
+    assert_eq!(app.pop_route(), Some(ContentRoute::Artifact));
+    app.push_route(ContentRoute::ModelSelection);
+    assert!(render_to_string(&app, 100, 28).contains("Search · deepseek"));
 }
 
 #[test]

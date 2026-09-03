@@ -18,14 +18,18 @@ use ys_agent_runtime::{
 use super::input::{DetailRequest, InputAction};
 use super::{
     AsyncOperationRegistry, ProviderOperationCompletion, ProviderOperationPolicy,
+    artifact::ArtifactWorkspaceState,
     composer::ComposerState,
     mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQueryMode},
+    model_selection::ModelSelectionState,
+    navigation::{ContentRoute, NavigationState, ProviderNavigationState},
     palette::SlashPalette,
     provider_management::{
         ProviderManagementScreen, ProviderManagementScreenView, ProviderManagementStep,
         ProviderManagementView, ProviderOperationKind, ProviderProfileView, ProviderResultOutcome,
     },
     theme::{ThemeRegistry, UiPreferences, YsdaTheme},
+    timeline::TimelineState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -103,6 +107,11 @@ pub struct DiagnosticsView {
 
 #[derive(Debug, Clone)]
 pub struct TuiApp {
+    pub navigation: NavigationState,
+    pub timeline_state: TimelineState,
+    pub artifact_workspace: ArtifactWorkspaceState,
+    pub model_selection_state: ModelSelectionState,
+    pub provider_navigation: ProviderNavigationState,
     pub workspace_name: String,
     pub principal_name: String,
     pub model_label: String,
@@ -144,6 +153,11 @@ impl TuiApp {
         let theme_names = theme_registry.names().map(str::to_owned).collect();
         let active_theme = theme_registry.resolve("deep-navy").expect("built-in theme");
         Self {
+            navigation: NavigationState::new(),
+            timeline_state: TimelineState::default(),
+            artifact_workspace: ArtifactWorkspaceState::default(),
+            model_selection_state: ModelSelectionState::default(),
+            provider_navigation: ProviderNavigationState::default(),
             workspace_name: "local".to_owned(),
             principal_name: principal.display_name,
             model_label: "not checked".to_owned(),
@@ -264,6 +278,14 @@ impl TuiApp {
         self.mode_picker_return = self.transient;
         self.mode_picker = Some(ModePickerState::new(self.query_mode, self.composer.text()));
         self.transient = Some(TransientView::ModePicker);
+    }
+
+    pub fn push_route(&mut self, route: ContentRoute) {
+        self.navigation.push(route);
+    }
+
+    pub fn pop_route(&mut self) -> Option<ContentRoute> {
+        self.navigation.pop()
     }
 
     pub fn push_transcript(&mut self, item: TranscriptItem) {

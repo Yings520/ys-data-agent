@@ -10,7 +10,10 @@ use ratatui::{
 use super::{
     TransientView, TuiApp,
     app::{DetailKind, TranscriptItem},
+    artifact, model_selection,
+    navigation::ContentRoute,
     palette::{command_catalog, command_hint},
+    timeline,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,10 +119,35 @@ fn render_header(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMo
 fn render_body(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMode) {
     let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
     let text = match app.transient {
-        Some(TransientView::Detail(_)) => detail_lines(app),
         Some(TransientView::Help) => help_lines(),
         Some(TransientView::Repair) => repair_lines(app),
-        _ => transcript_lines(app),
+        _ => match app.navigation.current() {
+            ContentRoute::Timeline => match app.transient {
+                Some(TransientView::Detail(_)) => detail_lines(app),
+                _ => {
+                    let mut text = transcript_lines(app);
+                    text.lines.extend(
+                        timeline::render_lines(&app.timeline_state)
+                            .into_iter()
+                            .map(Line::from),
+                    );
+                    text
+                }
+            },
+            ContentRoute::Artifact => Text::from(
+                artifact::render_lines(&app.artifact_workspace)
+                    .into_iter()
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            ),
+            ContentRoute::ModelSelection => Text::from(
+                model_selection::render_lines(&app.model_selection_state)
+                    .into_iter()
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            ),
+            ContentRoute::ProviderManagement | ContentRoute::Diagnostics => detail_lines(app),
+        },
     };
     let borders = if mode == LayoutMode::Compact {
         Borders::NONE
