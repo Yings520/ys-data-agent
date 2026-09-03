@@ -632,7 +632,7 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
     }
 }
 
-async fn handle_terminal_event(
+pub(crate) async fn handle_terminal_event(
     app: &mut TuiApp,
     controller: &mut TuiController,
     event: Event,
@@ -1795,6 +1795,7 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("Active · DeepSeek"))
         );
+
     }
 
     #[tokio::test]

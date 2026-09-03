@@ -2556,6 +2556,7 @@ mod provider_management_tests {
     };
 
     use async_trait::async_trait;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ys_agent_adapters::{
         credential::keyring::InMemoryCredentialVault,
         model::{discovery::LiterModelDiscovery, liter::LiterProviderFactory},
@@ -2700,24 +2701,35 @@ mod provider_management_tests {
             .expect("model command loads governed selection");
         assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
         assert_eq!(app.transient, None);
-        controller
-            .apply_model_selection_action(
+        for key in [KeyCode::Right, KeyCode::Left] {
+            crate::tui::event_loop::handle_terminal_event(
                 &mut app,
-                ModelSelectionAction::SearchChanged("xAI".to_owned()),
+                &mut controller,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            )
+            .await
+            .expect("switch Providers and Plans");
+        }
+        for character in "xAI".chars() {
+            crate::tui::event_loop::handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )),
             )
             .await
             .expect("search selection");
+        }
         let original_highlight = app.model_selection_state.highlighted;
-        let outcome = controller
-            .apply_model_selection_action(&mut app, ModelSelectionAction::Confirm)
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
             .await
             .expect("Needs setup opens existing Provider flow");
-        assert!(matches!(
-            outcome,
-            ModelSelectionOutcome::OpenProviderManagement(SelectionTarget::Provider(
-                ProviderId::Xai
-            ))
-        ));
         assert_eq!(app.navigation.current(), ContentRoute::ProviderManagement);
         assert_eq!(
             controller
@@ -2735,7 +2747,13 @@ mod provider_management_tests {
             "setup must not switch before validation"
         );
 
-        controller.close_provider_management(&mut app).await;
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("return to Model Selection");
         assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
         assert_eq!(app.model_selection_state.search, "xAI");
         assert_eq!(app.model_selection_state.highlighted, original_highlight);

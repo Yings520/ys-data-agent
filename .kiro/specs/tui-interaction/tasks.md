@@ -199,7 +199,7 @@
   - _Requirements: 2.4, 2.7, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.8, 4.2, 4.9_
   - _Boundary: TUI public KeyEvent interaction tests_
   - _Depends: 4.3, 4.6_
-- [ ] 5.2 验证 Model Selection、Provider 配置与异步交互
+- [x] 5.2 验证 Model Selection、Provider 配置与异步交互
   - 使用真实 KeyEvent 覆盖 Providers/Plans 切换、搜索、两级进入、逐层返回、Needs setup 和不可用候选阻断。
   - 覆盖发现失败保留已保存候选、空 Catalog retry、Current 唯一性，以及不同 Profile 同名模型不合并。
   - 以可控异步 completion 验证 Provider mutation 串行、安全取消和 operation ID/route key 丢弃陈旧结果。
