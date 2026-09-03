@@ -240,7 +240,7 @@
   - _Requirements: 1.1, 1.2, 1.4, 1.5, 1.6, 2.1, 2.2, 2.3, 6.2, 6.4, 6.6, 6.7, 6.8_
   - _Boundary: TUI responsive renderer golden and non-success state tests_
   - _Depends: 3.5, 4.2, 4.3, 5.1_
-- [ ] 5.7 验证敏感信息、外部文本与生产数据边界
+- [x] 5.7 验证敏感信息、外部文本与生产数据边界
   - 向 Display Context、候选、Artifact 和错误输入 Secret、DSN、内部 ID、raw payload、Provider 回显和受限业务行，证明默认渲染树与可序列化安全视图均不泄露。
   - 注入控制字符与超长文本，验证清理、限制宽度和安全换行不会改变状态语义或破坏布局。
   - 扫描并运行负向测试，确保 Timeline、Artifact 和 Model Selection 不使用生产 fixture、固定 SQL、演示数据或伪造候选。
