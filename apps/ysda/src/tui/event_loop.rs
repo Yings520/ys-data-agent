@@ -1837,6 +1837,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_keys_cover_palette_mode_and_artifact_navigation() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let workspace_id = WorkspaceId::new();
+        let service = Arc::new(InProcessAgentService::new(
+            workspace_id,
+            store,
+            artifacts,
+            Arc::new(NoopRunScheduler),
+        ));
+        let principal = Principal::local_operator("keyboard-contract-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+        )
+        .await
+        .expect("slash opens palette");
+        assert_eq!(app.transient, Some(super::TransientView::SlashPalette));
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+        )
+        .await
+        .expect("unmatched search remains editable");
+        assert_eq!(app.transient, Some(super::TransientView::SlashPalette));
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("palette cancel");
+        assert_eq!(app.composer.text(), "");
+
+        app.composer.set_text("/mode");
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("open mode picker");
+        assert_eq!(app.transient, Some(super::TransientView::ModePicker));
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("select Query mode");
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("confirm Query mode");
+        assert_eq!(app.query_mode, crate::tui::TuiQueryMode::Query);
+
+        app.push_route(ContentRoute::Artifact);
+        let first = app.artifact_workspace.tab();
+        for _ in 0..5 {
+            handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            )
+            .await
+            .expect("cycle Artifact tabs");
+        }
+        assert_eq!(app.artifact_workspace.tab(), first);
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("Artifact back");
+        assert_eq!(app.navigation.current(), ContentRoute::Timeline);
+    }
+
+    #[tokio::test]
     async fn tui_submission_acknowledges_before_model_returns() {
         let directory = tempdir().expect("temporary directory");
         let store = Arc::new(

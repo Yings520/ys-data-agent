@@ -191,7 +191,7 @@
   - _Depends: 4.5_
 
 - [ ] 5. 验证真实交互、安全渲染与发布门禁
-- [ ] 5.1 验证命令、Mode 与页面导航的真实键盘路径
+- [x] 5.1 验证命令、Mode 与页面导航的真实键盘路径
   - 使用真实 Crossterm KeyEvent 驱动公开输入路径，覆盖命令起始位置、实时搜索、无匹配、↑/↓、Enter、Esc 和 Overlay→View→Composer 优先级。
   - 证明命令面板、解析器、Footer 与帮助界面只公开 `/mode` 和 `/model`，旧命令不能通过隐藏路径执行。
   - 覆盖 Auto/Query 确认与取消、结果卡片 Enter、Artifact 五页签和逐层返回，不直接修改 reducer 私有字段。
