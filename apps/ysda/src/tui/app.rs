@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use ys_agent_core::{
     ActiveProviderView, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, CommandId,
@@ -19,7 +19,8 @@ use ys_agent_runtime::{
 
 use super::input::{DetailRequest, InputAction};
 use super::{
-    AsyncOperationRegistry, ProviderOperationCompletion, ProviderOperationPolicy, RouteKey,
+    AsyncChannel, AsyncOperationRegistry, AsyncOperationTicket, AsyncResultGuard,
+    ProviderOperationCompletion, ProviderOperationPolicy, RouteKey,
     artifact::ArtifactWorkspaceState,
     composer::ComposerState,
     mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQueryMode},
@@ -63,6 +64,35 @@ pub enum TransientView {
     Detail(DetailKind),
     Help,
     Repair,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayContextRefreshTrigger {
+    Startup,
+    QueryStateChanged,
+    DatasourceChanged,
+    ProviderOperationCompleted,
+    UserRetry,
+}
+
+impl DisplayContextRefreshTrigger {
+    pub const ALL: [Self; 5] = [
+        Self::Startup,
+        Self::QueryStateChanged,
+        Self::DatasourceChanged,
+        Self::ProviderOperationCompleted,
+        Self::UserRetry,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Startup => 0,
+            Self::QueryStateChanged => 1,
+            Self::DatasourceChanged => 2,
+            Self::ProviderOperationCompleted => 3,
+            Self::UserRetry => 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +352,10 @@ impl TuiApp {
         self.header.context_unavailable = true;
     }
 
+    pub fn display_context_unavailable(&self) -> bool {
+        self.header.context_unavailable
+    }
+
     pub fn apply_active_provider_view(&mut self, active: Option<&ActiveProviderView>) {
         self.header.current_model = active
             .map(|view| view.model.as_str().to_owned())
@@ -445,6 +479,12 @@ pub struct TuiController {
     provider_screen: Option<ProviderManagementScreen>,
     provider_operations: AsyncOperationRegistry<ProviderOperationPayload>,
     provider_route_key: Option<RouteKey>,
+    display_context_guard: AsyncResultGuard,
+    display_context_tasks: JoinSet<(
+        AsyncOperationTicket,
+        ys_agent_core::CoreResult<TuiDisplayContext>,
+    )>,
+    display_context_refresh_counts: [usize; 5],
 }
 
 pub(super) enum SubmissionCompletion {
@@ -487,7 +527,56 @@ impl TuiController {
                     .expect("fixed Provider operation policy is valid"),
             ),
             provider_route_key: None,
+            display_context_guard: AsyncResultGuard::default(),
+            display_context_tasks: JoinSet::new(),
+            display_context_refresh_counts: [0; 5],
         }
+    }
+
+    /// Refreshes the authoritative header snapshot in the background. A newer request supersedes
+    /// an older one, and route admission prevents a late completion from mutating another view.
+    pub fn request_display_context_refresh(
+        &mut self,
+        app: &TuiApp,
+        trigger: DisplayContextRefreshTrigger,
+    ) {
+        self.display_context_refresh_counts[trigger.index()] += 1;
+        let ticket = self
+            .display_context_guard
+            .start(AsyncChannel::DisplayContext, app.navigation.route_key())
+            .expect("Display Context is a replaceable read lane");
+        let service = self.service.clone();
+        self.display_context_tasks.spawn(async move {
+            let result = service.tui_display_context().await;
+            (ticket, result)
+        });
+    }
+
+    /// Applies every ready refresh whose operation and route are still current. Failures preserve
+    /// the last known-good values and expose only the typed unavailable marker.
+    pub fn apply_ready_display_context(&mut self, app: &mut TuiApp) -> bool {
+        let mut applied = false;
+        while let Some(completion) = self.display_context_tasks.try_join_next() {
+            let Ok((ticket, result)) = completion else {
+                continue;
+            };
+            if !self
+                .display_context_guard
+                .accept_completion(ticket, app.navigation.route_key())
+            {
+                continue;
+            }
+            match result {
+                Ok(context) => app.apply_display_context(context),
+                Err(_) => app.mark_display_context_unavailable(),
+            }
+            applied = true;
+        }
+        applied
+    }
+
+    pub fn display_context_refresh_count(&self, trigger: DisplayContextRefreshTrigger) -> usize {
+        self.display_context_refresh_counts[trigger.index()]
     }
 
     pub fn submission_in_flight(&self) -> bool {
@@ -1898,8 +1987,12 @@ fn user_readable_run_failure(snapshot: &ys_agent_core::RunSnapshot) -> String {
 
 #[cfg(test)]
 mod provider_management_tests {
-    use std::sync::Arc;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
+    use async_trait::async_trait;
     use ys_agent_adapters::{
         credential::keyring::InMemoryCredentialVault,
         model::{discovery::LiterModelDiscovery, liter::LiterProviderFactory},
@@ -1910,7 +2003,8 @@ mod provider_management_tests {
         RunProviderBindingRepository, SaveProfileRevision, WorkspaceId,
     };
     use ys_agent_runtime::{
-        InProcessAgentService, NoopRunScheduler,
+        DatasourceDisplayState, InProcessAgentService, NoopRunScheduler, QueryDisplayState,
+        TuiDisplayContextInput, TuiDisplayContextSource,
         provider::{
             api::InProcessProviderManagementApi,
             catalog::GovernedProviderCatalog,
@@ -1920,6 +2014,26 @@ mod provider_management_tests {
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
     use super::*;
+
+    struct SequenceDisplayContextSource {
+        responses: Mutex<VecDeque<ys_agent_core::CoreResult<TuiDisplayContextInput>>>,
+    }
+
+    #[async_trait]
+    impl TuiDisplayContextSource for SequenceDisplayContextSource {
+        async fn load(&self) -> ys_agent_core::CoreResult<TuiDisplayContextInput> {
+            self.responses
+                .lock()
+                .expect("display source lock")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(ys_agent_core::CoreError::validation(
+                        "display_context_test_exhausted",
+                        "no test Display Context response remains",
+                    ))
+                })
+        }
+    }
 
     fn catalog_views() -> Vec<ProviderCatalogView> {
         ProviderId::ALL
@@ -2033,5 +2147,72 @@ mod provider_management_tests {
             CredentialKind::ApiKey,
             ProviderId::DeepSeek.required_credential_kind()
         );
+    }
+
+    #[tokio::test]
+    async fn display_context_refresh_preserves_last_good_and_observes_all_triggers() {
+        let directory = tempfile::tempdir().expect("temporary runtime directory");
+        let workspace_id = WorkspaceId::new();
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("open runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let source = Arc::new(SequenceDisplayContextSource {
+            responses: Mutex::new(VecDeque::from([
+                TuiDisplayContextInput::new(
+                    "Authoritative Workspace",
+                    DatasourceDisplayState::active("Governed Warehouse").expect("safe datasource"),
+                    true,
+                    QueryDisplayState::Ready,
+                ),
+                Err(ys_agent_core::CoreError::validation(
+                    "display_context_unavailable",
+                    "injected refresh failure",
+                )),
+            ])),
+        });
+        let service = Arc::new(
+            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_tui_display_context_source(source),
+        );
+        let principal = Principal::local_operator("display-context-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+
+        controller.request_display_context_refresh(&app, DisplayContextRefreshTrigger::Startup);
+        for _ in 0..100 {
+            if controller.apply_ready_display_context(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
+        assert!(!app.header_view().context_unavailable);
+
+        controller
+            .request_display_context_refresh(&app, DisplayContextRefreshTrigger::QueryStateChanged);
+        for _ in 0..100 {
+            if controller.apply_ready_display_context(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
+        assert!(app.header_view().context_unavailable);
+
+        for trigger in [
+            DisplayContextRefreshTrigger::DatasourceChanged,
+            DisplayContextRefreshTrigger::ProviderOperationCompleted,
+            DisplayContextRefreshTrigger::UserRetry,
+        ] {
+            controller.request_display_context_refresh(&app, trigger);
+        }
+        for trigger in DisplayContextRefreshTrigger::ALL {
+            assert_eq!(controller.display_context_refresh_count(trigger), 1);
+        }
     }
 }

@@ -26,8 +26,8 @@ use ys_agent_core::{
 use crate::bootstrap::AppDependencies;
 
 use super::{
-    AsyncOperationBusy, RouteKey, TranscriptItem, TransientView, TuiApp, TuiController,
-    UiPreferenceStore, UiPreferences, parse_input,
+    AsyncOperationBusy, DisplayContextRefreshTrigger, RouteKey, TranscriptItem, TransientView,
+    TuiApp, TuiController, UiPreferenceStore, UiPreferences, parse_input,
     provider_management::{
         ProviderAuthentication, ProviderManagementStateKind, ProviderOperationKind,
     },
@@ -528,6 +528,7 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
         dependencies.workspace_id,
         dependencies.principal,
     );
+    controller.request_display_context_refresh(&app, DisplayContextRefreshTrigger::Startup);
     let report = controller.doctor().await?;
     app.transient = (!report.allows_query_submission()).then_some(TransientView::Repair);
     app.doctor_report = Some(report);
@@ -551,10 +552,21 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
                     app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
                 }
             }
+            controller.request_display_context_refresh(
+                &app,
+                DisplayContextRefreshTrigger::QueryStateChanged,
+            );
             dirty = true;
         }
         if let Some(completion) = controller.take_ready_provider_operation() {
             controller.apply_provider_operation(&mut app, completion);
+            controller.request_display_context_refresh(
+                &app,
+                DisplayContextRefreshTrigger::ProviderOperationCompleted,
+            );
+            dirty = true;
+        }
+        if controller.apply_ready_display_context(&mut app) {
             dirty = true;
         }
         if app.should_quit {
@@ -582,6 +594,10 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
                 let event = service_event?;
                 controller.apply_service_event(&mut app, event);
                 controller.reload_durable_state(&mut app).await?;
+                controller.request_display_context_refresh(
+                    &app,
+                    DisplayContextRefreshTrigger::QueryStateChanged,
+                );
                 dirty = true;
             },
             signal = tokio::signal::ctrl_c() => {
@@ -745,6 +761,11 @@ async fn handle_terminal_event(
                     let _ = controller.append_provider_text(app, character);
                     return Ok(false);
                 }
+            }
+            if key.code == KeyCode::Char('r') && app.display_context_unavailable() {
+                controller
+                    .request_display_context_refresh(app, DisplayContextRefreshTrigger::UserRetry);
+                return Ok(false);
             }
             match (key.code, key.modifiers) {
                 (KeyCode::Enter, _) => submit_composer(app, controller).await?,

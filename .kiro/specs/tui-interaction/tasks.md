@@ -140,7 +140,7 @@
   - _Depends: 3.1, 3.3, 3.4_
 
 - [ ] 4. 完成 TUI 与 AgentService 的跨边界集成
-- [ ] 4.1 集成 Display Context 生命周期
+- [x] 4.1 集成 Display Context 生命周期
   - 在启动、Query 状态变化、数据源变化、Provider 操作完成和用户 retry 时通过 AgentService 刷新 Display Context，禁止每帧刷新。
   - 刷新失败时由 Controller 保留最后一次成功值并显示 `status unavailable`；没有历史值时显示真实不可用状态，不读取本地配置或猜测 Header。
   - 把 Workspace、数据源、只读状态与 Query 状态写入 Header read model，同时保持 Mode 与当前模型的独立权威来源。

@@ -14,8 +14,8 @@ mod timeline;
 mod ui;
 
 pub use app::{
-    AnswerView, BaseView, DetailKind, DetailView, DiagnosticsView, TaskSummary, TranscriptItem,
-    TransientView, TuiApp, TuiController,
+    AnswerView, BaseView, DetailKind, DetailView, DiagnosticsView, DisplayContextRefreshTrigger,
+    TaskSummary, TranscriptItem, TransientView, TuiApp, TuiController,
 };
 pub use artifact::ArtifactWorkspaceState;
 pub use async_guard::{AsyncChannel, AsyncOperationBusy, AsyncOperationTicket, AsyncResultGuard};
