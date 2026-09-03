@@ -184,6 +184,16 @@ impl ModelSelectionState {
         })
     }
 
+    pub fn refresh_snapshot(&mut self, snapshot: ModelSelectionSnapshot) {
+        self.snapshot = Some(snapshot);
+        self.load_state = if self.visible_targets().is_empty() {
+            ModelSelectionLoadState::Empty
+        } else {
+            ModelSelectionLoadState::Ready
+        };
+        self.normalize_highlight();
+    }
+
     pub fn reduce(&mut self, action: ModelSelectionAction) -> ModelSelectionOutcome {
         match action {
             ModelSelectionAction::SnapshotLoaded(snapshot) => {

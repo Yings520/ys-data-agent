@@ -165,7 +165,7 @@
   - _Requirements: 2.4, 2.5, 2.6, 2.7, 6.4, 6.7_
   - _Boundary: TUI Controller Artifact navigation adapter_
   - _Depends: 1.3, 3.3, 4.2_
-- [ ] 4.4 集成 Needs setup 与既有 Provider Management
+- [x] 4.4 集成 Needs setup 与既有 Provider Management
   - `/model` 的 Needs setup 候选只能进入既有 Provider 配置流程，不恢复独立 `/providers` 命令或隐藏解析入口。
   - Provider 配置完成、失败、取消或返回后重新读取 selection snapshot，并恢复原页签、搜索、高亮与 Composer 内容。
   - 网络认证、发现和验证期间保持事件循环可响应；安全取消后原活动模型和已输入的非敏感内容不变。

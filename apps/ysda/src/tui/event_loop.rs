@@ -29,6 +29,7 @@ use super::{
     AsyncOperationBusy, ContentRoute, DisplayContextRefreshTrigger, RouteKey, TranscriptItem,
     TransientView, TuiApp, TuiController, UiPreferenceStore, UiPreferences,
     artifact::{ArtifactAction, ResultMove},
+    model_selection::ModelSelectionAction,
     parse_input,
     provider_management::{
         ProviderAuthentication, ProviderManagementStateKind, ProviderOperationKind,
@@ -562,6 +563,7 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
         }
         if let Some(completion) = controller.take_ready_provider_operation() {
             controller.apply_provider_operation(&mut app, completion);
+            controller.refresh_model_selection_checkpoint().await;
             controller.request_display_context_refresh(
                 &app,
                 DisplayContextRefreshTrigger::ProviderOperationCompleted,
@@ -643,11 +645,18 @@ async fn handle_terminal_event(
                     controller.apply_artifact_action(app, ArtifactAction::Back);
                     return Ok(false);
                 }
+                if app.navigation.current() == ContentRoute::ModelSelection {
+                    controller
+                        .apply_model_selection_action(app, ModelSelectionAction::Back)
+                        .await?;
+                    return Ok(false);
+                }
                 if app.transient == Some(TransientView::Detail(super::DetailKind::Providers)) {
                     if controller.provider_operation_in_flight() {
                         controller.cancel_provider_operation(app).await;
+                        controller.refresh_model_selection_checkpoint().await;
                     } else {
-                        controller.close_provider_management(app);
+                        controller.close_provider_management(app).await;
                     }
                     return Ok(false);
                 }
@@ -681,6 +690,30 @@ async fn handle_terminal_event(
                 };
                 if let Some(action) = action {
                     controller.apply_artifact_action(app, action);
+                }
+                return Ok(false);
+            }
+            if app.navigation.current() == ContentRoute::ModelSelection {
+                let action = match key.code {
+                    KeyCode::BackTab | KeyCode::Left => Some(ModelSelectionAction::PreviousTab),
+                    KeyCode::Tab | KeyCode::Right => Some(ModelSelectionAction::NextTab),
+                    KeyCode::Up => Some(ModelSelectionAction::MoveUp),
+                    KeyCode::Down => Some(ModelSelectionAction::MoveDown),
+                    KeyCode::Enter => Some(ModelSelectionAction::Confirm),
+                    KeyCode::Backspace => {
+                        let mut search = app.model_selection_state.search.clone();
+                        search.pop();
+                        Some(ModelSelectionAction::SearchChanged(search))
+                    }
+                    KeyCode::Char(character) if key.modifiers.is_empty() => {
+                        let mut search = app.model_selection_state.search.clone();
+                        search.push(character);
+                        Some(ModelSelectionAction::SearchChanged(search))
+                    }
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    controller.apply_model_selection_action(app, action).await?;
                 }
                 return Ok(false);
             }

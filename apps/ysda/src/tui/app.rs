@@ -8,8 +8,8 @@ use ys_agent_core::{
     CredentialMutationRequest, EventEnvelope, ExportFormat, OperationId, Principal, ProfileId,
     ProfileName, ProfileRevision, ProtectedCredentialWrite, ProviderCredentialReference,
     ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError, ProviderRemediation,
-    RunEventKind, RunId, RunStatus, SaveProfileRequest, SaveProfileRevision, Sensitivity,
-    SessionId, StepId, TaskId, WorkspaceId,
+    RunEventKind, RunId, RunStatus, SaveProfileRequest, SaveProfileRevision, SelectionTarget,
+    Sensitivity, SessionId, StepId, TaskId, WorkspaceId,
 };
 use ys_agent_runtime::{
     AgentServiceApi, CreateTaskRequest, DatasourceDisplayState, DatasourceUnavailableReason,
@@ -28,7 +28,7 @@ use super::{
     },
     composer::ComposerState,
     mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQueryMode},
-    model_selection::ModelSelectionState,
+    model_selection::{ModelSelectionAction, ModelSelectionOutcome, ModelSelectionState},
     navigation::{ContentRoute, FocusTarget, NavigationState, ProviderNavigationState},
     palette::SlashPalette,
     provider_management::{
@@ -496,6 +496,7 @@ pub struct TuiController {
         ys_agent_core::CoreResult<ArtifactReadPayload>,
     )>,
     artifact_result_id: Option<ArtifactId>,
+    model_selection_checkpoint: Option<(ModelSelectionState, String)>,
 }
 
 pub(super) enum SubmissionCompletion {
@@ -561,6 +562,7 @@ impl TuiController {
             artifact_guard: AsyncResultGuard::default(),
             artifact_tasks: JoinSet::new(),
             artifact_result_id: None,
+            model_selection_checkpoint: None,
         }
     }
 
@@ -1082,10 +1084,17 @@ impl TuiController {
         refresh_provider_detail(app, screen);
     }
 
-    pub fn close_provider_management(&mut self, app: &mut TuiApp) {
+    pub async fn close_provider_management(&mut self, app: &mut TuiApp) {
         app.close_transient();
         let _ = app.pop_route();
         self.provider_route_key = None;
+        if let Some((mut state, composer)) = self.model_selection_checkpoint.take() {
+            if let Ok(snapshot) = self.service.provider_model_selection_snapshot().await {
+                state.refresh_snapshot(snapshot);
+            }
+            app.model_selection_state = state;
+            app.composer.set_text(&composer);
+        }
     }
 
     pub(super) async fn take_ready_submission(
@@ -1208,7 +1217,7 @@ impl TuiController {
             ),
             InputAction::Providers => self.open_provider_management(app, false).await?,
             InputAction::Mode => app.open_mode_picker(),
-            InputAction::Model => self.open_provider_management(app, true).await?,
+            InputAction::Model => self.open_model_selection(app).await?,
             InputAction::Doctor => {
                 let report = self.service.doctor().await?;
                 app.transient =
@@ -1355,6 +1364,114 @@ impl TuiController {
         );
         self.provider_screen = Some(screen);
         Ok(())
+    }
+
+    async fn open_model_selection(&mut self, app: &mut TuiApp) -> ys_agent_core::CoreResult<()> {
+        let snapshot = self
+            .service
+            .provider_model_selection_snapshot()
+            .await
+            .map_err(provider_to_core)?;
+        app.model_selection_state = ModelSelectionState::default();
+        app.model_selection_state
+            .reduce(ModelSelectionAction::SnapshotLoaded(snapshot));
+        app.push_route(ContentRoute::ModelSelection);
+        app.transient = None;
+        Ok(())
+    }
+
+    pub(super) async fn apply_model_selection_action(
+        &mut self,
+        app: &mut TuiApp,
+        action: ModelSelectionAction,
+    ) -> ys_agent_core::CoreResult<ModelSelectionOutcome> {
+        let outcome = app.model_selection_state.reduce(action);
+        match &outcome {
+            ModelSelectionOutcome::ReloadSnapshot => {
+                let snapshot = self
+                    .service
+                    .provider_model_selection_snapshot()
+                    .await
+                    .map_err(provider_to_core)?;
+                app.model_selection_state
+                    .reduce(ModelSelectionAction::SnapshotLoaded(snapshot));
+            }
+            ModelSelectionOutcome::LoadCandidates(request) => {
+                match self
+                    .service
+                    .provider_list_model_candidates(request.clone())
+                    .await
+                {
+                    Ok(batch) => {
+                        app.model_selection_state
+                            .reduce(ModelSelectionAction::CandidatesLoaded(batch));
+                    }
+                    Err(error) => {
+                        app.model_selection_state
+                            .reduce(ModelSelectionAction::CandidatesFailed(
+                                error.code().to_owned(),
+                            ));
+                    }
+                }
+            }
+            ModelSelectionOutcome::OpenProviderManagement(target) => {
+                self.open_provider_setup(app, target.clone()).await?;
+            }
+            ModelSelectionOutcome::Blocked(block) => {
+                app.set_runtime_status(format!("Model selection blocked · {block:?}"));
+            }
+            ModelSelectionOutcome::Close => {
+                let _ = app.pop_route();
+            }
+            ModelSelectionOutcome::Activate(_)
+            | ModelSelectionOutcome::ValidateThenActivate(_)
+            | ModelSelectionOutcome::RevalidateThenActivate(_) => {
+                app.set_runtime_status("Model activation requires validation");
+            }
+            ModelSelectionOutcome::AlreadyCurrent => {
+                app.set_runtime_status("Model is already current");
+            }
+            ModelSelectionOutcome::Changed | ModelSelectionOutcome::Ignored => {}
+        }
+        Ok(outcome)
+    }
+
+    async fn open_provider_setup(
+        &mut self,
+        app: &mut TuiApp,
+        target: SelectionTarget,
+    ) -> ys_agent_core::CoreResult<()> {
+        let browse = load_provider_management_view(self.service.as_ref())
+            .await
+            .map_err(provider_to_core)?;
+        self.model_selection_checkpoint =
+            Some((app.model_selection_state.clone(), app.composer.text()));
+        let mut screen = ProviderManagementScreen::new(browse);
+        let sequence = screen.view().browse.profiles.len().saturating_add(1);
+        if screen.start_create(format!("Provider Profile {sequence}")) {
+            let _ = screen.select_provider(target.provider());
+        }
+        app.push_route(ContentRoute::ProviderManagement);
+        self.provider_route_key = Some(app.navigation.route_key());
+        let view = screen.view();
+        app.show_detail(
+            DetailKind::Providers,
+            DetailView {
+                title: "Provider setup".to_owned(),
+                lines: provider_management_lines(&view),
+            },
+        );
+        self.provider_screen = Some(screen);
+        Ok(())
+    }
+
+    pub(super) async fn refresh_model_selection_checkpoint(&mut self) {
+        let Some((state, _)) = self.model_selection_checkpoint.as_mut() else {
+            return;
+        };
+        if let Ok(snapshot) = self.service.provider_model_selection_snapshot().await {
+            state.refresh_snapshot(snapshot);
+        }
     }
 
     async fn new_task(&mut self, app: &mut TuiApp, goal: String) -> ys_agent_core::CoreResult<()> {
@@ -2287,7 +2404,7 @@ mod provider_management_tests {
         model::{discovery::LiterModelDiscovery, liter::LiterProviderFactory},
     };
     use ys_agent_core::{
-        CredentialKind, ProfileId, ProfileName, ProfileRevision, ProviderCatalogView, ProviderId,
+        ProfileId, ProfileName, ProfileRevision, ProviderCatalogView, ProviderId,
         ProviderProfileRepository, ProviderSupportStatus, RevisionPrecondition,
         RunProviderBindingRepository, SaveProfileRevision, WorkspaceId,
     };
@@ -2338,7 +2455,7 @@ mod provider_management_tests {
     }
 
     #[tokio::test]
-    async fn providers_and_legacy_model_use_one_masked_service_route() {
+    async fn model_needs_setup_uses_provider_management_and_restores_selection() {
         let directory = tempfile::tempdir().expect("temporary runtime directory");
         let store = Arc::new(
             SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -2397,7 +2514,7 @@ mod provider_management_tests {
                 .with_provider_management_api(provider_api),
         );
         let principal = Principal::local_operator("tui-provider-test");
-        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut controller = TuiController::new(service.clone(), workspace_id, principal.clone());
         let mut app = TuiApp::for_principal(principal);
 
         controller
@@ -2418,24 +2535,54 @@ mod provider_management_tests {
                 .any(|line| line.contains("TUI managed Profile"))
         );
 
+        controller.close_provider_management(&mut app).await;
+        app.composer.set_text("preserved draft");
         controller
             .apply(&mut app, InputAction::Model)
             .await
-            .expect("legacy model command reuses Provider manager");
-        let detail = app.detail.expect("same Provider detail");
+            .expect("model command loads governed selection");
         assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
-        assert_eq!(detail.title, "Provider management");
-        assert!(
-            detail
-                .lines
-                .iter()
-                .any(|line| line.contains("Editing step · Model"))
-        );
-        assert!(!format!("{detail:?}").contains("api_key"));
+        assert_eq!(app.transient, None);
+        controller
+            .apply_model_selection_action(
+                &mut app,
+                ModelSelectionAction::SearchChanged("xAI".to_owned()),
+            )
+            .await
+            .expect("search selection");
+        let original_highlight = app.model_selection_state.highlighted;
+        let outcome = controller
+            .apply_model_selection_action(&mut app, ModelSelectionAction::Confirm)
+            .await
+            .expect("Needs setup opens existing Provider flow");
+        assert!(matches!(
+            outcome,
+            ModelSelectionOutcome::OpenProviderManagement(SelectionTarget::Provider(
+                ProviderId::Xai
+            ))
+        ));
+        assert_eq!(app.navigation.current(), ContentRoute::ProviderManagement);
         assert_eq!(
-            CredentialKind::ApiKey,
-            ProviderId::DeepSeek.required_credential_kind()
+            controller
+                .provider_screen_view()
+                .and_then(|view| view.edit)
+                .and_then(|edit| edit.provider),
+            Some(ProviderId::Xai)
         );
+        assert!(
+            service
+                .provider_active()
+                .await
+                .expect("read active Provider")
+                .is_none(),
+            "setup must not switch before validation"
+        );
+
+        controller.close_provider_management(&mut app).await;
+        assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
+        assert_eq!(app.model_selection_state.search, "xAI");
+        assert_eq!(app.model_selection_state.highlighted, original_highlight);
+        assert_eq!(app.composer.text(), "preserved draft");
     }
 
     #[tokio::test]
