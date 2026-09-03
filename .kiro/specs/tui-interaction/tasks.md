@@ -1,7 +1,7 @@
 # Implementation Plan
 
 - [ ] 1. 建立安全的 TUI 应用契约与 Runtime 用例
-- [ ] 1.1 定义 Provider、Plan 与 Model Selection 的安全领域契约
+- [x] 1.1 定义 Provider、Plan 与 Model Selection 的安全领域契约
   - 表达由受治理 Catalog 提供的 Provider/Plan 分类、`Configured / Needs setup / Unavailable` 状态，以及全局唯一的 `Current` 标记。
   - 定义包含 Profile revision、activation revision、Provider 和 Model 的稳定候选键，并使不同 Profile 下的同名模型保持为不同候选。
   - 扩展 Provider 管理 port，提供 selection snapshot、候选列表和切换请求所需的厂商无关契约。

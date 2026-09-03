@@ -4,14 +4,18 @@ use ys_agent_core::{
     CredentialMutationIntent, CredentialMutationRecord, CredentialMutationRepository,
     CredentialMutationRequest, CredentialPointerCommit, CredentialProtectionStatus,
     CredentialVault, CredentialViewStatus, DeleteProfileRequest, DeviceAuthorizationView,
-    DiscoverModelsRequest, DiscoveredModel, ModelDiscovery, OAuthConnectionService,
-    OAuthConnectionView, OperationId, ProfileDetail, ProfileId, ProfileName, ProfileRevision,
-    ProfileRevisionRepository, ProfileSummary, ProtectedCredentialWrite, ProviderCatalogView,
-    ProviderClientBinding, ProviderClientFactory, ProviderCredentialReference, ProviderDoctorView,
-    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi, ProviderManagementError,
-    ProviderProfileRepository, ProviderRemediation, ProviderResult, ResolvedRunProvider, RunId,
-    RunModelProviderResolver, RunProviderBindingRepository, SaveProfileRevision,
-    ValidateProfileRequest, ValidationActivationRepository, ValidationCommit,
+    DiscoverModelsRequest, DiscoveredModel, ListModelCandidatesRequest, ModelCandidateBatch,
+    ModelCandidateKey, ModelCandidateStatus, ModelCandidateView, ModelDiscovery,
+    ModelSelectionSnapshot, OAuthConnectionService, OAuthConnectionView, OperationId,
+    ProfileDetail, ProfileId, ProfileName, ProfileRevision, ProfileRevisionRepository,
+    ProfileSummary, ProtectedCredentialWrite, ProviderCatalogView, ProviderClientBinding,
+    ProviderClientFactory, ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode,
+    ProviderField, ProviderId, ProviderManagementApi, ProviderManagementError, ProviderModelId,
+    ProviderPlanId, ProviderProfileRepository, ProviderRemediation, ProviderResult,
+    ResolvedRunProvider, RunId, RunModelProviderResolver, RunProviderBindingRepository,
+    SaveProfileRevision, SelectionAvailability, SelectionCurrentStatus, SelectionTarget,
+    SelectionTargetView, SwitchModelRequest, ValidateProfileRequest,
+    ValidationActivationRepository, ValidationCommit,
 };
 
 struct FakeProviderManagementApi;
@@ -33,6 +37,30 @@ fn unavailable<T>() -> ProviderResult<T> {
 
 #[async_trait::async_trait]
 impl ProviderManagementApi for FakeProviderManagementApi {
+    async fn model_selection_snapshot(&self) -> ProviderResult<ModelSelectionSnapshot> {
+        ModelSelectionSnapshot::new(Vec::new()).map_err(|_| {
+            ProviderManagementError::new(
+                ProviderErrorCode::Internal,
+                None,
+                ProviderRemediation::ContactSupport,
+            )
+        })
+    }
+
+    async fn list_model_candidates(
+        &self,
+        _request: ListModelCandidatesRequest,
+    ) -> ProviderResult<ModelCandidateBatch> {
+        unavailable()
+    }
+
+    async fn switch_model(
+        &self,
+        _request: SwitchModelRequest,
+    ) -> ProviderResult<ActiveProviderView> {
+        unavailable()
+    }
+
     async fn catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>> {
         Ok(Vec::new())
     }
@@ -564,6 +592,127 @@ fn tui_and_doctor_can_compile_against_a_vendor_neutral_fake_service_port() {
     drop(api.cancel_operation(OperationId::new()));
     drop(api.oauth_connection(ProfileId::new()));
     drop(api.doctor());
+    drop(api.model_selection_snapshot());
+}
+
+#[test]
+fn model_selection_contract_rejects_incomplete_stale_and_ambiguous_state() {
+    let profile_id = ProfileId::new();
+    let model =
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/reasoner").expect("valid model");
+
+    assert!(
+        ModelCandidateKey::new(profile_id, 0, Some(3), ProviderId::DeepSeek, model.clone(),)
+            .is_err()
+    );
+    assert!(
+        ModelCandidateKey::new(profile_id, 2, Some(0), ProviderId::DeepSeek, model.clone(),)
+            .is_err()
+    );
+    assert!(ModelCandidateKey::new(profile_id, 2, Some(3), ProviderId::Anthropic, model,).is_err());
+
+    let key = ModelCandidateKey::new(
+        profile_id,
+        2,
+        Some(3),
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/reasoner").expect("valid model"),
+    )
+    .expect("complete candidate key");
+    assert!(key.ensure_fresh(2, Some(3)).is_ok());
+    assert_eq!(
+        key.ensure_fresh(3, Some(3))
+            .expect_err("stale profile revision")
+            .code(),
+        "provider.activation.precondition_failed"
+    );
+    assert_eq!(
+        key.ensure_fresh(2, Some(4))
+            .expect_err("stale activation revision")
+            .code(),
+        "provider.activation.precondition_failed"
+    );
+
+    let current = SelectionTargetView::new(
+        SelectionTarget::Provider(ProviderId::DeepSeek),
+        "DeepSeek",
+        SelectionAvailability::Configured,
+        SelectionCurrentStatus::Current,
+    )
+    .expect("valid target");
+    let second_current = SelectionTargetView::new(
+        SelectionTarget::Plan {
+            provider: ProviderId::ChatGptSubscription,
+            plan: ProviderPlanId::new("plus").expect("valid plan"),
+        },
+        "ChatGPT Plus",
+        SelectionAvailability::Configured,
+        SelectionCurrentStatus::Current,
+    )
+    .expect("valid target");
+    assert!(ModelSelectionSnapshot::new(vec![current, second_current]).is_err());
+}
+
+#[test]
+fn model_selection_views_are_safe_and_keep_same_named_models_distinct_by_profile() {
+    let first_profile = ProfileId::new();
+    let second_profile = ProfileId::new();
+    let source = SelectionTarget::Provider(ProviderId::DeepSeek);
+    let first_key = ModelCandidateKey::new(
+        first_profile,
+        4,
+        Some(8),
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/reasoner").expect("valid model"),
+    )
+    .expect("valid key");
+    let second_key = ModelCandidateKey::new(
+        second_profile,
+        7,
+        Some(8),
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/reasoner").expect("valid model"),
+    )
+    .expect("valid key");
+    assert_ne!(first_key, second_key);
+
+    let batch = ModelCandidateBatch::new(
+        source,
+        vec![
+            ModelCandidateView::new(
+                first_key,
+                "primary",
+                "Reasoner",
+                ModelCandidateStatus::Ready,
+                SelectionCurrentStatus::Current,
+            )
+            .expect("valid candidate"),
+            ModelCandidateView::new(
+                second_key,
+                "backup",
+                "Reasoner",
+                ModelCandidateStatus::NeedsValidation,
+                SelectionCurrentStatus::NotCurrent,
+            )
+            .expect("valid candidate"),
+        ],
+    )
+    .expect("unique current candidate");
+
+    let rendered = serde_json::to_string(&batch).expect("safe view serializes");
+    for forbidden in [
+        "credential",
+        "base_url",
+        "parameters",
+        "validation_digest",
+        "request",
+        "operation_id",
+        "internal_id",
+    ] {
+        assert!(!rendered.contains(forbidden), "leaked field: {forbidden}");
+    }
+    assert!(rendered.contains("primary"));
+    assert!(rendered.contains("backup"));
 }
 
 #[test]

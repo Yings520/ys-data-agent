@@ -10,15 +10,16 @@ use crate::{
     CredentialLease, CredentialMutationIntent, CredentialMutationRecord, CredentialMutationRequest,
     CredentialPointerCommit, CredentialProtectionStatus, CredentialViewStatus,
     DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
-    EventEnvelope, FreshnessObservation, MetricDefinition, ModelCapabilities, ModelRequest,
-    ModelResponse, OAuthConnectionView, ObservedSchema, OperationId, PendingRunEvent, Principal,
-    ProfileDetail, ProfileId, ProfileRevision, ProfileSummary, ProtectedCredentialWrite,
-    ProviderCatalogView, ProviderClientBinding, ProviderCredentialReference, ProviderDoctorView,
-    ProviderErrorCode, ProviderResult, PutArtifact, QueryBudget, QueryPreflight, QueryRequest,
-    QueryResult, RemoteRevocationOutcome, ResolvedRunProvider, RunId, RunProviderBinding,
-    RunSnapshot, SaveProfileRequest, SaveProfileRevision, Session, SessionId, SourceId, Task,
-    TaskId, ToolCallId, ToolOutcome, ToolSpec, ValidateProfileRequest, ValidationCommit,
-    WorkspaceId,
+    EventEnvelope, FreshnessObservation, ListModelCandidatesRequest, MetricDefinition,
+    ModelCandidateBatch, ModelCapabilities, ModelRequest, ModelResponse, ModelSelectionSnapshot,
+    OAuthConnectionView, ObservedSchema, OperationId, PendingRunEvent, Principal, ProfileDetail,
+    ProfileId, ProfileRevision, ProfileSummary, ProtectedCredentialWrite, ProviderCatalogView,
+    ProviderClientBinding, ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode,
+    ProviderManagementError, ProviderRemediation, ProviderResult, PutArtifact, QueryBudget,
+    QueryPreflight, QueryRequest, QueryResult, RemoteRevocationOutcome, ResolvedRunProvider, RunId,
+    RunProviderBinding, RunSnapshot, SaveProfileRequest, SaveProfileRevision, Session, SessionId,
+    SourceId, SwitchModelRequest, Task, TaskId, ToolCallId, ToolOutcome, ToolSpec,
+    ValidateProfileRequest, ValidationCommit, WorkspaceId,
 };
 
 /// A production Run is only created from this complete, immutable Provider snapshot. The Store
@@ -432,6 +433,28 @@ pub trait OAuthConnectionService: Send + Sync {
 /// types only; they never receive a repository, Vault, OAuth transport, or HTTP client.
 #[async_trait]
 pub trait ProviderManagementApi: Send + Sync {
+    /// Implementors that have not adopted the model-selection capability fail closed instead of
+    /// silently deriving candidates from profiles or accepting an unchecked activation request.
+    async fn model_selection_snapshot(&self) -> ProviderResult<ModelSelectionSnapshot> {
+        Err(model_selection_capability_unavailable())
+    }
+
+    async fn list_model_candidates(
+        &self,
+        request: ListModelCandidatesRequest,
+    ) -> ProviderResult<ModelCandidateBatch> {
+        let _ = request;
+        Err(model_selection_capability_unavailable())
+    }
+
+    async fn switch_model(
+        &self,
+        request: SwitchModelRequest,
+    ) -> ProviderResult<ActiveProviderView> {
+        let _ = request;
+        Err(model_selection_capability_unavailable())
+    }
+
     async fn catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>>;
 
     async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>>;
@@ -523,4 +546,12 @@ pub trait ProviderManagementApi: Send + Sync {
         profile_id: ProfileId,
         operation_id: OperationId,
     ) -> ProviderResult<RemoteRevocationOutcome>;
+}
+
+fn model_selection_capability_unavailable() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::ProtocolIncompatible,
+        None,
+        ProviderRemediation::ContactSupport,
+    )
 }
