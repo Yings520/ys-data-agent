@@ -93,7 +93,7 @@
   - _Depends: 1.4, 2.4_
 
 - [ ] 3. 构建独立的产品视图与响应式壳层
-- [ ] 3.1 (P) 构建 Timeline 投影与专用渲染
+- [x] 3.1 (P) 构建 Timeline 投影与专用渲染
   - 按持久化 Query Artifact、终态 Snapshot、运行中 Snapshot、typed Event、Service Reply 的优先级投影用户问题、关键阶段、状态、警告和主要结果。
   - 按 sequence 去重并禁止旧 Event 降级终态；等待输入、拒绝、失败和取消使用明确原因与下一步，不使用成功色或 verified。
   - 只保留投影所需的有界安全状态，不在 Timeline 中累积 raw payload 或无界 Event 历史。
