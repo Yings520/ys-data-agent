@@ -103,7 +103,7 @@
   - _Requirements: 2.1, 2.2, 2.3, 2.8, 6.3, 6.4_
   - _Boundary: Dedicated TUI Timeline projection and renderer_
   - _Depends: 1.2, 2.3_
-- [ ] 3.2 (P) 构建 Artifact Workspace 状态与 Results viewport
+- [x] 3.2 (P) 构建 Artifact Workspace 状态与 Results viewport
   - 实现 Summary、Results、SQL、Schema 和 Evidence 五个页签，默认进入 Results，并支持 Tab 与 Shift+Tab 切换。
   - 为 Results 表格维护行列焦点、滚动窗口和边界安全的移动规则，只在当前 viewport 中保留待渲染单元格。
   - Artifact 内部导航只产生本地状态变化，不生成 Query、Tool 或 resume action。

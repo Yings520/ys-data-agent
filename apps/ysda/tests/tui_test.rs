@@ -131,12 +131,11 @@ fn route_overlay_and_focus_state_is_local_reversible_and_independent() {
         [InputLayer::Overlay, InputLayer::View, InputLayer::Composer]
     );
 
-    let artifact = ArtifactWorkspaceState {
-        search: "revenue".to_owned(),
-        highlighted: Some(3),
-        scroll: 9,
-        focus: FocusTarget::ArtifactContent,
-    };
+    let mut artifact = ArtifactWorkspaceState::default();
+    artifact.search = "revenue".to_owned();
+    artifact.highlighted = Some(3);
+    artifact.scroll = 9;
+    artifact.focus = FocusTarget::ArtifactContent;
     let mut models = ModelSelectionState::default();
     models.search = "deepseek".to_owned();
     models.highlighted = Some(1);
