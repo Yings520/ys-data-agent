@@ -27,8 +27,10 @@ pub use provider::resolver::{FixedRunModelProviderResolver, RunBoundProviderReso
 pub use recovery::{RecoveryDecision, RecoveryManager, RecoveryRequest};
 pub use service::{
     ActiveRunProviderBindingSource, AgentServiceApi, ArtifactView, CreateTaskRequest,
-    EventSubscription, InProcessAgentService, NoopRunScheduler, RunScheduler, SendMessageRequest,
+    DatasourceDisplayState, DatasourceUnavailableReason, EventSubscription, InProcessAgentService,
+    NoopRunScheduler, QueryDisplayState, QueryNonSuccessReason, RunScheduler, SendMessageRequest,
     ServiceEvent, ServiceEventPublisher, ServiceReply, StaticRunProviderBindingSource,
+    TuiDisplayContext, TuiDisplayContextInput, TuiDisplayContextSource,
     UnavailableRunProviderBindingSource,
 };
 pub use workflow::query::{

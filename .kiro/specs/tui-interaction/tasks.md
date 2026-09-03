@@ -10,7 +10,7 @@
   - _Requirements: 4.3, 4.4, 4.6, 4.7, 4.8, 5.1, 6.1, 6.3_
   - _Boundary: Core Provider selection types and ports_
   - _Depends: none_
-- [ ] 1.2 提供脱敏的 Display Context
+- [x] 1.2 提供脱敏的 Display Context
   - 从权威 Workspace、活动数据源、只读能力和 Query 状态组合 TUI 所需的显示上下文，不把本地配置读取或状态猜测交给界面。
   - 将未配置、不可用、等待输入、完成和明确非成功状态映射为稳定、用户可展示的结果。
   - 增加正向与负向 Service contract tests，证明返回值不含 DSN、Credential、ACL 主体、内部 ID、内部 phase、Event payload 或业务数据行。

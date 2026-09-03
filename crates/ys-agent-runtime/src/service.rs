@@ -102,6 +102,147 @@ pub struct ArtifactView {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum DatasourceDisplayState {
+    Active { display_name: String },
+    NotConfigured,
+    Unavailable { reason: DatasourceUnavailableReason },
+}
+
+impl DatasourceDisplayState {
+    pub fn active(display_name: impl Into<String>) -> CoreResult<Self> {
+        let display_name = display_name.into();
+        validate_display_label(&display_name, "datasource display name")?;
+        Ok(Self::Active { display_name })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatasourceUnavailableReason {
+    ConnectionUnavailable,
+    ValidationRequired,
+    StatusUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryNonSuccessReason {
+    Rejected,
+    Failed,
+    Cancelled,
+    Unsupported,
+    StatusUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum QueryDisplayState {
+    Ready,
+    Running,
+    WaitingForInput,
+    Completed,
+    NonSuccess { reason: QueryNonSuccessReason },
+}
+
+impl From<RunStatus> for QueryDisplayState {
+    fn from(status: RunStatus) -> Self {
+        match status {
+            RunStatus::Queued => Self::Ready,
+            RunStatus::Running => Self::Running,
+            RunStatus::WaitingForInput => Self::WaitingForInput,
+            RunStatus::Succeeded => Self::Completed,
+            RunStatus::Failed => Self::NonSuccess {
+                reason: QueryNonSuccessReason::Failed,
+            },
+            RunStatus::Cancelled => Self::NonSuccess {
+                reason: QueryNonSuccessReason::Cancelled,
+            },
+        }
+    }
+}
+
+/// Atomic, non-sensitive inputs read from the authoritative Workspace, datasource, and Query
+/// state owners. The service maps this snapshot into the public TUI read model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiDisplayContextInput {
+    workspace_display_name: String,
+    datasource: DatasourceDisplayState,
+    read_only: bool,
+    query_state: QueryDisplayState,
+}
+
+impl TuiDisplayContextInput {
+    pub fn new(
+        workspace_display_name: impl Into<String>,
+        datasource: DatasourceDisplayState,
+        read_only: bool,
+        query_state: QueryDisplayState,
+    ) -> CoreResult<Self> {
+        let workspace_display_name = workspace_display_name.into();
+        validate_display_label(&workspace_display_name, "workspace display name")?;
+        Ok(Self {
+            workspace_display_name,
+            datasource,
+            read_only,
+            query_state,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TuiDisplayContext {
+    workspace_display_name: String,
+    datasource: DatasourceDisplayState,
+    read_only: bool,
+    query_state: QueryDisplayState,
+}
+
+impl TuiDisplayContext {
+    pub fn workspace_display_name(&self) -> &str {
+        &self.workspace_display_name
+    }
+
+    pub fn datasource(&self) -> &DatasourceDisplayState {
+        &self.datasource
+    }
+
+    pub const fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub const fn query_state(&self) -> QueryDisplayState {
+        self.query_state
+    }
+}
+
+impl From<TuiDisplayContextInput> for TuiDisplayContext {
+    fn from(input: TuiDisplayContextInput) -> Self {
+        Self {
+            workspace_display_name: input.workspace_display_name,
+            datasource: input.datasource,
+            read_only: input.read_only,
+            query_state: input.query_state,
+        }
+    }
+}
+
+#[async_trait]
+pub trait TuiDisplayContextSource: Send + Sync {
+    async fn load(&self) -> CoreResult<TuiDisplayContextInput>;
+}
+
+fn validate_display_label(value: &str, label: &str) -> CoreResult<()> {
+    if value.trim().is_empty() || value != value.trim() || value.chars().any(char::is_control) {
+        return Err(CoreError::validation(
+            "invalid_tui_display_label",
+            format!("{label} must be non-empty, trimmed, and contain no control characters"),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceEvent {
     pub run_id: RunId,
@@ -211,8 +352,27 @@ impl ArtifactExportService for UnconfiguredExporter {
     }
 }
 
+struct UnconfiguredTuiDisplayContextSource;
+
+#[async_trait]
+impl TuiDisplayContextSource for UnconfiguredTuiDisplayContextSource {
+    async fn load(&self) -> CoreResult<TuiDisplayContextInput> {
+        Err(CoreError::validation(
+            "tui_display_context_unavailable",
+            "TUI display context is not configured",
+        ))
+    }
+}
+
 #[async_trait]
 pub trait AgentServiceApi: Send + Sync {
+    async fn tui_display_context(&self) -> CoreResult<TuiDisplayContext> {
+        Err(CoreError::validation(
+            "tui_display_context_unavailable",
+            "TUI display context is not configured",
+        ))
+    }
+
     async fn create_session(
         &self,
         command_id: CommandId,
@@ -440,6 +600,7 @@ pub struct InProcessAgentService {
     front_door: Option<FrontDoorAgent>,
     run_provider_bindings: Arc<dyn RunProviderBindingSource>,
     provider_management: Option<Arc<dyn ProviderManagementApi>>,
+    tui_display_context_source: Arc<dyn TuiDisplayContextSource>,
 }
 
 #[derive(Debug, Default)]
@@ -693,6 +854,7 @@ impl InProcessAgentService {
             front_door: None,
             run_provider_bindings: Arc::new(UnavailableRunProviderBindingSource),
             provider_management: None,
+            tui_display_context_source: Arc::new(UnconfiguredTuiDisplayContextSource),
         }
     }
 
@@ -732,6 +894,14 @@ impl InProcessAgentService {
         provider_management: Arc<dyn ProviderManagementApi>,
     ) -> Self {
         self.provider_management = Some(provider_management);
+        self
+    }
+
+    pub fn with_tui_display_context_source(
+        mut self,
+        source: Arc<dyn TuiDisplayContextSource>,
+    ) -> Self {
+        self.tui_display_context_source = source;
         self
     }
 
@@ -1015,6 +1185,10 @@ fn active_snapshot_changed(error: &CoreError) -> bool {
 
 #[async_trait]
 impl AgentServiceApi for InProcessAgentService {
+    async fn tui_display_context(&self) -> CoreResult<TuiDisplayContext> {
+        self.tui_display_context_source.load().await.map(Into::into)
+    }
+
     fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
         self.provider_management.as_deref()
     }

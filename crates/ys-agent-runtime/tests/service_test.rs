@@ -18,8 +18,10 @@ use ys_agent_core::{
 };
 use ys_agent_runtime::{
     ActiveRunProviderBindingSource, AgentServiceApi, CoordinationDecision, Coordinator,
-    CreateTaskRequest, InProcessAgentService, RuleBasedCoordinator, RunScheduler,
-    SendMessageRequest, ServiceReply, StaticRunProviderBindingSource,
+    CreateTaskRequest, DatasourceDisplayState, InProcessAgentService, QueryDisplayState,
+    QueryNonSuccessReason, RuleBasedCoordinator, RunScheduler, SendMessageRequest, ServiceReply,
+    StaticRunProviderBindingSource, TuiDisplayContext, TuiDisplayContextInput,
+    TuiDisplayContextSource,
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
@@ -72,6 +74,24 @@ struct SwitchActiveAfterFirstBinding {
     source: ActiveRunProviderBindingSource,
     database: std::path::PathBuf,
     switched: AtomicBool,
+}
+
+struct FakeTuiDisplayContextSource {
+    input: TuiDisplayContextInput,
+    calls: AtomicUsize,
+    _dsn_canary: String,
+    _credential_canary: String,
+    _internal_id_canary: String,
+    _event_payload_canary: String,
+    _business_row_canary: String,
+}
+
+#[async_trait]
+impl TuiDisplayContextSource for FakeTuiDisplayContextSource {
+    async fn load(&self) -> CoreResult<TuiDisplayContextInput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.input.clone())
+    }
 }
 
 #[async_trait]
@@ -249,6 +269,131 @@ async fn provider_management_is_available_only_through_the_service_boundary() {
         .expect_err("an uncomposed service must not expose a repository or Vault fallback");
 
     assert_eq!(error.code(), "provider.internal");
+}
+
+#[tokio::test]
+async fn tui_display_context_is_composed_from_a_safe_authoritative_snapshot() {
+    let fixture = ServiceFixture::new().await;
+    let source = Arc::new(FakeTuiDisplayContextSource {
+        input: TuiDisplayContextInput::new(
+            "analytics",
+            DatasourceDisplayState::active("warehouse").expect("safe display name"),
+            true,
+            QueryDisplayState::WaitingForInput,
+        )
+        .expect("valid display context input"),
+        calls: AtomicUsize::new(0),
+        _dsn_canary: "postgres://admin:dsn-canary@production".to_owned(),
+        _credential_canary: "credential-canary".to_owned(),
+        _internal_id_canary: "internal-id-canary".to_owned(),
+        _event_payload_canary: "event-payload-canary".to_owned(),
+        _business_row_canary: "business-row-canary".to_owned(),
+    });
+    let service = InProcessAgentService::new(
+        fixture.workspace_id,
+        fixture.store.clone(),
+        fixture.artifacts.clone(),
+        fixture.scheduler.clone(),
+    )
+    .with_tui_display_context_source(source.clone());
+
+    let view: TuiDisplayContext = service
+        .tui_display_context()
+        .await
+        .expect("read safe display context");
+
+    assert_eq!(view.workspace_display_name(), "analytics");
+    assert_eq!(
+        view.datasource(),
+        &DatasourceDisplayState::active("warehouse").expect("safe display name")
+    );
+    assert!(view.read_only());
+    assert_eq!(view.query_state(), QueryDisplayState::WaitingForInput);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+
+    let rendered = serde_json::to_string(&view).expect("display context serializes");
+    for forbidden in [
+        "dsn-canary",
+        "credential-canary",
+        "internal-id-canary",
+        "event-payload-canary",
+        "business-row-canary",
+        "workspace_id",
+        "source_id",
+        "phase",
+        "acl",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "leaked display field: {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tui_display_context_fails_closed_without_an_authoritative_source() {
+    let fixture = ServiceFixture::new().await;
+
+    let error = fixture
+        .service
+        .tui_display_context()
+        .await
+        .expect_err("service must not infer display state from local configuration");
+
+    assert_eq!(error.code(), "tui_display_context_unavailable");
+}
+
+#[test]
+fn query_display_state_maps_runtime_terminal_states_without_false_success() {
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Queued),
+        QueryDisplayState::Ready
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Running),
+        QueryDisplayState::Running
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::WaitingForInput),
+        QueryDisplayState::WaitingForInput
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Succeeded),
+        QueryDisplayState::Completed
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Failed),
+        QueryDisplayState::NonSuccess {
+            reason: QueryNonSuccessReason::Failed,
+        }
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Cancelled),
+        QueryDisplayState::NonSuccess {
+            reason: QueryNonSuccessReason::Cancelled,
+        }
+    );
+
+    let states = [
+        DatasourceDisplayState::NotConfigured,
+        DatasourceDisplayState::Unavailable {
+            reason: ys_agent_runtime::DatasourceUnavailableReason::StatusUnavailable,
+        },
+    ];
+    let rendered = serde_json::to_string(&states).expect("stable datasource states serialize");
+    assert!(rendered.contains("not_configured"));
+    assert!(rendered.contains("status_unavailable"));
+    assert!(
+        TuiDisplayContextInput::new(
+            "workspace\nspoofed",
+            DatasourceDisplayState::NotConfigured,
+            true,
+            QueryDisplayState::NonSuccess {
+                reason: QueryNonSuccessReason::Rejected,
+            },
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
