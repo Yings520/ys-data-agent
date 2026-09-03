@@ -22,8 +22,8 @@ use ys_agent_core::{
     ProviderResult, PutArtifact, QueryResult, RemoteRevocationOutcome, RetentionPolicy, Run,
     RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
     RunProviderBindingSource, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore,
-    Sensitivity, Session, SessionId, Task, TaskId, ValidateProfileRequest, ValidationVersions,
-    WorkflowKind, WorkspaceId,
+    Sensitivity, Session, SessionId, SwitchModelRequest, Task, TaskId, ValidateProfileRequest,
+    ValidationVersions, WorkflowKind, WorkspaceId,
 };
 
 use crate::{
@@ -490,6 +490,13 @@ pub trait AgentServiceApi: Send + Sync {
         request: ListModelCandidatesRequest,
     ) -> ProviderResult<ModelCandidateBatch> {
         provider_api(self)?.list_model_candidates(request).await
+    }
+
+    async fn provider_switch_model(
+        &self,
+        request: SwitchModelRequest,
+    ) -> ProviderResult<ActiveProviderView> {
+        provider_api(self)?.switch_model(request).await
     }
 
     async fn provider_list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>> {

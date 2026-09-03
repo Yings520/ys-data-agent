@@ -36,7 +36,7 @@
   - _Requirements: 4.1, 4.3, 4.4, 4.6, 4.7, 4.8, 6.3, 6.4_
   - _Boundary: ProviderManagement model-selection query use cases_
   - _Depends: 1.1, 1.3_
-- [ ] 1.5 实现经过验证的原子模型切换用例
+- [x] 1.5 实现经过验证的原子模型切换用例
   - 对已验证候选执行带 Profile revision 与 activation revision 前置条件的原子激活；未配置、验证失效、能力不足或陈旧候选必须 fail closed。
   - 对首次使用的模型依次保存新 Draft revision、验证兼容性并原子激活，任何中间失败都保持原 active pointer 不变。
   - 将取消、超时、冲突和迟到结果归一化为稳定错误与恢复动作，并在成功后重新读取权威活动配置。

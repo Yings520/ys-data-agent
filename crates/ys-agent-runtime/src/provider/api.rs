@@ -17,9 +17,9 @@ use ys_agent_core::{
     ProviderClientBinding, ProviderClientFactory, ProviderCredentialReference, ProviderDoctorView,
     ProviderErrorCode, ProviderField, ProviderManagementApi, ProviderManagementError,
     ProviderModelId, ProviderProfileRepository, ProviderRemediation, ProviderResult,
-    ProviderSupportStatus, RunProviderBindingRepository, SelectionAvailability,
-    SelectionCurrentStatus, SelectionTargetView, ValidateProfileRequest, ValidationCommit,
-    ValidationCommitPrecondition,
+    ProviderSupportStatus, RevisionPrecondition, RunProviderBindingRepository, SaveProfileRequest,
+    SaveProfileRevision, SelectionAvailability, SelectionCurrentStatus, SelectionTargetView,
+    SwitchModelRequest, ValidateProfileRequest, ValidationCommit, ValidationCommitPrecondition,
 };
 
 use super::{
@@ -138,6 +138,39 @@ impl InProcessProviderManagementApi {
                 existing_names: &names,
             }))
     }
+
+    async fn activate_and_readback(
+        &self,
+        operation_id: OperationId,
+        revision: &ProfileRevision,
+        expected_activation_revision: Option<u64>,
+    ) -> ProviderResult<ActiveProviderView> {
+        let validation = revision.validation().ok_or_else(model_context_unknown)?;
+        let activated = self
+            .lifecycle
+            .activate(ActivateProfileRequest {
+                operation_id,
+                precondition: ActivationPrecondition {
+                    profile_id: revision.profile_id(),
+                    revision: revision.revision(),
+                    validation_id: validation.id(),
+                    validation_digest: validation.digest().clone(),
+                    expected_activation_revision,
+                },
+            })
+            .await?;
+        let readback = self
+            .lifecycle
+            .active_snapshot()
+            .await?
+            .as_ref()
+            .map(ActiveProviderView::from)
+            .ok_or_else(internal_error)?;
+        if readback != activated {
+            return Err(stale_operation());
+        }
+        Ok(readback)
+    }
 }
 
 #[async_trait]
@@ -231,7 +264,7 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
         let mut candidates = Vec::new();
 
         for summary in summaries
-            .into_iter()
+            .iter()
             .filter(|summary| summary.provider == provider)
         {
             let revision = self
@@ -311,7 +344,170 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
             }
         }
 
+        if let Some(active) = active.as_ref()
+            && active.provider == provider
+            && !candidates
+                .iter()
+                .any(|candidate| candidate.current().is_current())
+        {
+            let summary = summaries
+                .iter()
+                .find(|summary| summary.profile_id == active.profile_id)
+                .ok_or_else(catalog_unavailable)?;
+            let active_revision = self
+                .profiles
+                .load_revision(active.profile_id, active.profile_revision)
+                .await?;
+            if active_revision.provider() != active.provider
+                || active_revision.model() != &active.model
+                || active_revision.state() != ProfileState::Ready
+            {
+                return Err(catalog_unavailable());
+            }
+            candidates.push(model_candidate_view(
+                active.profile_id,
+                active.profile_revision,
+                expected_activation_revision,
+                active.provider,
+                active.model.clone(),
+                &summary.name,
+                ModelCandidateStatus::Ready,
+                SelectionCurrentStatus::Current,
+            )?);
+        }
+
         ModelCandidateBatch::new(request.target, candidates).map_err(|_| catalog_unavailable())
+    }
+
+    async fn switch_model(
+        &self,
+        request: SwitchModelRequest,
+    ) -> ProviderResult<ActiveProviderView> {
+        self.lifecycle
+            .require_not_cancelled(request.operation_id())?;
+        let candidate = request.candidate();
+        let revision = self
+            .profiles
+            .load_current_revision(candidate.profile_id())
+            .await?;
+        let active_revision = self
+            .profiles
+            .active()
+            .await?
+            .map(|active| active.activation_revision());
+        candidate.ensure_fresh(revision.revision(), active_revision)?;
+        if revision.provider() != candidate.provider() {
+            return Err(model_context_unknown());
+        }
+        let catalog_view = unique_catalog_view(&self.catalog_views, candidate.provider())?;
+        if catalog_view.support_status == ProviderSupportStatus::Blocked {
+            return Err(model_context_unknown());
+        }
+        let (credential_generation, credential_status) = self.generation_status(&revision).await?;
+        require_saved_credential(credential_status)?;
+
+        if revision.model() == candidate.model() && revision.state() == ProfileState::Ready {
+            return self
+                .activate_and_readback(
+                    request.operation_id(),
+                    &revision,
+                    candidate.expected_activation_revision(),
+                )
+                .await;
+        }
+        if revision.model() == candidate.model() && revision.state() == ProfileState::Invalid {
+            return Err(validation_stale());
+        }
+
+        let discovered = self
+            .discover_models(DiscoverModelsRequest {
+                operation_id: request.operation_id(),
+                profile_id: revision.profile_id(),
+                profile_revision: revision.revision(),
+                provider: revision.provider(),
+                credential_generation,
+            })
+            .await?;
+        self.lifecycle
+            .require_not_cancelled(request.operation_id())?;
+        let observed_context_limit = discovered.into_iter().find_map(|discovered| {
+            let model = ProviderModelId::new(revision.provider(), discovered.model).ok()?;
+            (model == *candidate.model())
+                .then_some(discovered.context_limit)
+                .flatten()
+                .filter(|limit| *limit > 0)
+        });
+        let observed_context_limit = observed_context_limit.ok_or_else(model_context_unknown)?;
+
+        let latest_revision = self
+            .profiles
+            .load_current_revision(candidate.profile_id())
+            .await?;
+        let latest_activation_revision = self
+            .profiles
+            .active()
+            .await?
+            .map(|active| active.activation_revision());
+        candidate.ensure_fresh(latest_revision.revision(), latest_activation_revision)?;
+
+        let validation_revision =
+            if revision.model() == candidate.model() && revision.state() == ProfileState::Draft {
+                revision
+            } else {
+                let detail = self.lifecycle.load_profile(revision.profile_id()).await?;
+                let name = ProfileName::new(detail.summary.name).map_err(|_| internal_error())?;
+                let next_revision = revision
+                    .revision()
+                    .checked_add(1)
+                    .ok_or_else(internal_error)?;
+                let draft = ProfileRevision::draft(
+                    revision.profile_id(),
+                    next_revision,
+                    revision.provider(),
+                    candidate.model().clone(),
+                    revision.parameters().clone(),
+                    Some(credential_generation),
+                )
+                .map_err(|_| model_context_unknown())?;
+                self.lifecycle
+                    .save_profile(SaveProfileRequest {
+                        operation_id: request.operation_id(),
+                        revision: SaveProfileRevision {
+                            precondition: RevisionPrecondition {
+                                profile_id: revision.profile_id(),
+                                expected_current_revision: Some(revision.revision()),
+                            },
+                            name,
+                            revision: draft,
+                        },
+                    })
+                    .await?;
+                self.profiles
+                    .load_current_revision(revision.profile_id())
+                    .await?
+            };
+
+        let validation = self
+            .validate_profile(ValidateProfileRequest {
+                operation_id: request.operation_id(),
+                profile_id: validation_revision.profile_id(),
+                revision: validation_revision.revision(),
+                observed_context_limit: Some(observed_context_limit),
+            })
+            .await?;
+        if validation.state != ProfileState::Ready {
+            return Err(model_context_unknown());
+        }
+        let ready = self
+            .profiles
+            .load_current_revision(validation_revision.profile_id())
+            .await?;
+        self.activate_and_readback(
+            request.operation_id(),
+            &ready,
+            candidate.expected_activation_revision(),
+        )
+        .await
     }
 
     async fn list_profiles(&self) -> ProviderResult<Vec<ys_agent_core::ProfileSummary>> {
@@ -597,6 +793,18 @@ fn candidate_current_status(
     }
 }
 
+fn unique_catalog_view(
+    views: &[ProviderCatalogView],
+    provider: ys_agent_core::ProviderId,
+) -> ProviderResult<&ProviderCatalogView> {
+    let mut matches = views.iter().filter(|view| view.provider == provider);
+    let view = matches.next().ok_or_else(catalog_unavailable)?;
+    if matches.next().is_some() {
+        return Err(catalog_unavailable());
+    }
+    Ok(view)
+}
+
 fn candidate_status(
     state: ProfileState,
     credential_status: CredentialViewStatus,
@@ -679,6 +887,14 @@ fn model_context_unknown() -> ProviderManagementError {
     ProviderManagementError::new(
         ProviderErrorCode::ModelIncompatible,
         Some(ProviderField::Model),
+        ProviderRemediation::ValidateProfile,
+    )
+}
+
+fn validation_stale() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::ValidationStale,
+        Some(ProviderField::Validation),
         ProviderRemediation::ValidateProfile,
     )
 }

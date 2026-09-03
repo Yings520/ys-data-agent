@@ -627,6 +627,7 @@ impl ProviderManagementService {
     /// Persists the caller's next Draft revision under the repository CAS precondition. A failed
     /// save returns before this service can alter the active snapshot or any prior revision.
     pub async fn save_profile(&self, request: SaveProfileRequest) -> ProviderResult<ProfileDetail> {
+        self.require_not_cancelled(request.operation_id)?;
         let profile_id = request.revision.revision.profile_id();
         self.validate_draft(&request.revision.name, &request.revision.revision)
             .await?;
@@ -903,7 +904,7 @@ impl ProviderManagementService {
         Ok(())
     }
 
-    fn require_not_cancelled(&self, operation_id: OperationId) -> ProviderResult<()> {
+    pub(super) fn require_not_cancelled(&self, operation_id: OperationId) -> ProviderResult<()> {
         let cancelled = self
             .cancelled_operations
             .lock()

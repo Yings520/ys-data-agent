@@ -10,11 +10,12 @@ use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
 use ys_agent_core::{
     AgentAction, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactKind, ArtifactMetadata,
     ArtifactStore, CellValue, CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult,
-    CredentialVault, EventActor, ModelResponse, PendingRunEvent, Principal,
-    ProtectedCredentialWrite, ProviderCredentialReference, ProviderResult, PutArtifact,
-    QueryResult, RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
-    RunProviderBindingSource, RunStatus, RuntimeCommandBatch, RuntimeStore, SecretValue,
-    Sensitivity, StepId, TaskId, TaskStatus, WorkspaceId,
+    CredentialVault, EventActor, ModelCandidateKey, ModelResponse, OperationId, PendingRunEvent,
+    Principal, ProfileId, ProtectedCredentialWrite, ProviderCredentialReference, ProviderId,
+    ProviderModelId, ProviderResult, PutArtifact, QueryResult, RunEventKind, RunId,
+    RunProviderBinding, RunProviderBindingRepository, RunProviderBindingSource, RunStatus,
+    RuntimeCommandBatch, RuntimeStore, SecretValue, Sensitivity, StepId, SwitchModelRequest,
+    TaskId, TaskStatus, WorkspaceId,
 };
 use ys_agent_runtime::{
     ActiveRunProviderBindingSource, AgentServiceApi, CoordinationDecision, Coordinator,
@@ -275,6 +276,23 @@ async fn provider_management_is_available_only_through_the_service_boundary() {
         .provider_model_selection_snapshot()
         .await
         .expect_err("an uncomposed service must fail closed for model selection too");
+    assert_eq!(error.code(), "provider.internal");
+
+    let profile_id = ProfileId::new();
+    let candidate = ModelCandidateKey::new(
+        profile_id,
+        1,
+        None,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/service-boundary")
+            .expect("governed model"),
+    )
+    .expect("valid candidate key");
+    let error = fixture
+        .service
+        .provider_switch_model(SwitchModelRequest::new(OperationId::new(), candidate))
+        .await
+        .expect_err("an uncomposed service must not invent a switch path");
     assert_eq!(error.code(), "provider.internal");
 }
 

@@ -4,13 +4,15 @@ use ys_agent_adapters::{
     credential::keyring::InMemoryCredentialVault, model::liter::LiterProviderFactory,
 };
 use ys_agent_core::{
-    CredentialLease, CredentialVault, CredentialViewStatus, DiscoverModelsRequest, DiscoveredModel,
-    ListModelCandidatesRequest, ModelCandidateStatus, ModelDiscovery, ProfileName,
-    ProtectedCredentialWrite, ProviderCatalogView, ProviderCredentialReference, ProviderErrorCode,
+    AgentAction, CoreError, CoreResult, CredentialLease, CredentialVault, CredentialViewStatus,
+    DiscoverModelsRequest, DiscoveredModel, ListModelCandidatesRequest, ModelCandidateKey,
+    ModelCandidateStatus, ModelCapabilities, ModelDiscovery, ModelProvider, ModelRequest,
+    ModelResponse, ProfileName, ProtectedCredentialWrite, ProviderCatalogView,
+    ProviderClientBinding, ProviderClientFactory, ProviderCredentialReference, ProviderErrorCode,
     ProviderField, ProviderId, ProviderManagementApi, ProviderManagementError,
     ProviderProfileRepository, ProviderRemediation, ProviderResult, ProviderSupportStatus,
     RunProviderBindingRepository, SecretValue, SelectionAvailability, SelectionCurrentStatus,
-    SelectionTarget,
+    SelectionTarget, SwitchModelRequest, ToolCall, ToolCallId,
 };
 use ys_agent_runtime::provider::{
     api::InProcessProviderManagementApi,
@@ -39,6 +41,80 @@ impl ModelDiscovery for ScriptedDiscovery {
             .pop_front()
             .expect("scripted discovery response")
     }
+}
+
+struct ScriptedProvider {
+    responses: tokio::sync::Mutex<VecDeque<CoreResult<ModelResponse>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for ScriptedProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calling: true,
+            structured_outputs: true,
+            max_context_tokens: 0,
+            parallel_tool_calls: false,
+            streaming: false,
+        }
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> CoreResult<ModelResponse> {
+        self.responses
+            .lock()
+            .await
+            .pop_front()
+            .expect("scripted Provider response")
+    }
+}
+
+struct ScriptedProviderFactory {
+    scripts: tokio::sync::Mutex<VecDeque<VecDeque<CoreResult<ModelResponse>>>>,
+}
+
+#[async_trait::async_trait]
+impl ProviderClientFactory for ScriptedProviderFactory {
+    async fn build(
+        &self,
+        _binding: ProviderClientBinding,
+        credential: CredentialLease,
+    ) -> ProviderResult<Arc<dyn ModelProvider>> {
+        credential.with_secret(|_| ());
+        let responses = self
+            .scripts
+            .lock()
+            .await
+            .pop_front()
+            .expect("scripted Provider instance");
+        Ok(Arc::new(ScriptedProvider {
+            responses: tokio::sync::Mutex::new(responses),
+        }))
+    }
+}
+
+fn successful_probe_responses() -> VecDeque<CoreResult<ModelResponse>> {
+    VecDeque::from([
+        Ok(ModelResponse {
+            action: AgentAction::CallTool {
+                call: ToolCall {
+                    id: ToolCallId::new(),
+                    provider_call_id: Some("switch-model-probe".to_owned()),
+                    name: "ysda_compatibility_probe".to_owned(),
+                    arguments: serde_json::json!({}),
+                    version: "v1".to_owned(),
+                },
+            },
+            raw_content: None,
+            usage: None,
+        }),
+        Ok(ModelResponse {
+            action: AgentAction::Respond {
+                message: "probe complete".to_owned(),
+            },
+            raw_content: None,
+            usage: None,
+        }),
+    ])
 }
 
 fn catalog_views() -> Vec<ProviderCatalogView> {
@@ -98,6 +174,28 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
                 Some(ProviderField::Model),
                 ProviderRemediation::Retry,
             )),
+            Ok(vec![DiscoveredModel {
+                model: "deepseek/new-model".to_owned(),
+                context_limit: Some(64),
+            }]),
+            Ok(vec![DiscoveredModel {
+                model: "deepseek/timeout-model".to_owned(),
+                context_limit: Some(64),
+            }]),
+            Err(ProviderManagementError::new(
+                ProviderErrorCode::DiscoveryFailed,
+                Some(ProviderField::Model),
+                ProviderRemediation::Retry,
+            )),
+        ])),
+    });
+    let factory = Arc::new(ScriptedProviderFactory {
+        scripts: tokio::sync::Mutex::new(VecDeque::from([
+            successful_probe_responses(),
+            VecDeque::from([Err(CoreError::validation(
+                "provider.timeout",
+                "injected compatibility timeout",
+            ))]),
         ])),
     });
     let lifecycle = Arc::new(ProviderManagementService::new(profiles.clone()));
@@ -115,7 +213,7 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
         lifecycle,
         credentials,
         discovery,
-        Arc::new(LiterProviderFactory::new()),
+        factory,
     );
 
     assert_eq!(api.catalog().await.expect("offline catalog").len(), 9);
@@ -215,6 +313,13 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
         candidate.key().model().as_str() == "deepseek/new-model"
             && candidate.status() == ModelCandidateStatus::NeedsValidation
     }));
+    let ready_key = first
+        .candidates()
+        .iter()
+        .find(|candidate| candidate.current() == SelectionCurrentStatus::Current)
+        .expect("current Ready candidate")
+        .key()
+        .clone();
     assert!(
         !serde_json::to_string(&first)
             .expect("serialize candidates")
@@ -232,6 +337,152 @@ async fn masked_provider_api_serves_offline_catalog_profiles_and_active_snapshot
             .iter()
             .all(|candidate| candidate.key().model().as_str() == "deepseek/test-model")
     );
+
+    let unavailable_key = ModelCandidateKey::new(
+        copied.summary.profile_id,
+        copied.revision,
+        Some(reactivated.activation_revision),
+        copied.summary.provider,
+        copied.model.clone(),
+    )
+    .expect("unavailable candidate key");
+    let error = api
+        .switch_model(SwitchModelRequest::new(
+            ys_agent_core::OperationId::new(),
+            unavailable_key,
+        ))
+        .await
+        .expect_err("a candidate without a protected Credential must fail closed");
+    assert_eq!(error.code(), "provider.credential.missing");
+    assert_eq!(
+        api.active_provider()
+            .await
+            .expect("active readback after missing Credential")
+            .expect("active Provider"),
+        reactivated
+    );
+
+    let switched = api
+        .switch_model(SwitchModelRequest::new(
+            ys_agent_core::OperationId::new(),
+            ready_key.clone(),
+        ))
+        .await
+        .expect("atomically reactivate a Ready candidate");
+    assert_eq!(switched.profile_id, active.profile_id());
+    assert_eq!(switched.model.as_str(), "deepseek/test-model");
+    assert_eq!(
+        api.active_provider()
+            .await
+            .expect("authoritative readback")
+            .expect("active Provider"),
+        switched
+    );
+
+    let error = api
+        .switch_model(SwitchModelRequest::new(
+            ys_agent_core::OperationId::new(),
+            ready_key,
+        ))
+        .await
+        .expect_err("a candidate with a stale activation revision must fail closed");
+    assert_eq!(error.code(), "provider.activation.precondition_failed");
+    assert_eq!(
+        api.active_provider()
+            .await
+            .expect("active readback after conflict")
+            .expect("active Provider"),
+        switched
+    );
+
+    let cancelled_operation = ys_agent_core::OperationId::new();
+    api.cancel_operation(cancelled_operation)
+        .await
+        .expect("record cancellation");
+    let fresh_key = ModelCandidateKey::new(
+        switched.profile_id,
+        switched.profile_revision,
+        Some(switched.activation_revision),
+        switched.provider,
+        switched.model.clone(),
+    )
+    .expect("fresh candidate key");
+    let error = api
+        .switch_model(SwitchModelRequest::new(cancelled_operation, fresh_key))
+        .await
+        .expect_err("a cancelled switch must fail closed");
+    assert_eq!(error.code(), "provider.operation.cancelled");
+    assert_eq!(
+        api.active_provider()
+            .await
+            .expect("active readback after cancellation")
+            .expect("active Provider"),
+        switched
+    );
+
+    let first_use_key = ModelCandidateKey::new(
+        switched.profile_id,
+        switched.profile_revision,
+        Some(switched.activation_revision),
+        switched.provider,
+        ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/new-model")
+            .expect("governed model"),
+    )
+    .expect("first-use candidate key");
+    let first_used = api
+        .switch_model(SwitchModelRequest::new(
+            ys_agent_core::OperationId::new(),
+            first_use_key,
+        ))
+        .await
+        .expect("discover, persist, validate, and activate a first-use model");
+    assert_eq!(first_used.model.as_str(), "deepseek/new-model");
+    assert_eq!(first_used.profile_revision, switched.profile_revision + 1);
+    assert_eq!(
+        api.active_provider()
+            .await
+            .expect("first-use authoritative readback")
+            .expect("active Provider"),
+        first_used
+    );
+
+    let timeout_key = ModelCandidateKey::new(
+        first_used.profile_id,
+        first_used.profile_revision,
+        Some(first_used.activation_revision),
+        first_used.provider,
+        ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/timeout-model")
+            .expect("governed model"),
+    )
+    .expect("timeout candidate key");
+    let error = api
+        .switch_model(SwitchModelRequest::new(
+            ys_agent_core::OperationId::new(),
+            timeout_key,
+        ))
+        .await
+        .expect_err("a compatibility timeout must not replace the active model");
+    assert_eq!(error.code(), "provider.timeout");
+    assert_eq!(
+        api.active_provider()
+            .await
+            .expect("active readback after timeout")
+            .expect("active Provider"),
+        first_used
+    );
+    let after_timeout = api
+        .list_model_candidates(ListModelCandidatesRequest {
+            target: SelectionTarget::Provider(ProviderId::DeepSeek),
+        })
+        .await
+        .expect("reload candidates after a failed first-use validation");
+    let current = after_timeout
+        .candidates()
+        .iter()
+        .filter(|candidate| candidate.current().is_current())
+        .collect::<Vec<_>>();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].key().model().as_str(), "deepseek/new-model");
 }
 
 #[tokio::test]
