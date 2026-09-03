@@ -157,7 +157,7 @@
   - _Requirements: 2.1, 2.2, 2.3, 6.4, 6.5_
   - _Boundary: TUI Controller Event and Run Snapshot integration_
   - _Depends: 3.1, 4.1_
-- [ ] 4.3 集成结果卡片与 Artifact 只读导航
+- [x] 4.3 集成结果卡片与 Artifact 只读导航
   - 让结果卡片获得焦点后 Enter 打开 Artifact 的 Results 页；鼠标启用时点击同一卡片执行完全相同的 typed navigation action。
   - 进入 Artifact 时只通过 AgentService 读取受 Policy 限制的持久化内容与 Preview；缺失或受限时显示真实原因。
   - 切换页签、滚动表格和 Esc 返回 Timeline 时保留 Timeline 状态，且不调用 send_message、resume_task、Query 或 Tool API。

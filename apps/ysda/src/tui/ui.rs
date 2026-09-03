@@ -39,7 +39,7 @@ impl LayoutMode {
     }
 }
 
-pub fn render(frame: &mut Frame<'_>, app: &TuiApp) {
+pub fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
     let area = frame.area();
     let mode = LayoutMode::resolve(area);
     let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
@@ -48,6 +48,7 @@ pub fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         area,
     );
     if mode == LayoutMode::TooSmall {
+        app.timeline_state.result_card_hit_region = None;
         render_too_small(frame, app, area);
         return;
     }
@@ -175,7 +176,7 @@ fn query_color(
     }
 }
 
-fn render_body(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMode) {
+fn render_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect, mode: LayoutMode) {
     let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
     let text = match app.transient {
         Some(TransientView::Help) => help_lines(app),
@@ -202,7 +203,10 @@ fn render_body(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMode
                 artifact::render_lines(&app.artifact_workspace)
                     .into_iter()
                     .map(|line| {
-                        let color = if line.contains("restricted") || line.contains("missing") {
+                        let color = if line.contains("restricted")
+                            || line.contains("missing")
+                            || line.contains("unavailable")
+                        {
                             theme.error
                         } else if line.contains("Warning") || line.contains("preview limited") {
                             theme.warning
@@ -263,6 +267,41 @@ fn render_body(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMode
     } else {
         app.scroll
     };
+    let result_hit_region = if app.navigation.current() == ContentRoute::Timeline
+        && app.timeline_state.view().result_card.is_some()
+    {
+        text.lines
+            .iter()
+            .position(|line| line.to_string() == "Results")
+            .and_then(|result_index| {
+                let width = usize::from(area.width.max(1));
+                let rows_before = text.lines[..result_index]
+                    .iter()
+                    .map(|line| line.width().max(1).div_ceil(width))
+                    .sum::<usize>();
+                let card_rows = text.lines[result_index..]
+                    .iter()
+                    .map(|line| line.width().max(1).div_ceil(width))
+                    .sum::<usize>();
+                let scroll = usize::from(scroll);
+                let visible_height = usize::from(visible_height);
+                (rows_before < scroll.saturating_add(visible_height)).then(|| {
+                    let visible_start = rows_before.saturating_sub(scroll);
+                    let clipped_top = scroll.saturating_sub(rows_before).min(card_rows);
+                    let height = card_rows
+                        .saturating_sub(clipped_top)
+                        .min(visible_height.saturating_sub(visible_start));
+                    timeline::HitRegion::new(
+                        area.x,
+                        area.y.saturating_add(visible_start as u16),
+                        area.width,
+                        height as u16,
+                    )
+                })
+            })
+    } else {
+        None
+    };
     let paragraph = Paragraph::new(text)
         .style(Style::default().fg(theme.text).bg(theme.background))
         .block(
@@ -273,6 +312,7 @@ fn render_body(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMode
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
+    app.timeline_state.result_card_hit_region = result_hit_region;
 }
 
 fn timeline_color(
@@ -647,10 +687,11 @@ fn render_too_small(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
 }
 
 pub fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {
+    let mut app = app.clone();
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal
-        .draw(|frame| render(frame, app))
+        .draw(|frame| render(frame, &mut app))
         .expect("render test app");
     let buffer = terminal.backend().buffer();
     (0..height)

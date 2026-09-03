@@ -21,11 +21,15 @@ use super::input::{DetailRequest, InputAction};
 use super::{
     AsyncChannel, AsyncOperationRegistry, AsyncOperationTicket, AsyncResultGuard,
     ProviderOperationCompletion, ProviderOperationPolicy, RouteKey,
-    artifact::ArtifactWorkspaceState,
+    artifact::{
+        ArtifactAction, ArtifactOutcome, ArtifactUnavailableReason, ArtifactWorkspaceProjection,
+        ArtifactWorkspaceState, AuthorizedResultsPreview, ResultsAccess, ResultsViewportPage,
+        ResultsViewportRequest, project_results_viewport,
+    },
     composer::ComposerState,
     mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQueryMode},
     model_selection::ModelSelectionState,
-    navigation::{ContentRoute, NavigationState, ProviderNavigationState},
+    navigation::{ContentRoute, FocusTarget, NavigationState, ProviderNavigationState},
     palette::SlashPalette,
     provider_management::{
         ProviderManagementScreen, ProviderManagementScreenView, ProviderManagementStep,
@@ -486,6 +490,12 @@ pub struct TuiController {
         ys_agent_core::CoreResult<TuiDisplayContext>,
     )>,
     display_context_refresh_counts: [usize; 5],
+    artifact_guard: AsyncResultGuard,
+    artifact_tasks: JoinSet<(
+        AsyncOperationTicket,
+        ys_agent_core::CoreResult<ArtifactReadPayload>,
+    )>,
+    artifact_result_id: Option<ArtifactId>,
 }
 
 pub(super) enum SubmissionCompletion {
@@ -502,6 +512,14 @@ pub(super) enum TimelineEventOutcome {
     Duplicate,
     Gap,
     Ignored,
+}
+
+pub(super) enum ArtifactReadPayload {
+    Projection {
+        result_id: Option<ArtifactId>,
+        projection: ArtifactWorkspaceProjection,
+    },
+    Viewport(ResultsViewportPage),
 }
 
 pub(super) enum ProviderOperationPayload {
@@ -540,6 +558,9 @@ impl TuiController {
             display_context_guard: AsyncResultGuard::default(),
             display_context_tasks: JoinSet::new(),
             display_context_refresh_counts: [0; 5],
+            artifact_guard: AsyncResultGuard::default(),
+            artifact_tasks: JoinSet::new(),
+            artifact_result_id: None,
         }
     }
 
@@ -596,6 +617,133 @@ impl TuiController {
 
     pub(super) fn reset_event_subscription(&mut self) {
         self.subscription = None;
+    }
+
+    pub(super) fn request_open_artifact(
+        &mut self,
+        app: &mut TuiApp,
+    ) -> ys_agent_core::CoreResult<bool> {
+        if app.navigation.current() != ContentRoute::Timeline
+            || app.timeline_state.focus != FocusTarget::TimelineResultCard
+            || app.timeline_state.view().result_card.is_none()
+        {
+            return Ok(false);
+        }
+        let query_id = app.primary_artifact_id.ok_or_else(|| {
+            ys_agent_core::CoreError::validation(
+                "primary_artifact_missing",
+                "The focused result card has no persisted Query Artifact",
+            )
+        })?;
+        app.push_route(ContentRoute::Artifact);
+        app.artifact_workspace = ArtifactWorkspaceState::default();
+        app.scroll = 0;
+        self.artifact_result_id = None;
+        let request = app.artifact_workspace.results().request();
+        let source_display_name = app.header.datasource.clone();
+        let access = self.access(ArtifactAccessPurpose::TuiPreview);
+        let ticket = self
+            .artifact_guard
+            .start(AsyncChannel::Artifact, app.navigation.route_key())
+            .expect("Artifact is a replaceable read lane");
+        let service = self.service.clone();
+        self.artifact_tasks.spawn(async move {
+            let result = load_artifact_projection(
+                service.as_ref(),
+                query_id,
+                access,
+                &source_display_name,
+                request,
+            )
+            .await;
+            (ticket, result)
+        });
+        Ok(true)
+    }
+
+    pub(super) fn apply_ready_artifact(&mut self, app: &mut TuiApp) -> bool {
+        let mut applied = false;
+        while let Some(completion) = self.artifact_tasks.try_join_next() {
+            let Ok((ticket, result)) = completion else {
+                continue;
+            };
+            if !self
+                .artifact_guard
+                .accept_completion(ticket, app.navigation.route_key())
+            {
+                continue;
+            }
+            match result {
+                Ok(ArtifactReadPayload::Projection {
+                    result_id,
+                    projection,
+                }) => {
+                    self.artifact_result_id = result_id;
+                    app.artifact_workspace
+                        .reduce(ArtifactAction::ProjectionLoaded(projection));
+                }
+                Ok(ArtifactReadPayload::Viewport(page)) => {
+                    app.artifact_workspace
+                        .reduce(ArtifactAction::ViewportLoaded(page));
+                }
+                Err(error) => {
+                    app.safe_warning = Some(error.code().to_owned());
+                    app.artifact_workspace
+                        .reduce(ArtifactAction::ProjectionLoaded(
+                            ArtifactWorkspaceProjection::unavailable(
+                                ArtifactUnavailableReason::StatusUnavailable,
+                            ),
+                        ));
+                }
+            }
+            applied = true;
+        }
+        applied
+    }
+
+    pub(super) fn apply_artifact_action(
+        &mut self,
+        app: &mut TuiApp,
+        action: ArtifactAction,
+    ) -> ArtifactOutcome {
+        let outcome = app.artifact_workspace.reduce(action);
+        match outcome {
+            ArtifactOutcome::ViewportRequested(request) => {
+                self.request_artifact_viewport(app, request);
+            }
+            ArtifactOutcome::Close => self.close_artifact(app),
+            ArtifactOutcome::Changed | ArtifactOutcome::Ignored => {}
+        }
+        outcome
+    }
+
+    fn request_artifact_viewport(&mut self, app: &TuiApp, request: ResultsViewportRequest) {
+        let Some(result_id) = self.artifact_result_id else {
+            return;
+        };
+        let access = self.access(ArtifactAccessPurpose::TuiPreview);
+        let ticket = self
+            .artifact_guard
+            .start(AsyncChannel::Artifact, app.navigation.route_key())
+            .expect("Artifact is a replaceable read lane");
+        let service = self.service.clone();
+        self.artifact_tasks.spawn(async move {
+            let result = service
+                .query_result_preview(&result_id, access)
+                .await
+                .map(|preview| {
+                    ArtifactReadPayload::Viewport(project_results_viewport(
+                        AuthorizedResultsPreview::from(&preview),
+                        request,
+                    ))
+                });
+            (ticket, result)
+        });
+    }
+
+    fn close_artifact(&mut self, app: &mut TuiApp) {
+        let _ = app.pop_route();
+        self.artifact_result_id = None;
     }
 
     pub fn submission_in_flight(&self) -> bool {
@@ -1706,7 +1854,9 @@ impl TuiController {
                 error.to_string(),
             )
         })?;
-        app.timeline_state.apply_persisted_query_artifact(&artifact);
+        if app.timeline_state.apply_persisted_query_artifact(&artifact) {
+            app.timeline_state.focus = FocusTarget::TimelineResultCard;
+        }
         if app.rendered_answer_artifact_id != Some(artifact_id) {
             let key_values = self.load_key_values(&artifact).await;
             app.push_transcript(TranscriptItem::Answer(AnswerView {
@@ -1835,6 +1985,85 @@ fn refresh_provider_detail(app: &mut TuiApp, screen: &ProviderManagementScreen) 
             lines: provider_management_lines(&view),
         },
     );
+}
+
+async fn load_artifact_projection(
+    service: &dyn AgentServiceApi,
+    query_id: ArtifactId,
+    access: ArtifactAccessContext,
+    source_display_name: &str,
+    request: ResultsViewportRequest,
+) -> ys_agent_core::CoreResult<ArtifactReadPayload> {
+    let query_view = match service.get_artifact(&query_id, access.clone()).await {
+        Ok(view) => view,
+        Err(error) if error.code() == "not_found" => {
+            return Ok(ArtifactReadPayload::Projection {
+                result_id: None,
+                projection: ArtifactWorkspaceProjection::unavailable(
+                    ArtifactUnavailableReason::Missing,
+                ),
+            });
+        }
+        Err(error) if error.code() == "artifact_access_denied" => {
+            return Ok(ArtifactReadPayload::Projection {
+                result_id: None,
+                projection: ArtifactWorkspaceProjection::unavailable(
+                    ArtifactUnavailableReason::PolicyRestricted,
+                ),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if query_view.truncated {
+        return Err(ys_agent_core::CoreError::validation(
+            "query_artifact_preview_limited",
+            "The persisted Query Artifact cannot be safely decoded from a limited preview",
+        ));
+    }
+    let artifact: QueryArtifact = serde_json::from_slice(&query_view.preview).map_err(|_| {
+        ys_agent_core::CoreError::validation(
+            "malformed_query_artifact",
+            "The persisted Query Artifact does not match the supported schema",
+        )
+    })?;
+    let result_id = artifact
+        .result_artifact
+        .as_ref()
+        .map(|reference| reference.id());
+    let preview = match result_id {
+        Some(result_id) => match service
+            .query_result_preview(&result_id, access.clone())
+            .await
+        {
+            Ok(preview) => Some(preview),
+            Err(error) if error.code() == "not_found" => None,
+            Err(error) if error.code() == "artifact_access_denied" => {
+                return Ok(ArtifactReadPayload::Projection {
+                    result_id: Some(result_id),
+                    projection: ArtifactWorkspaceProjection::authorized(
+                        &artifact,
+                        source_display_name,
+                        ResultsAccess::PolicyRestricted,
+                        request,
+                    ),
+                });
+            }
+            Err(error) => return Err(error),
+        },
+        None => None,
+    };
+    let results = preview.as_ref().map_or(ResultsAccess::Missing, |preview| {
+        ResultsAccess::Available(AuthorizedResultsPreview::from(preview))
+    });
+    Ok(ArtifactReadPayload::Projection {
+        result_id,
+        projection: ArtifactWorkspaceProjection::authorized(
+            &artifact,
+            source_display_name,
+            results,
+            request,
+        ),
+    })
 }
 
 async fn load_provider_management_view(
@@ -2279,18 +2508,153 @@ mod provider_management_tests {
 
 #[cfg(test)]
 mod event_timeline_tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use chrono::Utc;
+    use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
     use ys_agent_core::{
-        EventActor, EventId, RunEventKind, RunSnapshot, VersionedRunEvent, WorkflowKind,
+        ArtifactMetadata, EventActor, EventId, QueryIntent, RetentionPolicy, RunEventKind,
+        RunSnapshot, SemanticStatus, Session, SourceId, Task, VersionedRunEvent, WorkflowKind,
     };
-    use ys_agent_runtime::{InProcessAgentService, NoopRunScheduler};
+    use ys_agent_runtime::{
+        ArtifactView, EventSubscription, InProcessAgentService, NoopRunScheduler,
+        QueryResultPreviewView, VerificationReport, doctor::DoctorReport,
+    };
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
     use super::*;
-    use crate::tui::timeline::TimelineStatus;
+    use crate::tui::{
+        HitRegion,
+        artifact::{ArtifactAction, ResultMove},
+        timeline::TimelineStatus,
+    };
+
+    #[derive(Default)]
+    struct CountingMissingArtifactService {
+        artifact_reads: AtomicUsize,
+        query_or_tool_calls: AtomicUsize,
+        resume_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentServiceApi for CountingMissingArtifactService {
+        async fn query_result_preview(
+            &self,
+            _artifact_id: &ArtifactId,
+            _access: ArtifactAccessContext,
+        ) -> ys_agent_core::CoreResult<QueryResultPreviewView> {
+            unreachable!("a missing primary Artifact has no Results Preview")
+        }
+
+        async fn create_session(
+            &self,
+            _command_id: CommandId,
+            _principal: Principal,
+        ) -> ys_agent_core::CoreResult<Session> {
+            unreachable!("Artifact navigation cannot create a Session")
+        }
+
+        async fn create_task(
+            &self,
+            _request: CreateTaskRequest,
+        ) -> ys_agent_core::CoreResult<Task> {
+            unreachable!("Artifact navigation cannot create a Task")
+        }
+
+        async fn send_message(
+            &self,
+            _request: SendMessageRequest,
+        ) -> ys_agent_core::CoreResult<ServiceReply> {
+            self.query_or_tool_calls.fetch_add(1, Ordering::SeqCst);
+            Err(ys_agent_core::CoreError::validation(
+                "unexpected_query_call",
+                "Artifact navigation cannot submit a Query or invoke Tools",
+            ))
+        }
+
+        async fn resume_task(
+            &self,
+            _command_id: CommandId,
+            _task_id: &TaskId,
+        ) -> ys_agent_core::CoreResult<RunId> {
+            self.resume_calls.fetch_add(1, Ordering::SeqCst);
+            Err(ys_agent_core::CoreError::validation(
+                "unexpected_resume_call",
+                "Artifact navigation cannot resume a Task",
+            ))
+        }
+
+        async fn answer_clarification(
+            &self,
+            _command_id: CommandId,
+            _run_id: &RunId,
+            _answer: String,
+        ) -> ys_agent_core::CoreResult<()> {
+            unreachable!("Artifact navigation cannot answer clarification")
+        }
+
+        async fn list_tasks(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> ys_agent_core::CoreResult<Vec<Task>> {
+            unreachable!("Artifact navigation cannot list Tasks")
+        }
+
+        async fn get_task(&self, _task_id: &TaskId) -> ys_agent_core::CoreResult<Task> {
+            unreachable!("Artifact navigation cannot read Tasks")
+        }
+
+        async fn get_run(&self, _run_id: &RunId) -> ys_agent_core::CoreResult<RunSnapshot> {
+            unreachable!("Artifact navigation cannot read Runs")
+        }
+
+        async fn get_artifact(
+            &self,
+            artifact_id: &ArtifactId,
+            _access: ArtifactAccessContext,
+        ) -> ys_agent_core::CoreResult<ArtifactView> {
+            self.artifact_reads.fetch_add(1, Ordering::SeqCst);
+            Err(ys_agent_core::CoreError::NotFound {
+                entity: "Artifact",
+                id: artifact_id.to_string(),
+            })
+        }
+
+        async fn subscribe_events(
+            &self,
+            _run_id: &RunId,
+            _after_sequence: u64,
+        ) -> ys_agent_core::CoreResult<EventSubscription> {
+            unreachable!("Artifact navigation cannot subscribe to Events")
+        }
+
+        async fn cancel_run(
+            &self,
+            _command_id: CommandId,
+            _run_id: &RunId,
+            _reason: String,
+        ) -> ys_agent_core::CoreResult<()> {
+            unreachable!("Artifact navigation cannot cancel Runs")
+        }
+
+        async fn doctor(&self) -> ys_agent_core::CoreResult<DoctorReport> {
+            unreachable!("Artifact navigation does not run Doctor")
+        }
+
+        async fn export_artifact(
+            &self,
+            _command_id: CommandId,
+            _artifact_id: &ArtifactId,
+            _format: ExportFormat,
+            _access: ArtifactAccessContext,
+        ) -> ys_agent_core::CoreResult<ArtifactMetadata> {
+            unreachable!("Artifact navigation cannot export")
+        }
+    }
 
     fn event(
         workspace_id: WorkspaceId,
@@ -2413,5 +2777,103 @@ mod event_timeline_tests {
         assert_eq!(controller.event_sequence_cursor(), 3);
         controller.reset_event_subscription();
         assert_eq!(controller.event_sequence_cursor(), 3);
+    }
+
+    #[tokio::test]
+    async fn artifact_navigation_is_read_only_and_preserves_the_timeline() {
+        let workspace_id = WorkspaceId::new();
+        let service = Arc::new(CountingMissingArtifactService::default());
+        let principal = Principal::local_operator("artifact-navigation-test");
+        let mut controller = TuiController::new(service.clone(), workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let primary_artifact_id = ArtifactId::new();
+        controller.focus_run(&mut app, task_id, run_id);
+        app.timeline_state.begin_query("Show governed orders");
+        app.timeline_state.apply_snapshot(&RunSnapshot {
+            run_id,
+            task_id,
+            workflow: WorkflowKind::Query,
+            status: RunStatus::Succeeded,
+            attempt: 1,
+            retry_of_run_id: None,
+            version: 1,
+            workflow_state: json!({}),
+            pending_wait_metadata: None,
+            primary_artifact_id: Some(primary_artifact_id),
+            last_completed_step_id: None,
+        });
+        app.timeline_state
+            .apply_persisted_query_artifact(&QueryArtifact {
+                question: "Show governed orders".to_owned(),
+                intent: QueryIntent::Metadata,
+                answer_summary: "Governed result available".to_owned(),
+                metric: None,
+                semantic_status: SemanticStatus::Observed,
+                source_id: SourceId::new("warehouse"),
+                source_relations: Vec::new(),
+                time_range: None,
+                executed_sql: None,
+                bound_parameters: Vec::new(),
+                result_schema: Default::default(),
+                result_artifact: None,
+                freshness: None,
+                verification: VerificationReport {
+                    checks: Vec::new(),
+                    hard_failures: Vec::new(),
+                    warnings: Vec::new(),
+                    evidence_refs: Vec::new(),
+                },
+                assumptions: Vec::new(),
+                warning_codes: Vec::new(),
+                sensitivity: Sensitivity::Internal,
+                retention_policy: RetentionPolicy::Session,
+                expires_at: None,
+                generated_at: Utc::now(),
+            });
+        app.timeline_state
+            .focus_result_card(HitRegion::new(1, 1, 40, 4));
+        app.primary_artifact_id = Some(primary_artifact_id);
+
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, &mut app))
+            .expect("render Timeline hit region");
+        assert!(
+            app.timeline_state.result_card_hit_region.is_some(),
+            "the rendered result card exposes a mouse hit region"
+        );
+
+        assert!(
+            controller
+                .request_open_artifact(&mut app)
+                .expect("open request")
+        );
+        for _ in 0..100 {
+            if controller.apply_ready_artifact(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(app.navigation.current(), ContentRoute::Artifact);
+        assert!(
+            crate::tui::artifact::render_lines(&app.artifact_workspace)
+                .join("\n")
+                .contains("Artifact is missing")
+        );
+        controller.apply_artifact_action(&mut app, ArtifactAction::NextTab);
+        controller.apply_artifact_action(&mut app, ArtifactAction::MoveResult(ResultMove::Down));
+        controller.apply_artifact_action(&mut app, ArtifactAction::Back);
+
+        assert_eq!(app.navigation.current(), ContentRoute::Timeline);
+        assert_eq!(
+            app.timeline_state.view().question,
+            Some("Show governed orders")
+        );
+        assert_eq!(service.artifact_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(service.query_or_tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.resume_calls.load(Ordering::SeqCst), 0);
     }
 }

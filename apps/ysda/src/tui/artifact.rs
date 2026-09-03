@@ -135,6 +135,7 @@ pub enum ResultsAccess<'a> {
 pub enum ArtifactUnavailableReason {
     Missing,
     PolicyRestricted,
+    StatusUnavailable,
 }
 
 impl ArtifactUnavailableReason {
@@ -142,6 +143,7 @@ impl ArtifactUnavailableReason {
         match self {
             Self::Missing => "Artifact is missing",
             Self::PolicyRestricted => "Artifact is restricted by Policy",
+            Self::StatusUnavailable => "Artifact status unavailable · retry from Timeline",
         }
     }
 }
@@ -300,6 +302,7 @@ impl ArtifactWorkspaceProjection {
             results: match reason {
                 ArtifactUnavailableReason::Missing => ProjectedResults::Missing,
                 ArtifactUnavailableReason::PolicyRestricted => ProjectedResults::PolicyRestricted,
+                ArtifactUnavailableReason::StatusUnavailable => ProjectedResults::Missing,
             },
         }
     }

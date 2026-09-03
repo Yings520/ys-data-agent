@@ -26,8 +26,10 @@ use ys_agent_core::{
 use crate::bootstrap::AppDependencies;
 
 use super::{
-    AsyncOperationBusy, DisplayContextRefreshTrigger, RouteKey, TranscriptItem, TransientView,
-    TuiApp, TuiController, UiPreferenceStore, UiPreferences, parse_input,
+    AsyncOperationBusy, ContentRoute, DisplayContextRefreshTrigger, RouteKey, TranscriptItem,
+    TransientView, TuiApp, TuiController, UiPreferenceStore, UiPreferences,
+    artifact::{ArtifactAction, ResultMove},
+    parse_input,
     provider_management::{
         ProviderAuthentication, ProviderManagementStateKind, ProviderOperationKind,
     },
@@ -459,7 +461,7 @@ impl TerminalGuard {
         Ok(())
     }
 
-    fn draw(&mut self, app: &TuiApp) -> io::Result<()> {
+    fn draw(&mut self, app: &mut TuiApp) -> io::Result<()> {
         self.terminal.draw(|frame| render(frame, app)).map(|_| ())
     }
 
@@ -569,11 +571,14 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
         if controller.apply_ready_display_context(&mut app) {
             dirty = true;
         }
+        if controller.apply_ready_artifact(&mut app) {
+            dirty = true;
+        }
         if app.should_quit {
             return Ok(());
         }
         if dirty {
-            terminal.draw(&app).map_err(terminal_error)?;
+            terminal.draw(&mut app).map_err(terminal_error)?;
             dirty = false;
         }
         let tick = if app.runtime_status.is_some() || !app.composer.text().is_empty() {
@@ -634,6 +639,10 @@ async fn handle_terminal_event(
                 return Ok(true);
             }
             if key.code == KeyCode::Esc {
+                if app.navigation.current() == ContentRoute::Artifact {
+                    controller.apply_artifact_action(app, ArtifactAction::Back);
+                    return Ok(false);
+                }
                 if app.transient == Some(TransientView::Detail(super::DetailKind::Providers)) {
                     if controller.provider_operation_in_flight() {
                         controller.cancel_provider_operation(app).await;
@@ -655,6 +664,24 @@ async fn handle_terminal_event(
             }
             if app.transient == Some(TransientView::SlashPalette) {
                 handle_palette_key(app, controller, key).await?;
+                return Ok(false);
+            }
+            if app.navigation.current() == ContentRoute::Artifact {
+                let action = match key.code {
+                    KeyCode::BackTab => Some(ArtifactAction::PreviousTab),
+                    KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        Some(ArtifactAction::PreviousTab)
+                    }
+                    KeyCode::Tab => Some(ArtifactAction::NextTab),
+                    KeyCode::Up => Some(ArtifactAction::MoveResult(ResultMove::Up)),
+                    KeyCode::Down => Some(ArtifactAction::MoveResult(ResultMove::Down)),
+                    KeyCode::Left => Some(ArtifactAction::MoveResult(ResultMove::Left)),
+                    KeyCode::Right => Some(ArtifactAction::MoveResult(ResultMove::Right)),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    controller.apply_artifact_action(app, action);
+                }
                 return Ok(false);
             }
             if app.transient == Some(TransientView::Detail(super::DetailKind::Providers)) {
@@ -774,6 +801,9 @@ async fn handle_terminal_event(
                     .request_display_context_refresh(app, DisplayContextRefreshTrigger::UserRetry);
                 return Ok(false);
             }
+            if key.code == KeyCode::Enter && controller.request_open_artifact(app)? {
+                return Ok(false);
+            }
             match (key.code, key.modifiers) {
                 (KeyCode::Enter, _) => submit_composer(app, controller).await?,
                 (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -826,6 +856,17 @@ async fn handle_terminal_event(
                 _ => {}
             }
             preview_theme(app)?;
+        }
+        Event::Mouse(mouse)
+            if app.mouse_enabled
+                && app.navigation.current() == ContentRoute::Timeline
+                && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && app
+                    .timeline_state
+                    .result_card_hit_region
+                    .is_some_and(|region| region.contains(mouse.column, mouse.row)) =>
+        {
+            controller.request_open_artifact(app)?;
         }
         Event::Mouse(_) | Event::Key(_) => {}
     }
