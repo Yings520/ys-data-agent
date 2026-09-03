@@ -2552,7 +2552,10 @@ fn user_readable_run_failure(snapshot: &ys_agent_core::RunSnapshot) -> String {
 mod provider_management_tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use async_trait::async_trait;
@@ -2581,11 +2584,13 @@ mod provider_management_tests {
 
     struct SequenceDisplayContextSource {
         responses: Mutex<VecDeque<ys_agent_core::CoreResult<TuiDisplayContextInput>>>,
+        loads: AtomicUsize,
     }
 
     #[async_trait]
     impl TuiDisplayContextSource for SequenceDisplayContextSource {
         async fn load(&self) -> ys_agent_core::CoreResult<TuiDisplayContextInput> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
             self.responses
                 .lock()
                 .expect("display source lock")
@@ -2597,6 +2602,21 @@ mod provider_management_tests {
                     ))
                 })
         }
+    }
+
+    async fn apply_display_context_refresh(
+        controller: &mut TuiController,
+        app: &mut TuiApp,
+        trigger: DisplayContextRefreshTrigger,
+    ) {
+        controller.request_display_context_refresh(app, trigger);
+        for _ in 0..100 {
+            if controller.apply_ready_display_context(app) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("Display Context refresh did not complete for {trigger:?}");
     }
 
     fn catalog_views() -> Vec<ProviderCatalogView> {
@@ -2774,6 +2794,10 @@ mod provider_management_tests {
         );
         let source = Arc::new(SequenceDisplayContextSource {
             responses: Mutex::new(VecDeque::from([
+                Err(ys_agent_core::CoreError::validation(
+                    "display_context_unavailable",
+                    "injected startup failure",
+                )),
                 TuiDisplayContextInput::new(
                     "Authoritative Workspace",
                     DatasourceDisplayState::active("Governed Warehouse").expect("safe datasource"),
@@ -2784,47 +2808,107 @@ mod provider_management_tests {
                     "display_context_unavailable",
                     "injected refresh failure",
                 )),
+                TuiDisplayContextInput::new(
+                    "Recovered Workspace",
+                    DatasourceDisplayState::active("Recovered Warehouse").expect("safe datasource"),
+                    false,
+                    QueryDisplayState::Completed,
+                ),
+                TuiDisplayContextInput::new(
+                    "Recovered Workspace",
+                    DatasourceDisplayState::active("Recovered Warehouse").expect("safe datasource"),
+                    false,
+                    QueryDisplayState::Completed,
+                ),
             ])),
+            loads: AtomicUsize::new(0),
         });
         let service = Arc::new(
             InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
-                .with_tui_display_context_source(source),
+                .with_tui_display_context_source(source.clone()),
         );
         let principal = Principal::local_operator("display-context-test");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());
         let mut app = TuiApp::for_principal(principal);
+        app.query_mode = TuiQueryMode::Query;
+        app.apply_active_provider_view(Some(&ys_agent_core::ActiveProviderView {
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            activation_revision: 1,
+            provider: ProviderId::DeepSeek,
+            model: ys_agent_core::ProviderModelId::new(
+                ProviderId::DeepSeek,
+                "deepseek/independent",
+            )
+            .expect("model"),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        }));
 
-        controller.request_display_context_refresh(&app, DisplayContextRefreshTrigger::Startup);
-        for _ in 0..100 {
-            if controller.apply_ready_display_context(&mut app) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
-        assert!(!app.header_view().context_unavailable);
-
-        controller
-            .request_display_context_refresh(&app, DisplayContextRefreshTrigger::QueryStateChanged);
-        for _ in 0..100 {
-            if controller.apply_ready_display_context(&mut app) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
+            DisplayContextRefreshTrigger::Startup,
+        )
+        .await;
+        assert_eq!(app.header_view().workspace, "status unavailable");
         assert!(app.header_view().context_unavailable);
 
-        for trigger in [
-            DisplayContextRefreshTrigger::DatasourceChanged,
-            DisplayContextRefreshTrigger::ProviderOperationCompleted,
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
             DisplayContextRefreshTrigger::UserRetry,
-        ] {
-            controller.request_display_context_refresh(&app, trigger);
-        }
+        )
+        .await;
+        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
+        assert_eq!(app.header_view().datasource, "Governed Warehouse");
+        assert_eq!(app.header_view().read_only, "read-only");
+        assert_eq!(app.header_view().query_state, QueryDisplayState::Ready);
+        assert!(!app.header_view().context_unavailable);
+
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
+            DisplayContextRefreshTrigger::QueryStateChanged,
+        )
+        .await;
+        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
+        assert_eq!(app.header_view().datasource, "Governed Warehouse");
+        assert!(app.header_view().context_unavailable);
+
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
+            DisplayContextRefreshTrigger::DatasourceChanged,
+        )
+        .await;
+        assert_eq!(app.header_view().workspace, "Recovered Workspace");
+        assert_eq!(app.header_view().datasource, "Recovered Warehouse");
+        assert_eq!(app.header_view().read_only, "write access");
+        assert_eq!(app.header_view().query_state, QueryDisplayState::Completed);
+        assert!(!app.header_view().context_unavailable);
+
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
+            DisplayContextRefreshTrigger::ProviderOperationCompleted,
+        )
+        .await;
         for trigger in DisplayContextRefreshTrigger::ALL {
             assert_eq!(controller.display_context_refresh_count(trigger), 1);
         }
+        assert_eq!(source.loads.load(Ordering::SeqCst), 5);
+        assert_eq!(app.query_mode, TuiQueryMode::Query);
+        assert_eq!(app.header_view().current_model, "deepseek/independent");
+
+        for _ in 0..3 {
+            crate::tui::ui::render_to_string(&app, 150, 46);
+            assert!(!controller.apply_ready_display_context(&mut app));
+        }
+        assert_eq!(
+            source.loads.load(Ordering::SeqCst),
+            5,
+            "rendering and empty result polling must not refresh Display Context"
+        );
     }
 }
 

@@ -215,7 +215,7 @@
   - _Requirements: 3.7, 4.7, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.4_
   - _Boundary: Provider activation, restart, and Run binding integration tests_
   - _Depends: 4.5, 4.6, 5.2_
-- [ ] 5.4 验证 Display Context 刷新与 last-good 行为
+- [x] 5.4 验证 Display Context 刷新与 last-good 行为
   - 覆盖启动、Query 状态变化、数据源变化、Provider 操作完成和用户 retry 五类刷新触发，并证明不会每帧刷新。
   - 注入刷新失败，验证 Controller 保留最后成功值并显示不可用；没有历史值时显示真实空状态而非本地猜测。
   - 检查 Workspace、数据源、只读与 Query 状态只来自 AgentService completion，Mode 与当前模型保持独立权威来源。
