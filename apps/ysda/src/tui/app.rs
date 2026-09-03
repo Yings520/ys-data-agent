@@ -149,6 +149,7 @@ struct HeaderReadModel {
     query: String,
     query_state: QueryDisplayState,
     current_model: String,
+    active_model_available: bool,
     context_unavailable: bool,
 }
 
@@ -163,6 +164,7 @@ impl Default for HeaderReadModel {
                 reason: QueryNonSuccessReason::StatusUnavailable,
             },
             current_model: "model unavailable".to_owned(),
+            active_model_available: false,
             context_unavailable: true,
         }
     }
@@ -282,6 +284,7 @@ impl TuiApp {
             query: "ready".to_owned(),
             query_state: QueryDisplayState::Ready,
             current_model: model.to_owned(),
+            active_model_available: true,
             context_unavailable: false,
         };
         app
@@ -309,6 +312,7 @@ impl TuiApp {
         self.doctor_report
             .as_ref()
             .is_some_and(DoctorReport::allows_query_submission)
+            && self.header.active_model_available
     }
 
     pub fn apply_display_context(&mut self, context: TuiDisplayContext) {
@@ -361,6 +365,7 @@ impl TuiApp {
     }
 
     pub fn apply_active_provider_view(&mut self, active: Option<&ActiveProviderView>) {
+        self.header.active_model_available = active.is_some();
         self.header.current_model = active
             .map(|view| view.model.as_str().to_owned())
             .unwrap_or_else(|| "model unavailable".to_owned());
@@ -1938,6 +1943,16 @@ impl TuiController {
         self.service.doctor().await
     }
 
+    pub async fn refresh_active_provider(&self, app: &mut TuiApp) -> ys_agent_core::CoreResult<()> {
+        let active = self
+            .service
+            .provider_active()
+            .await
+            .map_err(provider_to_core)?;
+        app.apply_active_provider_view(active.as_ref());
+        Ok(())
+    }
+
     pub async fn next_service_event(&mut self) -> ys_agent_core::CoreResult<EventEnvelope> {
         loop {
             let Some(run_id) = self.focused_run_id else {
@@ -3326,5 +3341,29 @@ mod event_timeline_tests {
         assert_eq!(app.header_view().current_model, "xai/authoritative");
         assert_eq!(app.header_view().workspace, "Authoritative Workspace");
         assert_eq!(app.model_selection_state.current_target_count(), 1);
+    }
+
+    #[test]
+    fn query_readiness_requires_doctor_and_an_authoritative_active_model() {
+        let mut app = TuiApp::for_principal(Principal::local_operator("readiness-test"));
+        app.doctor_report = Some(DoctorReport {
+            blocker_codes: Vec::new(),
+            warning_codes: Vec::new(),
+            ready_capabilities: vec![ys_agent_runtime::doctor::QueryCapability::AdHocRead],
+            repairs: Vec::new(),
+        });
+        assert!(!app.query_submission_enabled());
+
+        let active = ActiveProviderView {
+            activation_revision: 1,
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            provider: ProviderId::DeepSeek,
+            model: ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/ready")
+                .expect("model"),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        };
+        app.apply_active_provider_view(Some(&active));
+        assert!(app.query_submission_enabled());
     }
 }

@@ -532,6 +532,10 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
         dependencies.principal,
     );
     controller.request_display_context_refresh(&app, DisplayContextRefreshTrigger::Startup);
+    if let Err(error) = controller.refresh_active_provider(&mut app).await {
+        app.apply_active_provider_view(None);
+        app.safe_warning = Some(error.code().to_owned());
+    }
     let report = controller.doctor().await?;
     app.transient = (!report.allows_query_submission()).then_some(TransientView::Repair);
     app.doctor_report = Some(report);
@@ -1093,6 +1097,21 @@ mod tests {
         AsyncOperationRegistry, ProviderOperationPolicy, RouteKey, TuiApp, TuiController,
         handle_terminal_event, user_readable_error,
     };
+
+    fn test_active_provider() -> ActiveProviderView {
+        ActiveProviderView {
+            activation_revision: 1,
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            provider: ys_agent_core::ProviderId::DeepSeek,
+            model: ys_agent_core::ProviderModelId::new(
+                ys_agent_core::ProviderId::DeepSeek,
+                "deepseek/test",
+            )
+            .expect("test model"),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        }
+    }
 
     #[tokio::test]
     async fn provider_operations_start_without_blocking_the_tui_loop() {
@@ -1862,6 +1881,7 @@ mod tests {
             ready_capabilities: vec![QueryCapability::AdHocRead],
             repairs: Vec::new(),
         });
+        app.apply_active_provider_view(Some(&test_active_provider()));
         app.composer.set_text("你好");
 
         let handled = tokio::time::timeout(
@@ -1964,6 +1984,7 @@ mod tests {
             ready_capabilities: vec![QueryCapability::AdHocRead],
             repairs: Vec::new(),
         });
+        app.apply_active_provider_view(Some(&test_active_provider()));
         app.composer.set_text("你好");
 
         tokio::time::timeout(

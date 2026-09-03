@@ -181,7 +181,7 @@
   - _Requirements: 4.3, 4.4, 4.6, 4.7, 4.8, 4.9, 5.1, 5.2, 5.3, 6.4, 6.5_
   - _Boundary: TUI Controller model validation, activation, and authoritative refresh integration_
   - _Depends: 1.5, 4.4_
-- [ ] 4.6 集成活动模型与新 Run 边界
+- [x] 4.6 集成活动模型与新 Run 边界
   - 启动时从已保存活动 Profile 恢复 Header 当前模型；没有可用活动模型时显示明确不可用状态并阻止无法执行的 Query 提交。
   - 在 Query 启动边界验证新 Run 使用当时的权威 Provider binding，不让 TUI 直接选择 Credential、参数或 Runtime Provider 实例。
   - 证明切换前已运行的 Run A 保持原 Provider、Model、Credential generation 与参数，切换后启动的 Run B 使用新 binding。
