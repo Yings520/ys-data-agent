@@ -148,7 +148,7 @@
   - _Requirements: 1.2, 1.3, 1.4, 6.1, 6.2, 6.4_
   - _Boundary: TUI Controller Display Context lifecycle adapter_
   - _Depends: 1.2, 2.4, 3.5_
-- [ ] 4.2 集成 Event、Snapshot 与 Timeline 校准
+- [x] 4.2 集成 Event、Snapshot 与 Timeline 校准
   - 从单一 Event subscription 读取 typed Event，以持久化 sequence cursor 去重；断档、lag 或重连时重新读取 Run Snapshot。
   - 消费 Event 后只更新有界 Timeline 投影，不把 raw payload 或完整 Event 历史复制进 TUI 状态。
   - 将 Service Reply、运行 Snapshot、终态 Snapshot 与 Artifact completion 送入 Timeline 的事实优先级投影，禁止旧 Event 覆盖终态。

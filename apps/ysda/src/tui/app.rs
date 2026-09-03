@@ -473,6 +473,7 @@ pub struct TuiController {
     session_id: Option<SessionId>,
     focused_task_id: Option<TaskId>,
     focused_run_id: Option<RunId>,
+    event_sequence_cursor: u64,
     subscription: Option<EventSubscription>,
     pending_command_id: Option<CommandId>,
     pending_submission: Option<JoinHandle<ys_agent_core::CoreResult<SubmissionCompletion>>>,
@@ -493,6 +494,14 @@ pub(super) enum SubmissionCompletion {
         reply: ServiceReply,
     },
     ClarificationAnswered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TimelineEventOutcome {
+    Applied,
+    Duplicate,
+    Gap,
+    Ignored,
 }
 
 pub(super) enum ProviderOperationPayload {
@@ -518,6 +527,7 @@ impl TuiController {
             session_id: None,
             focused_task_id: None,
             focused_run_id: None,
+            event_sequence_cursor: 0,
             subscription: None,
             pending_command_id: None,
             pending_submission: None,
@@ -577,6 +587,15 @@ impl TuiController {
 
     pub fn display_context_refresh_count(&self, trigger: DisplayContextRefreshTrigger) -> usize {
         self.display_context_refresh_counts[trigger.index()]
+    }
+
+    #[cfg(test)]
+    pub(super) const fn event_sequence_cursor(&self) -> u64 {
+        self.event_sequence_cursor
+    }
+
+    pub(super) fn reset_event_subscription(&mut self) {
+        self.subscription = None;
     }
 
     pub fn submission_in_flight(&self) -> bool {
@@ -1085,11 +1104,13 @@ impl TuiController {
         self.session_id = Some(session.id);
         self.focused_task_id = None;
         self.focused_run_id = None;
+        self.event_sequence_cursor = 0;
         self.subscription = None;
         app.focused_task = None;
         app.transcript.clear();
         app.primary_artifact_id = None;
         app.rendered_answer_artifact_id = None;
+        app.timeline_state = TimelineState::default();
         app.runtime_status = None;
         app.detail = None;
         app.transient = None;
@@ -1229,7 +1250,9 @@ impl TuiController {
         self.finish_command();
         self.focused_task_id = Some(task_id);
         self.focused_run_id = Some(run_id);
+        self.event_sequence_cursor = 0;
         self.subscription = None;
+        app.timeline_state = TimelineState::default();
         app.diagnostics.task_id = Some(task_id);
         app.diagnostics.run_id = Some(run_id);
         app.set_runtime_status("Task resumed");
@@ -1285,6 +1308,7 @@ impl TuiController {
             ));
         }
         app.push_transcript(TranscriptItem::UserMessage(text.clone()));
+        app.timeline_state.begin_query(&text);
         app.set_runtime_status("Thinking…");
 
         let service = self.service.clone();
@@ -1344,6 +1368,7 @@ impl TuiController {
     }
 
     fn apply_message_reply(&mut self, app: &mut TuiApp, reply: ServiceReply) {
+        app.timeline_state.apply_service_reply(&reply);
         match reply {
             ServiceReply::Conversation { message } => {
                 app.push_transcript(TranscriptItem::Answer(AnswerView {
@@ -1378,6 +1403,7 @@ impl TuiController {
     fn focus_run(&mut self, app: &mut TuiApp, task_id: TaskId, run_id: RunId) {
         self.focused_task_id = Some(task_id);
         self.focused_run_id = Some(run_id);
+        self.event_sequence_cursor = 0;
         self.subscription = None;
         app.diagnostics.task_id = Some(task_id);
         app.diagnostics.run_id = Some(run_id);
@@ -1511,7 +1537,11 @@ impl TuiController {
                 return std::future::pending().await;
             };
             if self.subscription.is_none() {
-                self.subscription = Some(self.service.subscribe_events(&run_id, 0).await?);
+                self.subscription = Some(
+                    self.service
+                        .subscribe_events(&run_id, self.event_sequence_cursor)
+                        .await?,
+                );
             }
             let event = self
                 .subscription
@@ -1526,7 +1556,24 @@ impl TuiController {
         }
     }
 
-    pub fn apply_service_event(&mut self, app: &mut TuiApp, envelope: EventEnvelope) {
+    pub(super) fn apply_service_event(
+        &mut self,
+        app: &mut TuiApp,
+        envelope: EventEnvelope,
+    ) -> TimelineEventOutcome {
+        if self.focused_run_id != Some(envelope.run_id) {
+            return TimelineEventOutcome::Ignored;
+        }
+        if envelope.sequence <= self.event_sequence_cursor {
+            return TimelineEventOutcome::Duplicate;
+        }
+        if envelope.sequence != self.event_sequence_cursor.saturating_add(1) {
+            self.event_sequence_cursor = envelope.sequence;
+            self.subscription = None;
+            return TimelineEventOutcome::Gap;
+        }
+        self.event_sequence_cursor = envelope.sequence;
+        app.timeline_state.apply_event(&envelope);
         match envelope.event.kind {
             RunEventKind::StepStarted { step_id, label } => {
                 app.diagnostics.step_id = Some(step_id);
@@ -1572,6 +1619,17 @@ impl TuiController {
             }
             _ => {}
         }
+        TimelineEventOutcome::Applied
+    }
+
+    pub(super) fn apply_run_snapshot(
+        &mut self,
+        app: &mut TuiApp,
+        snapshot: &ys_agent_core::RunSnapshot,
+    ) {
+        if self.focused_run_id == Some(snapshot.run_id) {
+            app.timeline_state.apply_snapshot(snapshot);
+        }
     }
 
     pub async fn reload_durable_state(
@@ -1582,6 +1640,7 @@ impl TuiController {
             return Ok(());
         };
         let snapshot = self.service.get_run(&run_id).await?;
+        self.apply_run_snapshot(app, &snapshot);
         app.diagnostics.run_id = Some(snapshot.run_id);
         app.diagnostics.task_id = Some(snapshot.task_id);
         app.diagnostics.step_id = snapshot.last_completed_step_id;
@@ -1647,6 +1706,7 @@ impl TuiController {
                 error.to_string(),
             )
         })?;
+        app.timeline_state.apply_persisted_query_artifact(&artifact);
         if app.rendered_answer_artifact_id != Some(artifact_id) {
             let key_values = self.load_key_values(&artifact).await;
             app.push_transcript(TranscriptItem::Answer(AnswerView {
@@ -2214,5 +2274,144 @@ mod provider_management_tests {
         for trigger in DisplayContextRefreshTrigger::ALL {
             assert_eq!(controller.display_context_refresh_count(trigger), 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod event_timeline_tests {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use serde_json::json;
+    use ys_agent_core::{
+        EventActor, EventId, RunEventKind, RunSnapshot, VersionedRunEvent, WorkflowKind,
+    };
+    use ys_agent_runtime::{InProcessAgentService, NoopRunScheduler};
+    use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
+
+    use super::*;
+    use crate::tui::timeline::TimelineStatus;
+
+    fn event(
+        workspace_id: WorkspaceId,
+        task_id: TaskId,
+        run_id: RunId,
+        sequence: u64,
+        kind: RunEventKind,
+    ) -> EventEnvelope {
+        EventEnvelope {
+            event_id: EventId::new(),
+            workspace_id,
+            task_id,
+            run_id,
+            sequence,
+            occurred_at: Utc::now(),
+            actor: EventActor::System,
+            event: VersionedRunEvent::v1(kind),
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_deduplicates_events_and_recovers_a_gap_from_the_snapshot() {
+        let directory = tempfile::tempdir().expect("temporary runtime directory");
+        let workspace_id = WorkspaceId::new();
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("open runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let service = Arc::new(InProcessAgentService::new(
+            workspace_id,
+            store,
+            artifacts,
+            Arc::new(NoopRunScheduler),
+        ));
+        let principal = Principal::local_operator("timeline-integration-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        controller.focus_run(&mut app, task_id, run_id);
+        app.timeline_state
+            .begin_query("Why did governed orders change?");
+        controller.apply_message_reply(&mut app, ServiceReply::RunScheduled { task_id, run_id });
+        assert_eq!(app.timeline_state.view().status, TimelineStatus::Running);
+
+        assert_eq!(
+            controller.apply_service_event(
+                &mut app,
+                event(workspace_id, task_id, run_id, 1, RunEventKind::RunStarted),
+            ),
+            TimelineEventOutcome::Applied
+        );
+        assert_eq!(
+            controller.apply_service_event(
+                &mut app,
+                event(workspace_id, task_id, run_id, 1, RunEventKind::RunStarted),
+            ),
+            TimelineEventOutcome::Duplicate
+        );
+        assert_eq!(
+            controller.apply_service_event(
+                &mut app,
+                event(
+                    workspace_id,
+                    task_id,
+                    run_id,
+                    3,
+                    RunEventKind::RunFailed {
+                        code: "query.execution_failed".to_owned(),
+                        message: "raw transport body".to_owned(),
+                    },
+                ),
+            ),
+            TimelineEventOutcome::Gap
+        );
+
+        controller.apply_run_snapshot(
+            &mut app,
+            &RunSnapshot {
+                run_id,
+                task_id,
+                workflow: WorkflowKind::Query,
+                status: RunStatus::Failed,
+                attempt: 1,
+                retry_of_run_id: None,
+                version: 4,
+                workflow_state: json!({
+                    "phase": "verify",
+                    "failure": {
+                        "what_happened": "governed Query validation failed",
+                        "required_user_action": "review diagnostics and retry"
+                    }
+                }),
+                pending_wait_metadata: None,
+                primary_artifact_id: None,
+                last_completed_step_id: None,
+            },
+        );
+        assert_eq!(app.timeline_state.view().status, TimelineStatus::Failed);
+        let notice = app
+            .timeline_state
+            .view()
+            .notice
+            .expect("failed snapshot has recovery guidance");
+        assert_eq!(notice.reason, "governed Query validation failed");
+        assert_eq!(notice.next_action, "review diagnostics and retry");
+
+        assert_eq!(
+            controller.apply_service_event(
+                &mut app,
+                event(workspace_id, task_id, run_id, 2, RunEventKind::RunStarted),
+            ),
+            TimelineEventOutcome::Duplicate
+        );
+        assert_eq!(app.timeline_state.view().status, TimelineStatus::Failed);
+        assert_eq!(controller.event_sequence_cursor(), 3);
+        controller.reset_event_subscription();
+        assert_eq!(controller.event_sequence_cursor(), 3);
     }
 }

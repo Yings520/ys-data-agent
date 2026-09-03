@@ -591,9 +591,16 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
                 None => return Ok(()),
             },
             service_event = controller.next_service_event() => {
-                let event = service_event?;
-                controller.apply_service_event(&mut app, event);
-                controller.reload_durable_state(&mut app).await?;
+                match service_event {
+                    Ok(event) => {
+                        controller.apply_service_event(&mut app, event);
+                        controller.reload_durable_state(&mut app).await?;
+                    }
+                    Err(_) => {
+                        controller.reset_event_subscription();
+                        controller.reload_durable_state(&mut app).await?;
+                    }
+                }
                 controller.request_display_context_refresh(
                     &app,
                     DisplayContextRefreshTrigger::QueryStateChanged,
