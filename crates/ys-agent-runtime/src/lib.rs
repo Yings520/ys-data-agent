@@ -28,10 +28,10 @@ pub use recovery::{RecoveryDecision, RecoveryManager, RecoveryRequest};
 pub use service::{
     ActiveRunProviderBindingSource, AgentServiceApi, ArtifactView, CreateTaskRequest,
     DatasourceDisplayState, DatasourceUnavailableReason, EventSubscription, InProcessAgentService,
-    NoopRunScheduler, QueryDisplayState, QueryNonSuccessReason, RunScheduler, SendMessageRequest,
-    ServiceEvent, ServiceEventPublisher, ServiceReply, StaticRunProviderBindingSource,
-    TuiDisplayContext, TuiDisplayContextInput, TuiDisplayContextSource,
-    UnavailableRunProviderBindingSource,
+    NoopRunScheduler, QueryDisplayState, QueryNonSuccessReason, QueryResultPreviewView,
+    RunScheduler, SendMessageRequest, ServiceEvent, ServiceEventPublisher, ServiceReply,
+    StaticRunProviderBindingSource, TuiDisplayContext, TuiDisplayContextInput,
+    TuiDisplayContextSource, UnavailableRunProviderBindingSource,
 };
 pub use workflow::query::{
     ClarificationNeed, FreshnessState, MetricReference, ParameterKind, QUERY_SYSTEM_PROMPT_VERSION,

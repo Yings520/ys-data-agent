@@ -18,7 +18,7 @@
   - _Requirements: 1.2, 1.3, 6.1, 6.3_
   - _Boundary: AgentService Display Context read model_
   - _Depends: 1.1_
-- [ ] 1.3 提供 Policy-first 的持久化 Artifact 安全读取
+- [x] 1.3 提供 Policy-first 的持久化 Artifact 安全读取
   - 在读取和解析完整结果前执行现有 Artifact Policy，并为 Summary、Results、SQL、Schema 与 Evidence 所需内容保留真实的缺失或受限原因。
   - 生成最多 100 行、每个 cell 最多 256 个显示字符且总计不超过 64 KiB 的 Results Preview，同时分别表达持久化行数、返回行数和 UI 截断状态。
   - 保持 Query 自身的截断 warning 与 UI Preview 截断语义分离，禁止 TUI 从被截断 JSON 自行重建结果。

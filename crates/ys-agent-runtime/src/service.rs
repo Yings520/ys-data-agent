@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use ys_agent_core::{
     ActivateProfileRequest, ActiveProviderView, ArtifactAccessContext, ArtifactAccessPurpose,
-    ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore, CommandId,
+    ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore, CellValue, CommandId,
     CommandReceipt, CommandResultKind, CompatibilityEvidence, CompatibilityEvidenceView,
     ContextManifest, CoreError, CoreResult, CredentialGeneration, CredentialKind,
     CredentialMutationRequest, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
@@ -18,8 +18,8 @@ use ys_agent_core::{
     ProfileRevision, ProfileRevisionRepository, ProfileSummary, ProviderCatalogView,
     ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId,
     ProviderManagementApi, ProviderManagementError, ProviderModelId, ProviderParameters,
-    ProviderRemediation, ProviderResult, PutArtifact, RemoteRevocationOutcome, RetentionPolicy,
-    Run, RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
+    ProviderRemediation, ProviderResult, PutArtifact, QueryResult, RemoteRevocationOutcome,
+    RetentionPolicy, Run, RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
     RunProviderBindingSource, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore,
     Sensitivity, Session, SessionId, Task, TaskId, ValidateProfileRequest, ValidationVersions,
     WorkflowKind, WorkspaceId,
@@ -33,6 +33,9 @@ use crate::{
 
 const DEFAULT_EVENT_CAPACITY: usize = 64;
 const ARTIFACT_PREVIEW_LIMIT: usize = 4_096;
+const QUERY_RESULT_PREVIEW_ROW_LIMIT: usize = 100;
+const QUERY_RESULT_PREVIEW_CELL_CHAR_LIMIT: usize = 256;
+const QUERY_RESULT_PREVIEW_BYTE_LIMIT: usize = 64 * 1024;
 const DEFAULT_ARTIFACT_RETENTION_DAYS: u32 = 7;
 const ACTIVE_SNAPSHOT_RETRY_LIMIT: u8 = 2;
 
@@ -100,6 +103,44 @@ pub struct ArtifactView {
     pub metadata: ArtifactMetadata,
     pub preview: Vec<u8>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueryResultPreviewView {
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    persisted_row_count: usize,
+    returned_row_count: usize,
+    truncated: bool,
+}
+
+impl QueryResultPreviewView {
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    pub fn rows(&self) -> &[Vec<Value>] {
+        &self.rows
+    }
+
+    pub const fn persisted_row_count(&self) -> usize {
+        self.persisted_row_count
+    }
+
+    pub const fn returned_row_count(&self) -> usize {
+        self.returned_row_count
+    }
+
+    /// Indicates only limits applied while constructing this UI Preview. Query execution
+    /// truncation remains a Query Artifact warning and is intentionally not folded into this bit.
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+#[derive(Deserialize)]
+struct PersistedQueryResultEnvelope {
+    result: QueryResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -370,6 +411,17 @@ pub trait AgentServiceApi: Send + Sync {
         Err(CoreError::validation(
             "tui_display_context_unavailable",
             "TUI display context is not configured",
+        ))
+    }
+
+    async fn query_result_preview(
+        &self,
+        _artifact_id: &ArtifactId,
+        _access: ArtifactAccessContext,
+    ) -> CoreResult<QueryResultPreviewView> {
+        Err(CoreError::validation(
+            "query_result_preview_unavailable",
+            "Query result Preview is not configured",
         ))
     }
 
@@ -1189,6 +1241,28 @@ impl AgentServiceApi for InProcessAgentService {
         self.tui_display_context_source.load().await.map(Into::into)
     }
 
+    async fn query_result_preview(
+        &self,
+        artifact_id: &ArtifactId,
+        access: ArtifactAccessContext,
+    ) -> CoreResult<QueryResultPreviewView> {
+        ensure_workspace(self.workspace_id, access.workspace_id)?;
+        let metadata = self.store.load_artifact(artifact_id).await?;
+        authorize_query_result_preview(&metadata, &access)?;
+        let bytes = self
+            .artifacts
+            .get(&ArtifactRef::new(metadata), &access)
+            .await?;
+        let envelope: PersistedQueryResultEnvelope =
+            serde_json::from_slice(&bytes).map_err(|_| {
+                CoreError::validation(
+                    "malformed_query_result_artifact",
+                    "persisted Query result does not match the supported schema",
+                )
+            })?;
+        build_query_result_preview(envelope.result)
+    }
+
     fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
         self.provider_management.as_deref()
     }
@@ -1966,6 +2040,158 @@ fn ensure_workspace(expected: WorkspaceId, actual: WorkspaceId) -> CoreResult<()
             "resource belongs to another workspace",
         ))
     }
+}
+
+fn authorize_query_result_preview(
+    metadata: &ArtifactMetadata,
+    access: &ArtifactAccessContext,
+) -> CoreResult<()> {
+    if metadata.kind != ArtifactKind::QueryResult {
+        return Err(CoreError::validation(
+            "artifact_kind_mismatch",
+            "Query result Preview requires a QueryResult Artifact",
+        ));
+    }
+    if metadata.workspace_id != access.workspace_id {
+        return Err(CoreError::ArtifactAccessDenied {
+            reason: "artifact belongs to another workspace".to_owned(),
+        });
+    }
+    if metadata
+        .owner
+        .is_some_and(|owner| owner != access.principal_id)
+    {
+        return Err(CoreError::ArtifactAccessDenied {
+            reason: "artifact belongs to another principal".to_owned(),
+        });
+    }
+    if access.purpose != ArtifactAccessPurpose::TuiPreview
+        || metadata.sensitivity > access.max_sensitivity
+    {
+        return Err(CoreError::ArtifactAccessDenied {
+            reason: "purpose or sensitivity is not allowed".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn build_query_result_preview(result: QueryResult) -> CoreResult<QueryResultPreviewView> {
+    if result.row_count < result.rows.len() {
+        return Err(CoreError::validation(
+            "malformed_query_result_artifact",
+            "persisted Query result row count is smaller than its stored rows",
+        ));
+    }
+    for row in &result.rows {
+        if row.len() != result.columns.len() {
+            return Err(CoreError::validation(
+                "malformed_query_result_artifact",
+                "persisted Query result row width does not match its columns",
+            ));
+        }
+    }
+
+    let persisted_row_count = result.row_count;
+    let mut truncated = result.rows.len() > QUERY_RESULT_PREVIEW_ROW_LIMIT;
+    let mut columns = Vec::with_capacity(result.columns.len());
+    for column in &result.columns {
+        let (column, was_truncated) = truncate_display_text(column);
+        truncated |= was_truncated;
+        columns.push(column);
+    }
+
+    let mut preview = QueryResultPreviewView {
+        columns,
+        rows: Vec::new(),
+        persisted_row_count,
+        returned_row_count: 0,
+        truncated,
+    };
+
+    while serialized_preview_len(&preview)? > QUERY_RESULT_PREVIEW_BYTE_LIMIT {
+        if preview.columns.pop().is_none() {
+            return Err(CoreError::validation(
+                "query_result_preview_limit_too_small",
+                "Query result Preview metadata exceeds its byte limit",
+            ));
+        }
+        preview.truncated = true;
+    }
+
+    let visible_columns = preview.columns.len();
+    if visible_columns < result.columns.len() {
+        preview.truncated = true;
+    }
+
+    for row in result.rows.iter().take(QUERY_RESULT_PREVIEW_ROW_LIMIT) {
+        let mut projected = Vec::with_capacity(visible_columns);
+        for cell in row.iter().take(visible_columns) {
+            let (value, was_truncated) = preview_cell(cell)?;
+            preview.truncated |= was_truncated;
+            projected.push(value);
+        }
+
+        preview.rows.push(projected);
+        preview.returned_row_count = preview.rows.len();
+        if serialized_preview_len(&preview)? > QUERY_RESULT_PREVIEW_BYTE_LIMIT {
+            preview.rows.pop();
+            preview.returned_row_count = preview.rows.len();
+            preview.truncated = true;
+            break;
+        }
+    }
+
+    if preview.returned_row_count < result.rows.len() {
+        preview.truncated = true;
+    }
+    Ok(preview)
+}
+
+fn preview_cell(cell: &CellValue) -> CoreResult<(Value, bool)> {
+    match cell {
+        CellValue::Null => Ok((Value::Null, false)),
+        CellValue::Boolean(value) => Ok((Value::Bool(*value), false)),
+        CellValue::Integer(value) => Ok((Value::Number((*value).into()), false)),
+        CellValue::Real(value) => serde_json::Number::from_f64(*value)
+            .map(|number| (Value::Number(number), false))
+            .ok_or_else(|| {
+                CoreError::validation(
+                    "malformed_query_result_artifact",
+                    "persisted Query result contains a non-finite number",
+                )
+            }),
+        CellValue::Text(value) => {
+            let (value, truncated) = truncate_display_text(value);
+            Ok((Value::String(value), truncated))
+        }
+        CellValue::BlobSummary { bytes } => {
+            Ok((Value::String(format!("[BLOB {bytes} bytes]")), false))
+        }
+    }
+}
+
+fn truncate_display_text(value: &str) -> (String, bool) {
+    let mut chars = value.chars();
+    let truncated = chars
+        .clone()
+        .nth(QUERY_RESULT_PREVIEW_CELL_CHAR_LIMIT)
+        .is_some();
+    let value = chars
+        .by_ref()
+        .take(QUERY_RESULT_PREVIEW_CELL_CHAR_LIMIT)
+        .collect();
+    (value, truncated)
+}
+
+fn serialized_preview_len(preview: &QueryResultPreviewView) -> CoreResult<usize> {
+    serde_json::to_vec(preview)
+        .map(|bytes| bytes.len())
+        .map_err(|_| {
+            CoreError::validation(
+                "malformed_query_result_artifact",
+                "Query result Preview could not be serialized safely",
+            )
+        })
 }
 
 fn clarification_retention(

@@ -9,19 +9,19 @@ use tokio::sync::Mutex;
 use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
 use ys_agent_core::{
     AgentAction, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactKind, ArtifactMetadata,
-    ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult,
+    ArtifactStore, CellValue, CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult,
     CredentialVault, EventActor, ModelResponse, PendingRunEvent, Principal,
     ProtectedCredentialWrite, ProviderCredentialReference, ProviderResult, PutArtifact,
-    RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
+    QueryResult, RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
     RunProviderBindingSource, RunStatus, RuntimeCommandBatch, RuntimeStore, SecretValue,
     Sensitivity, StepId, TaskId, TaskStatus, WorkspaceId,
 };
 use ys_agent_runtime::{
     ActiveRunProviderBindingSource, AgentServiceApi, CoordinationDecision, Coordinator,
     CreateTaskRequest, DatasourceDisplayState, InProcessAgentService, QueryDisplayState,
-    QueryNonSuccessReason, RuleBasedCoordinator, RunScheduler, SendMessageRequest, ServiceReply,
-    StaticRunProviderBindingSource, TuiDisplayContext, TuiDisplayContextInput,
-    TuiDisplayContextSource,
+    QueryNonSuccessReason, QueryResultPreviewView, RuleBasedCoordinator, RunScheduler,
+    SendMessageRequest, ServiceReply, StaticRunProviderBindingSource, TuiDisplayContext,
+    TuiDisplayContextInput, TuiDisplayContextSource,
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
@@ -592,6 +592,152 @@ async fn tui_preview_reads_complete_internal_query_artifacts_only() {
 
     assert!(result_view.truncated);
     assert_eq!(result_view.preview.len(), 4_096);
+}
+
+#[tokio::test]
+async fn query_result_preview_is_policy_first_bounded_and_query_truncation_independent() {
+    let fixture = ServiceFixture::new().await;
+    let rows = (0..150)
+        .map(|index| vec![CellValue::Integer(index), CellValue::Text("x".repeat(300))])
+        .collect::<Vec<_>>();
+    let result = QueryResult {
+        columns: vec!["id".to_owned(), "payload".to_owned()],
+        rows,
+        truncated: false,
+        remote_query_id: Some("must-not-leak".to_owned()),
+        row_count: 150,
+        serialized_bytes: 100_000,
+        warning_codes: vec!["query_warning_must_remain_in_artifact".to_owned()],
+        model_preview: "must-not-be-reused".to_owned(),
+    };
+    let metadata = fixture
+        .persist_internal_artifact(
+            ArtifactKind::QueryResult,
+            serde_json::to_vec(&serde_json::json!({ "result": result }))
+                .expect("serialize persisted result envelope"),
+        )
+        .await;
+    let access = ArtifactAccessContext {
+        workspace_id: fixture.workspace_id,
+        principal_id: fixture.principal.id,
+        purpose: ArtifactAccessPurpose::TuiPreview,
+        max_sensitivity: Sensitivity::Internal,
+    };
+
+    let preview: QueryResultPreviewView = fixture
+        .service
+        .query_result_preview(&metadata.id, access.clone())
+        .await
+        .expect("build bounded preview");
+
+    assert_eq!(preview.persisted_row_count(), 150);
+    assert_eq!(preview.returned_row_count(), 100);
+    assert!(preview.truncated());
+    assert_eq!(
+        preview.rows()[0][1]
+            .as_str()
+            .expect("text cell")
+            .chars()
+            .count(),
+        256
+    );
+    assert!(
+        serde_json::to_vec(&preview)
+            .expect("serialize preview")
+            .len()
+            <= 64 * 1024
+    );
+    let rendered = serde_json::to_string(&preview).expect("serialize safe preview");
+    for forbidden in [
+        "must-not-leak",
+        "query_warning_must_remain_in_artifact",
+        "must-not-be-reused",
+    ] {
+        assert!(!rendered.contains(forbidden));
+    }
+
+    let query_truncated_only = QueryResult {
+        columns: vec!["value".to_owned()],
+        rows: vec![vec![CellValue::Integer(1)]],
+        truncated: true,
+        remote_query_id: None,
+        row_count: 1,
+        serialized_bytes: 1,
+        warning_codes: vec!["max_rows_exceeded".to_owned()],
+        model_preview: String::new(),
+    };
+    let metadata = fixture
+        .persist_internal_artifact(
+            ArtifactKind::QueryResult,
+            serde_json::to_vec(&serde_json::json!({ "result": query_truncated_only }))
+                .expect("serialize query-truncated result"),
+        )
+        .await;
+    let preview = fixture
+        .service
+        .query_result_preview(&metadata.id, access)
+        .await
+        .expect("preview query-truncated result");
+    assert!(
+        !preview.truncated(),
+        "query truncation is not UI truncation"
+    );
+}
+
+#[tokio::test]
+async fn query_result_preview_reports_policy_missing_and_malformed_failures_without_parsing_early()
+{
+    let fixture = ServiceFixture::new().await;
+    let malformed = fixture
+        .persist_internal_artifact(
+            ArtifactKind::QueryResult,
+            b"not-json-secret-canary".to_vec(),
+        )
+        .await;
+    let denied = fixture
+        .service
+        .query_result_preview(
+            &malformed.id,
+            ArtifactAccessContext {
+                workspace_id: fixture.workspace_id,
+                principal_id: fixture.principal.id,
+                purpose: ArtifactAccessPurpose::TuiPreview,
+                max_sensitivity: Sensitivity::Public,
+            },
+        )
+        .await
+        .expect_err("Policy must reject before malformed content is parsed");
+    assert_eq!(denied.code(), "artifact_access_denied");
+
+    let malformed_error = fixture
+        .service
+        .query_result_preview(
+            &malformed.id,
+            ArtifactAccessContext {
+                workspace_id: fixture.workspace_id,
+                principal_id: fixture.principal.id,
+                purpose: ArtifactAccessPurpose::TuiPreview,
+                max_sensitivity: Sensitivity::Internal,
+            },
+        )
+        .await
+        .expect_err("authorized malformed content must stay an explicit failure");
+    assert_eq!(malformed_error.code(), "malformed_query_result_artifact");
+
+    let missing = fixture
+        .service
+        .query_result_preview(
+            &ys_agent_core::ArtifactId::new(),
+            ArtifactAccessContext {
+                workspace_id: fixture.workspace_id,
+                principal_id: fixture.principal.id,
+                purpose: ArtifactAccessPurpose::TuiPreview,
+                max_sensitivity: Sensitivity::Internal,
+            },
+        )
+        .await
+        .expect_err("missing metadata must remain an explicit failure");
+    assert_eq!(missing.code(), "not_found");
 }
 
 fn front_door_model(
