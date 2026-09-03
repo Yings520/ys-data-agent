@@ -9,7 +9,7 @@ use ys_agent_core::{
     ProfileName, ProfileRevision, ProtectedCredentialWrite, ProviderCredentialReference,
     ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError, ProviderRemediation,
     RunEventKind, RunId, RunStatus, SaveProfileRequest, SaveProfileRevision, SelectionTarget,
-    Sensitivity, SessionId, StepId, TaskId, WorkspaceId,
+    Sensitivity, SessionId, StepId, SwitchModelRequest, TaskId, WorkspaceId,
 };
 use ys_agent_runtime::{
     AgentServiceApi, CreateTaskRequest, DatasourceDisplayState, DatasourceUnavailableReason,
@@ -497,6 +497,11 @@ pub struct TuiController {
     )>,
     artifact_result_id: Option<ArtifactId>,
     model_selection_checkpoint: Option<(ModelSelectionState, String)>,
+    model_switch_guard: AsyncResultGuard,
+    model_switch_tasks: JoinSet<(
+        AsyncOperationTicket,
+        ys_agent_core::CoreResult<ModelSwitchReadback>,
+    )>,
 }
 
 pub(super) enum SubmissionCompletion {
@@ -521,6 +526,13 @@ pub(super) enum ArtifactReadPayload {
         projection: ArtifactWorkspaceProjection,
     },
     Viewport(ResultsViewportPage),
+}
+
+pub(super) struct ModelSwitchReadback {
+    active: ActiveProviderView,
+    snapshot: ys_agent_core::ModelSelectionSnapshot,
+    candidates: Option<ys_agent_core::ModelCandidateBatch>,
+    display_context: TuiDisplayContext,
 }
 
 pub(super) enum ProviderOperationPayload {
@@ -563,6 +575,8 @@ impl TuiController {
             artifact_tasks: JoinSet::new(),
             artifact_result_id: None,
             model_selection_checkpoint: None,
+            model_switch_guard: AsyncResultGuard::default(),
+            model_switch_tasks: JoinSet::new(),
         }
     }
 
@@ -1423,10 +1437,15 @@ impl TuiController {
             ModelSelectionOutcome::Close => {
                 let _ = app.pop_route();
             }
-            ModelSelectionOutcome::Activate(_)
-            | ModelSelectionOutcome::ValidateThenActivate(_)
-            | ModelSelectionOutcome::RevalidateThenActivate(_) => {
-                app.set_runtime_status("Model activation requires validation");
+            ModelSelectionOutcome::Activate(key)
+            | ModelSelectionOutcome::ValidateThenActivate(key) => {
+                self.request_model_switch(app, key.clone())?;
+                app.set_runtime_status("Validating and activating model…");
+            }
+            ModelSelectionOutcome::RevalidateThenActivate(_) => {
+                app.set_runtime_status(
+                    "Model validation expired · reopen Provider setup and validate before activation",
+                );
             }
             ModelSelectionOutcome::AlreadyCurrent => {
                 app.set_runtime_status("Model is already current");
@@ -1434,6 +1453,129 @@ impl TuiController {
             ModelSelectionOutcome::Changed | ModelSelectionOutcome::Ignored => {}
         }
         Ok(outcome)
+    }
+
+    pub(super) fn request_model_switch(
+        &mut self,
+        app: &TuiApp,
+        key: ys_agent_core::ModelCandidateKey,
+    ) -> ys_agent_core::CoreResult<OperationId> {
+        let ticket = self
+            .model_switch_guard
+            .start(AsyncChannel::ProviderMutation, app.navigation.route_key())
+            .map_err(|_| {
+                ys_agent_core::CoreError::validation(
+                    "model_switch_in_flight",
+                    "Wait for or cancel the active model switch",
+                )
+            })?;
+        let candidates_request = app.model_selection_state.current_candidates_request();
+        let service = self.service.clone();
+        self.model_switch_tasks.spawn(async move {
+            let operation_id = ticket.operation_id;
+            let operation = async {
+                service
+                    .provider_switch_model(SwitchModelRequest::new(operation_id, key))
+                    .await
+                    .map_err(provider_to_core)?;
+                let active = service
+                    .provider_active()
+                    .await
+                    .map_err(provider_to_core)?
+                    .ok_or_else(|| {
+                        ys_agent_core::CoreError::validation(
+                            "active_model_readback_missing",
+                            "Model switch completed without an authoritative active Provider",
+                        )
+                    })?;
+                let snapshot = service
+                    .provider_model_selection_snapshot()
+                    .await
+                    .map_err(provider_to_core)?;
+                let candidates = match candidates_request {
+                    Some(request) => Some(
+                        service
+                            .provider_list_model_candidates(request)
+                            .await
+                            .map_err(provider_to_core)?,
+                    ),
+                    None => None,
+                };
+                let display_context = service.tui_display_context().await?;
+                Ok(ModelSwitchReadback {
+                    active,
+                    snapshot,
+                    candidates,
+                    display_context,
+                })
+            };
+            let result = match tokio::time::timeout(Duration::from_secs(30), operation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = service.cancel_provider_operation(operation_id).await;
+                    Err(ys_agent_core::CoreError::validation(
+                        "provider.timeout",
+                        "Model switch timed out and was cancelled",
+                    ))
+                }
+            };
+            (ticket, result)
+        });
+        Ok(ticket.operation_id)
+    }
+
+    pub(super) fn apply_ready_model_switch(&mut self, app: &mut TuiApp) -> bool {
+        let mut applied = false;
+        while let Some(completion) = self.model_switch_tasks.try_join_next() {
+            let Ok((ticket, result)) = completion else {
+                continue;
+            };
+            if !self
+                .model_switch_guard
+                .accept_completion(ticket, app.navigation.route_key())
+            {
+                continue;
+            }
+            match result {
+                Ok(readback) => {
+                    app.model_selection_state
+                        .refresh_snapshot(readback.snapshot);
+                    if let Some(candidates) = readback.candidates {
+                        app.model_selection_state
+                            .reduce(ModelSelectionAction::CandidatesLoaded(candidates));
+                    }
+                    app.apply_display_context(readback.display_context);
+                    app.apply_active_provider_view(Some(&readback.active));
+                    app.set_runtime_status("Model activated for new Runs");
+                }
+                Err(error) => {
+                    app.set_runtime_status(format!("Model activation failed · {}", error.code()));
+                }
+            }
+            applied = true;
+        }
+        applied
+    }
+
+    pub(super) fn model_switch_in_flight(&self) -> bool {
+        self.model_switch_guard
+            .active(AsyncChannel::ProviderMutation)
+            .is_some()
+    }
+
+    pub(super) async fn cancel_model_switch(&mut self) {
+        let Some(ticket) = self
+            .model_switch_guard
+            .active(AsyncChannel::ProviderMutation)
+        else {
+            return;
+        };
+        if self.model_switch_guard.cancel(ticket) {
+            let _ = self
+                .service
+                .cancel_provider_operation(ticket.operation_id)
+                .await;
+        }
     }
 
     async fn open_provider_setup(
@@ -2656,7 +2798,7 @@ mod provider_management_tests {
 #[cfg(test)]
 mod event_timeline_tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -2668,8 +2810,9 @@ mod event_timeline_tests {
         RunSnapshot, SemanticStatus, Session, SourceId, Task, VersionedRunEvent, WorkflowKind,
     };
     use ys_agent_runtime::{
-        ArtifactView, EventSubscription, InProcessAgentService, NoopRunScheduler,
-        QueryResultPreviewView, VerificationReport, doctor::DoctorReport,
+        ArtifactView, DatasourceDisplayState, EventSubscription, InProcessAgentService,
+        NoopRunScheduler, QueryDisplayState, QueryResultPreviewView, TuiDisplayContextInput,
+        VerificationReport, doctor::DoctorReport,
     };
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
@@ -2685,10 +2828,25 @@ mod event_timeline_tests {
         artifact_reads: AtomicUsize,
         query_or_tool_calls: AtomicUsize,
         resume_calls: AtomicUsize,
+        model_readback: Mutex<Option<(ActiveProviderView, ys_agent_core::ModelSelectionSnapshot)>>,
+        display_context: Mutex<Option<TuiDisplayContext>>,
     }
 
     #[async_trait::async_trait]
     impl AgentServiceApi for CountingMissingArtifactService {
+        async fn tui_display_context(&self) -> ys_agent_core::CoreResult<TuiDisplayContext> {
+            self.display_context
+                .lock()
+                .expect("display context lock")
+                .clone()
+                .ok_or_else(|| {
+                    ys_agent_core::CoreError::validation(
+                        "tui_display_context_unavailable",
+                        "no test Display Context",
+                    )
+                })
+        }
+
         async fn query_result_preview(
             &self,
             _artifact_id: &ArtifactId,
@@ -2790,6 +2948,52 @@ mod event_timeline_tests {
 
         async fn doctor(&self) -> ys_agent_core::CoreResult<DoctorReport> {
             unreachable!("Artifact navigation does not run Doctor")
+        }
+
+        async fn provider_model_selection_snapshot(
+            &self,
+        ) -> ys_agent_core::ProviderResult<ys_agent_core::ModelSelectionSnapshot> {
+            self.model_readback
+                .lock()
+                .expect("model readback lock")
+                .as_ref()
+                .map(|(_, snapshot)| snapshot.clone())
+                .ok_or_else(|| {
+                    ProviderManagementError::new(
+                        ProviderErrorCode::Internal,
+                        None,
+                        ProviderRemediation::Retry,
+                    )
+                })
+        }
+
+        async fn provider_switch_model(
+            &self,
+            _request: SwitchModelRequest,
+        ) -> ys_agent_core::ProviderResult<ActiveProviderView> {
+            self.model_readback
+                .lock()
+                .expect("model readback lock")
+                .as_ref()
+                .map(|(active, _)| active.clone())
+                .ok_or_else(|| {
+                    ProviderManagementError::new(
+                        ProviderErrorCode::Internal,
+                        None,
+                        ProviderRemediation::Retry,
+                    )
+                })
+        }
+
+        async fn provider_active(
+            &self,
+        ) -> ys_agent_core::ProviderResult<Option<ActiveProviderView>> {
+            Ok(self
+                .model_readback
+                .lock()
+                .expect("model readback lock")
+                .as_ref()
+                .map(|(active, _)| active.clone()))
         }
 
         async fn export_artifact(
@@ -3022,5 +3226,105 @@ mod event_timeline_tests {
         assert_eq!(service.artifact_reads.load(Ordering::SeqCst), 1);
         assert_eq!(service.query_or_tool_calls.load(Ordering::SeqCst), 0);
         assert_eq!(service.resume_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_model_switch_preserves_authoritative_header_and_selection() {
+        let workspace_id = WorkspaceId::new();
+        let service = Arc::new(CountingMissingArtifactService::default());
+        let principal = Principal::local_operator("model-switch-failure-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.apply_active_provider_view(Some(&ys_agent_core::ActiveProviderView {
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            activation_revision: 1,
+            provider: ProviderId::DeepSeek,
+            model: ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/before")
+                .expect("model"),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        }));
+        app.push_route(ContentRoute::ModelSelection);
+        let before = app.header_view().current_model.to_owned();
+        let before_state = app.model_selection_state.clone();
+        let key = ys_agent_core::ModelCandidateKey::new(
+            ProfileId::new(),
+            1,
+            Some(1),
+            ProviderId::Xai,
+            ys_agent_core::ProviderModelId::new(ProviderId::Xai, "xai/new").expect("model"),
+        )
+        .expect("candidate key");
+
+        controller
+            .request_model_switch(&app, key)
+            .expect("schedule switch");
+        for _ in 0..100 {
+            if controller.apply_ready_model_switch(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(app.header_view().current_model, before);
+        assert_eq!(app.model_selection_state, before_state);
+    }
+
+    #[tokio::test]
+    async fn successful_model_switch_commits_only_authoritative_readback() {
+        let workspace_id = WorkspaceId::new();
+        let profile_id = ProfileId::new();
+        let model = ys_agent_core::ProviderModelId::new(ProviderId::Xai, "xai/authoritative")
+            .expect("model");
+        let active = ActiveProviderView {
+            activation_revision: 2,
+            profile_id,
+            profile_revision: 3,
+            provider: ProviderId::Xai,
+            model: model.clone(),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        };
+        let snapshot = ys_agent_core::ModelSelectionSnapshot::new(vec![
+            ys_agent_core::SelectionTargetView::new(
+                SelectionTarget::Provider(ProviderId::Xai),
+                "xAI",
+                ys_agent_core::SelectionAvailability::Configured,
+                ys_agent_core::SelectionCurrentStatus::Current,
+            )
+            .expect("target"),
+        ])
+        .expect("snapshot");
+        let display_context: TuiDisplayContext = TuiDisplayContextInput::new(
+            "Authoritative Workspace",
+            DatasourceDisplayState::active("Governed Warehouse").expect("datasource"),
+            true,
+            QueryDisplayState::Ready,
+        )
+        .expect("Display Context")
+        .into();
+        let service = Arc::new(CountingMissingArtifactService {
+            model_readback: Mutex::new(Some((active, snapshot))),
+            display_context: Mutex::new(Some(display_context)),
+            ..Default::default()
+        });
+        let principal = Principal::local_operator("model-switch-success-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.push_route(ContentRoute::ModelSelection);
+        let key =
+            ys_agent_core::ModelCandidateKey::new(profile_id, 3, Some(1), ProviderId::Xai, model)
+                .expect("candidate key");
+
+        controller
+            .request_model_switch(&app, key)
+            .expect("schedule switch");
+        for _ in 0..100 {
+            if controller.apply_ready_model_switch(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(app.header_view().current_model, "xai/authoritative");
+        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
+        assert_eq!(app.model_selection_state.current_target_count(), 1);
     }
 }

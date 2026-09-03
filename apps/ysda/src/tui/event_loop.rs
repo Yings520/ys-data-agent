@@ -576,6 +576,9 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
         if controller.apply_ready_artifact(&mut app) {
             dirty = true;
         }
+        if controller.apply_ready_model_switch(&mut app) {
+            dirty = true;
+        }
         if app.should_quit {
             return Ok(());
         }
@@ -646,6 +649,11 @@ async fn handle_terminal_event(
                     return Ok(false);
                 }
                 if app.navigation.current() == ContentRoute::ModelSelection {
+                    if controller.model_switch_in_flight() {
+                        controller.cancel_model_switch().await;
+                        app.set_runtime_status("Model activation cancelled");
+                        return Ok(false);
+                    }
                     controller
                         .apply_model_selection_action(app, ModelSelectionAction::Back)
                         .await?;

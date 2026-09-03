@@ -184,6 +184,13 @@ impl ModelSelectionState {
         })
     }
 
+    pub fn current_candidates_request(&self) -> Option<ListModelCandidatesRequest> {
+        (self.level == ModelSelectionLevel::Models)
+            .then(|| self.model_target.clone())
+            .flatten()
+            .map(|target| ListModelCandidatesRequest { target })
+    }
+
     pub fn refresh_snapshot(&mut self, snapshot: ModelSelectionSnapshot) {
         self.snapshot = Some(snapshot);
         self.load_state = if self.visible_targets().is_empty() {

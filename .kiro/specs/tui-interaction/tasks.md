@@ -173,7 +173,7 @@
   - _Requirements: 3.2, 3.8, 4.5, 4.9, 6.4, 6.5_
   - _Boundary: TUI Controller Model Selection to Provider Management integration_
   - _Depends: 2.4, 2.5, 3.4, 3.5_
-- [ ] 4.5 集成验证、激活与权威模型刷新
+- [x] 4.5 集成验证、激活与权威模型刷新
   - Ready 候选通过 AgentService 请求切换；未配置、未验证、验证失效或能力不足候选在 TUI 边界被阻止并显示下一步。
   - 激活成功后依次重新读取 Active Provider、selection snapshot 与 Display Context，只有权威 readback 完成后才更新 Header 和唯一 Current 标记。
   - 激活失败、超时、取消、冲突或迟到 completion 时保留原活动模型、原 Header、原选择位置和非敏感输入。
