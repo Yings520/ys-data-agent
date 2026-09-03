@@ -3346,11 +3346,14 @@ mod event_timeline_tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(app.navigation.current(), ContentRoute::Artifact);
-        assert!(
-            crate::tui::artifact::render_lines(&app.artifact_workspace)
-                .join("\n")
-                .contains("Artifact is missing")
-        );
+        for (width, height) in [(150, 40), (100, 28), (60, 12)] {
+            let rendered = crate::tui::ui::render_to_string(&app, width, height);
+            assert!(rendered.contains("Artifact is missing"));
+            for tab in ["Summary", "Results", "SQL", "Schema", "Evidence"] {
+                assert!(rendered.contains(tab));
+            }
+            assert!(rendered.contains("/mode  /model  Esc back"));
+        }
         for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Esc] {
             crate::tui::event_loop::handle_terminal_event(
                 &mut app,

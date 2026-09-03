@@ -1,7 +1,11 @@
-use ratatui::layout::Rect;
+use chrono::Utc;
+use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Color};
 use ys_agent_core::{
-    ActiveProviderView, Principal, ProfileId, ProviderId, ProviderModelId, ProviderParameters,
+    ActiveProviderView, ArtifactId, EventActor, EventEnvelope, EventId, PolicyDecision, Principal,
+    ProfileId, ProviderId, ProviderModelId, ProviderParameters, RunEventKind, RunId, TaskId,
+    ToolCallId, VersionedRunEvent, WorkspaceId,
 };
+
 use ys_agent_runtime::{
     DatasourceDisplayState, QueryDisplayState, TuiDisplayContext, TuiDisplayContextInput,
 };
@@ -12,6 +16,39 @@ use ysda::tui::{
     ThemeRegistry, TimelineState, TransientView, TuiApp, TuiQueryMode, UiPreferences,
     bottom_panel_height, parse_input, render_to_string,
 };
+
+fn timeline_event(sequence: u64, event: RunEventKind) -> EventEnvelope {
+    EventEnvelope {
+        event_id: EventId::new(),
+        workspace_id: WorkspaceId::new(),
+        task_id: TaskId::new(),
+        run_id: RunId::new(),
+        sequence,
+        occurred_at: Utc::now(),
+        actor: EventActor::System,
+        event: VersionedRunEvent::v1(event),
+    }
+}
+
+fn rendered_color(app: &TuiApp, width: u16, height: u16, needle: &str) -> Color {
+    let mut app = app.clone();
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| ysda::tui::render(frame, &mut app))
+        .expect("render production TUI");
+    let buffer = terminal.backend().buffer();
+    for row in 0..height {
+        let line = (0..width)
+            .map(|column| buffer[(column, row)].symbol())
+            .collect::<String>();
+        if let Some(byte_offset) = line.find(needle) {
+            let column = line[..byte_offset].chars().count() as u16;
+            return buffer[(column, row)].fg;
+        }
+    }
+    panic!("rendered output did not contain {needle:?}");
+}
 
 #[test]
 fn welcome_is_minimal_and_shows_safe_header_labels() {
@@ -356,6 +393,114 @@ fn supported_terminal_sizes_render_without_panicking() {
     for (width, height) in [(60, 12), (80, 20), (100, 28), (150, 40)] {
         let _ = render_to_string(&app, width, height);
     }
+}
+
+#[test]
+fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
+    let mut shell = TuiApp::test_home(
+        "governed-workspace",
+        "orders-warehouse",
+        "read-only",
+        "deepseek/governed-chat",
+    );
+    shell.composer.set_text("kept governed question");
+    for (width, height) in [(150, 40), (100, 28), (60, 12)] {
+        let rendered = render_to_string(&shell, width, height);
+        for required in [
+            "Agent",
+            "Ask a governed data question",
+            "kept governed question",
+            "/mode  /model",
+        ] {
+            assert!(rendered.contains(required), "{width}×{height} omitted {required}");
+        }
+        assert!(!rendered.contains("Terminal too small"));
+
+        let mut artifact = shell.clone();
+        artifact.push_route(ContentRoute::Artifact);
+        let rendered = render_to_string(&artifact, width, height);
+        for required in [
+            "Artifact", "Summary", "Results", "SQL", "Schema", "Evidence", "Esc back",
+        ] {
+            assert!(rendered.contains(required), "{width}×{height} omitted {required}");
+        }
+    }
+
+    assert_eq!(
+        render_to_string(&shell, 50, 8),
+        "Agent\nTerminal too small · resize to at least 60×12\nComposer · kept governed question\nCtrl-C detach"
+    );
+
+    let cases = [
+        (
+            RunEventKind::RunWaiting {
+                reason: "Need a governed date range".to_owned(),
+            },
+            "Status · Waiting for input",
+            "Need a governed date range",
+            shell.active_theme.warning,
+        ),
+        (
+            RunEventKind::PolicyEvaluated {
+                call_id: ToolCallId::new(),
+                decision: PolicyDecision::Deny {
+                    code: "policy.read_denied".to_owned(),
+                    message: "provider detail must stay hidden".to_owned(),
+                },
+            },
+            "Status · Denied",
+            "policy.read_denied",
+            shell.active_theme.error,
+        ),
+        (
+            RunEventKind::RunFailed {
+                code: "query.execution_failed".to_owned(),
+                message: "transport body must stay hidden".to_owned(),
+            },
+            "Status · Failed",
+            "query.execution_failed",
+            shell.active_theme.error,
+        ),
+        (
+            RunEventKind::RunCancelled {
+                reason: "Cancelled by operator".to_owned(),
+            },
+            "Status · Cancelled",
+            "Cancelled by operator",
+            shell.active_theme.warning,
+        ),
+        (
+            RunEventKind::RunCompleted {
+                primary_artifact_id: ArtifactId::new(),
+            },
+            "Status · Succeeded",
+            "Status · Succeeded",
+            shell.active_theme.success,
+        ),
+    ];
+    for (event, status, reason, expected_color) in cases {
+        let mut app = shell.clone();
+        app.timeline_state.apply_event(&timeline_event(1, event));
+        for (width, height) in [(150, 40), (100, 28), (60, 12)] {
+            let rendered = render_to_string(&app, width, height);
+            assert!(rendered.contains(status), "{width}×{height} omitted {status}");
+            assert!(rendered.contains(reason), "{width}×{height} omitted {reason}");
+            if !status.ends_with("Succeeded") {
+                assert!(!rendered.contains("Verified"));
+            }
+        }
+        assert_eq!(rendered_color(&app, 100, 28, status), expected_color);
+    }
+
+    let mut warning = shell;
+    warning.safe_warning = Some("query.preview_limited".to_owned());
+    let rendered = render_to_string(&warning, 100, 28);
+    assert!(rendered.contains("Warning  query.preview_limited"));
+    assert_eq!(
+        rendered_color(&warning, 100, 28, "Warning  query.preview_limited"),
+        warning.active_theme.warning
+    );
+    assert!(!rendered.contains("Verified"));
 }
 
 #[test]

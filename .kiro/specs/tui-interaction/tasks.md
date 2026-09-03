@@ -232,7 +232,7 @@
   - _Requirements: 2.4, 2.5, 2.6, 2.7, 2.8, 6.1, 6.3, 6.7, 6.8_
   - _Boundary: TUI Artifact policy, Preview, viewport, mouse, and no-rerun tests_
   - _Depends: 4.3, 5.1_
-- [ ] 5.6 验证响应式 golden 与非成功状态语义
+- [x] 5.6 验证响应式 golden 与非成功状态语义
   - 用 `150×40`、`100×28`、`60×12` 及低于最小尺寸输入生成生产 renderer golden。
   - 检查 Header、主要内容、固定 Composer、Footer、五页签和尺寸提示不重叠、不 panic，并保留当前可执行键位。
   - 渲染 waiting、warning、denied、failed、cancelled、成功和缺失 Artifact 状态，验证非成功状态不使用成功色或 verified。
