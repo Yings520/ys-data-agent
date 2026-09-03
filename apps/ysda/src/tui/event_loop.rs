@@ -865,7 +865,7 @@ fn terminal_error(error: io::Error) -> CoreError {
 
 fn user_readable_error(error: &CoreError) -> String {
     format!(
-        "What happened: {}. Retry safety and required action are recorded in the Run evidence; use /details and /artifact for diagnostics.",
+        "What happened: {}. Retry safety and required action are recorded in the Run evidence.",
         error.code()
     )
 }
@@ -1594,7 +1594,7 @@ mod tests {
         assert!(matches!(
             app.transcript.last(),
             Some(super::TranscriptItem::Warning(text))
-                if text.contains("delete the leading /") && text.contains("/help")
+                if text.contains("available commands: /mode  /model")
         ));
     }
 

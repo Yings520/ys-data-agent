@@ -1,9 +1,8 @@
 use ratatui::layout::Rect;
-use ys_agent_core::{ArtifactId, ExportFormat, Principal};
+use ys_agent_core::Principal;
 use ysda::tui::{
-    ColorSpec, DetailKind, DetailRequest, DetailView, InputAction, LayoutMode, ThemeRegistry,
-    ThemeToken, TransientView, TuiApp, UiPreferences, bottom_panel_height, parse_input,
-    render_to_string,
+    ColorSpec, DetailKind, DetailView, InputAction, LayoutMode, ThemeRegistry, TransientView,
+    TuiApp, UiPreferences, bottom_panel_height, parse_input, render_to_string,
 };
 
 #[test]
@@ -27,27 +26,21 @@ fn welcome_is_minimal_and_shows_safe_header_labels() {
 }
 
 #[test]
-fn slash_new_creates_a_session_command_not_a_cancel_command() {
-    let action = parse_input("/new").expect("valid command");
-    assert_eq!(action, InputAction::NewSession);
-    assert!(!matches!(action, InputAction::CancelRun { .. }));
+fn slash_mode_is_a_typed_product_command() {
+    assert_eq!(parse_input("/mode"), Ok(InputAction::Mode));
 }
 
 #[test]
-fn slash_quit_detaches_without_cancelling_a_run() {
-    let action = parse_input("/quit").expect("quit command");
-    assert_eq!(action, InputAction::Quit);
-    assert!(!matches!(action, InputAction::CancelRun { .. }));
+fn retired_commands_have_no_hidden_parser_path() {
+    for command in ["/new", "/quit", "/providers", "/doctor", "/artifact"] {
+        assert!(parse_input(command).is_err(), "retired command: {command}");
+    }
 }
 
 #[test]
-fn provider_commands_use_the_single_management_route() {
+fn model_command_uses_the_single_model_selection_route() {
     assert_eq!(
-        parse_input("/providers").expect("Provider manager command"),
-        InputAction::Providers
-    );
-    assert_eq!(
-        parse_input("/model").expect("legacy model command"),
+        parse_input("/model").expect("Model Selection command"),
         InputAction::Model
     );
 }
@@ -126,44 +119,45 @@ fn slash_palette_replaces_composer_and_keeps_one_input_surface() {
     assert!(!rendered.contains("Ask a governed data question…"));
     assert_eq!(bottom_panel_height(&app, Rect::new(0, 0, 100, 28)), 10);
 
-    app.composer.set_text("/sql");
+    app.composer.set_text("/model");
     app.sync_slash_palette();
     assert_eq!(bottom_panel_height(&app, Rect::new(0, 0, 100, 28)), 10);
 }
 
 #[test]
-fn slash_palette_closes_after_a_command_argument_without_changing_the_composer() {
+fn slash_palette_keeps_no_match_open_for_continued_editing() {
     let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
-    app.composer.set_text("/resume");
+    app.composer.set_text("/model");
     app.sync_slash_palette();
     assert_eq!(app.transient, Some(TransientView::SlashPalette));
 
-    app.composer.set_text("/resume task");
+    app.composer.set_text("/model unknown");
     app.sync_slash_palette();
 
-    assert_eq!(app.transient, None);
-    assert_eq!(app.composer.text(), "/resume task");
+    assert_eq!(app.transient, Some(TransientView::SlashPalette));
+    assert_eq!(app.composer.text(), "/model unknown");
 }
 
 #[test]
 fn slash_prefix_with_only_whitespace_keeps_the_palette_open() {
     let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
-    app.composer.set_text("/ ");
+    app.composer.set_text("  /");
     app.sync_slash_palette();
 
     assert_eq!(app.transient, Some(TransientView::SlashPalette));
-    assert_eq!(app.composer.text(), "/ ");
+    app.close_transient();
+    assert_eq!(app.composer.text(), "  ");
 }
 
 #[test]
 fn slash_argument_does_not_replace_an_open_theme_picker() {
     let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
     app.transient = Some(TransientView::ThemePicker);
-    app.composer.set_text("/resume task");
+    app.composer.set_text("/model unknown");
     app.sync_slash_palette();
 
     assert_eq!(app.transient, Some(TransientView::ThemePicker));
-    assert_eq!(app.composer.text(), "/resume task");
+    assert_eq!(app.composer.text(), "/model unknown");
 }
 
 #[test]
@@ -175,74 +169,35 @@ fn supported_terminal_sizes_render_without_panicking() {
 }
 
 #[test]
-fn information_and_theme_commands_are_typed_before_dispatch() {
-    for (raw, expected) in [
-        ("/metrics", DetailRequest::Metrics),
-        ("/query", DetailRequest::Query),
-        ("/checks", DetailRequest::Checks),
-        ("/sql", DetailRequest::Sql),
-        ("/details", DetailRequest::Diagnostics),
-    ] {
-        assert_eq!(
-            parse_input(raw).expect("focused information command"),
-            InputAction::ShowDetail(expected),
-        );
-    }
-    assert_eq!(
-        parse_input("/artifact").expect("current Artifact command"),
-        InputAction::ShowDetail(DetailRequest::Artifact(None)),
-    );
-    let artifact_id = ArtifactId::new();
-    assert_eq!(
-        parse_input(&format!("/artifact {artifact_id}")).expect("specific Artifact command"),
-        InputAction::ShowDetail(DetailRequest::Artifact(Some(artifact_id))),
-    );
-    assert_eq!(
-        parse_input("/theme set accent #4389E6").expect("theme override"),
-        InputAction::SetThemeColor {
-            token: ThemeToken::Accent,
-            color: ColorSpec::Rgb(0x43, 0x89, 0xE6),
-        },
-    );
-    assert_eq!(
-        parse_input("/theme").expect("theme picker"),
-        InputAction::OpenThemePicker,
-    );
-    assert_eq!(
-        parse_input("/theme reset").expect("theme reset"),
-        InputAction::ResetTheme,
-    );
+fn footer_and_palette_expose_only_the_product_catalog() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    let footer = render_to_string(&app, 100, 28);
+    assert!(footer.contains("/mode  /model"));
+    assert!(!footer.contains("/doctor"));
+    assert!(!footer.contains("/providers"));
+
+    app.composer.set_text("/");
+    app.sync_slash_palette();
+    let palette = render_to_string(&app, 100, 28);
+    assert!(palette.contains("/mode"));
+    assert!(palette.contains("/model"));
+    assert!(!palette.contains("/theme"));
+
+    app.close_transient();
+    app.transient = Some(TransientView::Help);
+    let help = render_to_string(&app, 100, 28);
+    assert!(help.contains("/mode"));
+    assert!(help.contains("/model"));
+    assert!(!help.contains("/help"));
+    assert!(!help.contains("/providers"));
 }
 
 #[test]
-fn parser_keeps_data_commands_out_of_model_input() {
-    let task_id = "3d315500-ec47-4ce3-83ee-4284ec34cdbc";
-    let artifact_id = "1e0b9c5d-5dc3-4ee8-a939-17ea1c0cf58f";
-
-    assert_eq!(
-        parse_input("/task new investigate delayed orders").expect("new task"),
-        InputAction::NewTask("investigate delayed orders".to_owned())
-    );
-    assert!(matches!(
-        parse_input(&format!("/resume {task_id}")).expect("resume"),
-        InputAction::ResumeTask { .. }
-    ));
-    assert!(matches!(
-        parse_input(&format!("/cancel {task_id}")).expect("cancel"),
-        InputAction::CancelRun { .. }
-    ));
-    assert_eq!(
-        parse_input(&format!("/export {artifact_id} csv")).expect("export"),
-        InputAction::ExportArtifact {
-            artifact_id: artifact_id.parse().expect("artifact id"),
-            format: ExportFormat::Csv,
-        }
-    );
+fn parser_keeps_free_text_out_of_command_routing() {
     assert_eq!(
         parse_input("free text is a governed question").expect("message"),
         InputAction::SendMessage("free text is a governed question".to_owned())
     );
-    assert!(parse_input("/export not-an-id parquet").is_err());
     assert!(parse_input("/unknown").is_err());
 }
 

@@ -10,6 +10,7 @@ use ratatui::{
 use super::{
     TransientView, TuiApp,
     app::{DetailKind, TranscriptItem},
+    palette::{command_catalog, command_hint},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,12 +284,13 @@ fn detail_lines(app: &TuiApp) -> Text<'static> {
 }
 
 fn help_lines() -> Text<'static> {
-    Text::from(vec![
-        Line::from("Commands"),
-        Line::from("/new · /tasks · /task new TEXT · /resume TASK_ID · /cancel RUN_ID"),
-        Line::from("/metrics · /query · /checks · /artifact [ARTIFACT_ID] · /sql · /details"),
-        Line::from("/export ARTIFACT_ID json|csv|markdown · /doctor · /providers · /theme · /quit"),
-    ])
+    let mut lines = vec![Line::from("Commands")];
+    lines.extend(
+        command_catalog()
+            .iter()
+            .map(|command| Line::from(format!("/{} · {}", command.name, command.description))),
+    );
+    Text::from(lines)
 }
 
 fn repair_lines(app: &TuiApp) -> Text<'static> {
@@ -383,9 +385,9 @@ fn render_bottom(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, _mode: LayoutM
         }
         _ => {
             let hint = if app.query_submission_enabled() {
-                "Enter submit · / commands · Ctrl-C detach"
+                format!("{}  Enter submit · Ctrl-C detach", command_hint())
             } else {
-                "Run /doctor to check readiness · Ctrl-C detach"
+                format!("{}  readiness unavailable · Ctrl-C detach", command_hint())
             };
             frame.render_widget(
                 Paragraph::new(vec![

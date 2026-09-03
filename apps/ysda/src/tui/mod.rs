@@ -16,5 +16,6 @@ pub use event_loop::{
     ProviderOperationPolicy, run_tui,
 };
 pub use input::{DetailRequest, InputAction, InputError, parse_input};
+pub use palette::{SelectionItem, Selector};
 pub use theme::{ColorSpec, ThemeRegistry, ThemeToken, UiPreferenceStore, UiPreferences};
 pub use ui::{LayoutMode, bottom_panel_height, render, render_to_string};

@@ -214,23 +214,15 @@ impl TuiApp {
         }
 
         let was_open = self.transient == Some(TransientView::SlashPalette);
-        let command_has_argument = self
-            .composer
-            .text()
-            .strip_prefix('/')
-            .is_some_and(|command| {
-                command
-                    .split_once(char::is_whitespace)
-                    .is_some_and(|(token, _)| !token.is_empty())
-            });
-        let visible = if command_has_argument {
-            self.slash_palette.clear();
-            false
-        } else {
-            self.slash_palette.update(self.composer.text())
-        };
+        let visible = self.slash_palette.update(self.composer.text());
         if visible && !was_open {
-            self.palette_draft = Some(String::new());
+            let draft = self
+                .composer
+                .text()
+                .find('/')
+                .map(|slash| self.composer.text()[..slash].to_owned())
+                .unwrap_or_default();
+            self.palette_draft = Some(draft);
         } else if !visible {
             self.palette_draft = None;
         }
@@ -355,7 +347,7 @@ impl TuiController {
             let screen = self.provider_screen.as_mut().ok_or_else(|| {
                 ys_agent_core::CoreError::validation(
                     "provider_screen_not_open",
-                    "Open /providers before starting a Provider operation",
+                    "Open Provider setup before starting a Provider operation",
                 )
             })?;
             let command = screen.edit_command().ok_or_else(|| {
@@ -578,7 +570,7 @@ impl TuiController {
         let screen = self.provider_screen.as_mut().ok_or_else(|| {
             ys_agent_core::CoreError::validation(
                 "provider_screen_not_open",
-                "Open /providers before activating a Provider",
+                "Open Provider setup before activating a Provider",
             )
         })?;
         if !screen.request_activation() || screen.confirm_activation().is_none() {
@@ -775,6 +767,12 @@ impl TuiController {
                 },
             ),
             InputAction::Providers => self.open_provider_management(app, false).await?,
+            InputAction::Mode => {
+                return Err(ys_agent_core::CoreError::validation(
+                    "mode_selection_unavailable",
+                    "Mode selection is not active",
+                ));
+            }
             InputAction::Model => self.open_provider_management(app, true).await?,
             InputAction::Doctor => {
                 let report = self.service.doctor().await?;
@@ -1002,7 +1000,7 @@ impl TuiController {
         if !app.query_submission_enabled() {
             app.transient = Some(TransientView::Repair);
             app.push_transcript(TranscriptItem::Warning(
-                "Run /doctor and repair blockers before submitting a query".to_owned(),
+                "Repair readiness blockers before submitting a query".to_owned(),
             ));
             return Ok(());
         }
@@ -1291,7 +1289,7 @@ impl TuiController {
             RunEventKind::RunFailed { code, .. } => {
                 app.runtime_status = None;
                 app.push_transcript(TranscriptItem::Error(format!(
-                    "What happened: {code}. Use /details for diagnostics."
+                    "What happened: {code}. Open diagnostics for details."
                 )));
             }
             RunEventKind::RunCancelled { .. } => {
@@ -1364,7 +1362,7 @@ impl TuiController {
         if view.truncated {
             app.runtime_status = None;
             app.push_transcript(TranscriptItem::Warning(
-                "Verified answer is available through /artifact; concise preview is too large"
+                "Verified answer is available in the result Artifact; concise preview is too large"
                     .to_owned(),
             ));
             return Ok(());
@@ -1709,7 +1707,7 @@ fn user_readable_run_failure(snapshot: &ys_agent_core::RunSnapshot) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("inspect Evidence before retrying");
     format!(
-        "What happened: {what_happened}. Required action: {required_action}. Use /details for retry and Evidence diagnostics."
+        "What happened: {what_happened}. Required action: {required_action}. Open diagnostics for retry and Evidence details."
     )
 }
 
