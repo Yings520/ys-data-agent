@@ -1,0 +1,258 @@
+# Implementation Plan
+
+- [ ] 1. 建立安全的 TUI 应用契约与 Runtime 用例
+- [ ] 1.1 定义 Provider、Plan 与 Model Selection 的安全领域契约
+  - 表达由受治理 Catalog 提供的 Provider/Plan 分类、`Configured / Needs setup / Unavailable` 状态，以及全局唯一的 `Current` 标记。
+  - 定义包含 Profile revision、activation revision、Provider 和 Model 的稳定候选键，并使不同 Profile 下的同名模型保持为不同候选。
+  - 扩展 Provider 管理 port，提供 selection snapshot、候选列表和切换请求所需的厂商无关契约。
+  - 用领域契约测试证明候选视图不包含 Credential、URL、参数正文、validation digest、请求内容或其他内部标识。
+  - 完成后，Core 能拒绝陈旧或不完整候选键，并能为 Runtime 与 TUI 提供可编译的最小安全选择契约。
+  - _Requirements: 4.3, 4.4, 4.6, 4.7, 4.8, 5.1, 6.1, 6.3_
+  - _Boundary: Core Provider selection types and ports_
+  - _Depends: none_
+- [ ] 1.2 提供脱敏的 Display Context
+  - 从权威 Workspace、活动数据源、只读能力和 Query 状态组合 TUI 所需的显示上下文，不把本地配置读取或状态猜测交给界面。
+  - 将未配置、不可用、等待输入、完成和明确非成功状态映射为稳定、用户可展示的结果。
+  - 增加正向与负向 Service contract tests，证明返回值不含 DSN、Credential、ACL 主体、内部 ID、内部 phase、Event payload 或业务数据行。
+  - 完成后，AgentService 可按需返回一个真实、非敏感且与 Runtime 当前状态一致的 Display Context。
+  - _Requirements: 1.2, 1.3, 6.1, 6.3_
+  - _Boundary: AgentService Display Context read model_
+  - _Depends: 1.1_
+- [ ] 1.3 提供 Policy-first 的持久化 Artifact 安全读取
+  - 在读取和解析完整结果前执行现有 Artifact Policy，并为 Summary、Results、SQL、Schema 与 Evidence 所需内容保留真实的缺失或受限原因。
+  - 生成最多 100 行、每个 cell 最多 256 个显示字符且总计不超过 64 KiB 的 Results Preview，同时分别表达持久化行数、返回行数和 UI 截断状态。
+  - 保持 Query 自身的截断 warning 与 UI Preview 截断语义分离，禁止 TUI 从被截断 JSON 自行重建结果。
+  - 用敏感、缺失、超限和畸形 Artifact 测试证明受限内容不会在 Policy 决定前进入完整解析或返回值。
+  - 完成后，AgentService 能从持久化 Artifact 返回受治理的 workspace 数据和有界 Results Preview，且不会执行 Query。
+  - _Requirements: 2.5, 2.6, 2.8, 6.1, 6.3_
+  - _Boundary: Runtime Artifact policy and Query result Preview_
+  - _Depends: 1.2_
+- [ ] 1.4 组合 Model Selection 快照与候选列表
+  - 从 Catalog、Profile、活动配置和模型发现结果组合 Providers/Plans 顶层快照与下层 Model 候选，不在 TUI 维护分类常量。
+  - 对不同 Profile 的同名模型保留独立稳定键，并明确模型的验证状态与可执行下一步。
+  - 发现失败时保留已保存且状态可证明的候选；Catalog 失败、为空或无法证明的候选返回明确错误或空状态，不生成假数据。
+  - 用候选合并测试覆盖当前项唯一性、发现污染、重复模型名和 retry 后快照替换。
+  - 完成后，AgentService 可稳定列出真实的两级候选，且失败不会把未知候选伪装为 Ready。
+  - _Requirements: 4.1, 4.3, 4.4, 4.6, 4.7, 4.8, 6.3, 6.4_
+  - _Boundary: ProviderManagement model-selection query use cases_
+  - _Depends: 1.1, 1.3_
+- [ ] 1.5 实现经过验证的原子模型切换用例
+  - 对已验证候选执行带 Profile revision 与 activation revision 前置条件的原子激活；未配置、验证失效、能力不足或陈旧候选必须 fail closed。
+  - 对首次使用的模型依次保存新 Draft revision、验证兼容性并原子激活，任何中间失败都保持原 active pointer 不变。
+  - 将取消、超时、冲突和迟到结果归一化为稳定错误与恢复动作，并在成功后重新读取权威活动配置。
+  - 用故障注入与竞态测试证明成功返回精确 Active Provider view，失败、取消或冲突不会改变原活动模型。
+  - 完成后，AgentService 提供单一受治理切换入口，且切换结果可由权威 readback 证明。
+  - _Requirements: 4.7, 5.1, 5.2, 5.3, 6.4, 6.5_
+  - _Boundary: ProviderManagement model validation and activation use cases_
+  - _Depends: 1.1, 1.4_
+
+- [ ] 2. 建立无 I/O 的 TUI 交互状态基础
+- [ ] 2.1 建立唯一命令目录与通用选择器
+  - 将产品命令目录收敛为恰好 `/mode` 和 `/model`，解析器、命令面板、Footer 与帮助界面只能读取这一来源。
+  - 实现精确、前缀、有序字符和描述匹配的稳定搜索顺序，以及非空列表唯一高亮和空列表无伪选择的不变量。
+  - 只在搜索 query 或候选集合变化时重新计算匹配结果，光标移动和无关渲染不得重复执行搜索。
+  - 支持实时输入、↑/↓、Enter、Esc 和无匹配继续编辑，并保存打开面板前的 Composer 内容。
+  - 删除旧命令的公开和隐藏解析路径，用单元测试证明目录、解析器和面板不会接受范围外命令。
+  - 完成后，通用选择器无需 I/O 即可驱动全部选择界面，命令目录在所有消费者中精确一致。
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 6.6, 6.7_
+  - _Boundary: TUI command catalog and shared selection reducer_
+  - _Depends: 1.5_
+- [ ] 2.2 实现 Auto 与 Query Mode Picker
+  - 在通用选择器上只提供 `Auto` 和 `Query`，并以本地 UI 状态保存用户意图。
+  - 使 Auto 在 v0.2 解析为 Query、Query 显式锁定 Query，同时保证两者不改变 Policy、Tool Runtime、QueryBudget、数据外发、Provider binding 或 Completion Gate。
+  - Enter 提交新 Mode；Esc 恢复原 Mode、Composer 内容和原页面。
+  - 完成后，真实选择状态只有两个合法值，取消和确认路径均可由纯 reducer 测试观察。
+  - _Requirements: 3.5, 3.6, 3.7, 3.8_
+  - _Boundary: TUI Mode Picker state_
+  - _Depends: 2.1_
+- [ ] 2.3 建立 View、Overlay、焦点与输入优先级状态
+  - 建立以 Timeline 为根的页面栈，并为 Artifact、Model Selection 和既有 Provider Management 保存独立的搜索、高亮、滚动与焦点状态。
+  - 保证同一时刻最多一个 Overlay，输入处理顺序固定为 Overlay、当前 View、Composer。
+  - 为结果卡片建立键盘焦点和可选鼠标命中区域，但把实际 Artifact 读取留给后续集成任务。
+  - 预先建立 Timeline、Artifact、Model Selection 专用模块与共享渲染分发 seam，使后续模块无需同时修改共享入口。
+  - 完成后，打开、取消和逐层返回都能恢复原页面与输入状态，且导航本身不触发任何 Service 调用。
+  - _Requirements: 1.5, 2.4, 2.7, 3.8, 4.9_
+  - _Boundary: TUI route stack, overlay, focus, and render extension seams_
+  - _Depends: 2.2_
+- [ ] 2.4 隔离异步操作与陈旧结果
+  - 为 Display Context、Catalog、Artifact 和 Provider 操作关联 operation ID 与 route key，只允许匹配当前页面和当前操作的 completion 更新状态。
+  - 丢弃迟到或陈旧结果，限制同一时刻最多一个 Provider mutation，同时允许 Catalog 与 Artifact 读取独立推进。
+  - 将网络发现、认证和验证移出事件循环，并提供安全取消或返回语义；取消后保留非敏感输入和原活动配置。
+  - 完成后，事件循环不执行阻塞 I/O，竞态测试可观察到迟到 completion 不覆盖更新后的 route 或 active 状态。
+  - _Requirements: 4.9, 5.3, 6.4, 6.5_
+  - _Boundary: TUI asynchronous operation registry and stale-result guard_
+  - _Depends: 2.3_
+- [ ] 2.5 实现两级 Model Selection reducer
+  - 顶层只提供 Providers 与 Plans，并支持 Tab、←/→ 切换以及统一的搜索、↑/↓、Enter、Esc 行为。
+  - 显示 `Configured / Needs setup / Unavailable`、唯一 `Current` 标记和下层模型验证状态；不可用候选不能产生切换动作。
+  - 从下层返回时恢复原页签、搜索内容和高亮，Catalog 失败或为空时保持可 retry 的错误或空状态。
+  - 对 Needs setup、Ready、未验证、验证失效和能力不足候选产生不同的 typed intent，不直接访问 Provider 或 Repository。
+  - 完成后，纯 reducer 测试能覆盖完整两级导航、状态恢复、Current 唯一性与阻断路径。
+  - _Requirements: 4.1, 4.2, 4.4, 4.5, 4.6, 4.7, 4.9, 5.6_
+  - _Boundary: TUI Model Selection state and reducer_
+  - _Depends: 1.4, 2.4_
+
+- [ ] 3. 构建独立的产品视图与响应式壳层
+- [ ] 3.1 (P) 构建 Timeline 投影与专用渲染
+  - 按持久化 Query Artifact、终态 Snapshot、运行中 Snapshot、typed Event、Service Reply 的优先级投影用户问题、关键阶段、状态、警告和主要结果。
+  - 按 sequence 去重并禁止旧 Event 降级终态；等待输入、拒绝、失败和取消使用明确原因与下一步，不使用成功色或 verified。
+  - 只保留投影所需的有界安全状态，不在 Timeline 中累积 raw payload 或无界 Event 历史。
+  - 只有成功且存在主要 Query Artifact 时创建可聚焦结果卡片，视图数据不包含 raw payload、内部 ID、固定 SQL 或演示数据。
+  - 在独立 Timeline 模块内完成状态与专用渲染测试，不修改共享 app、顶层 renderer 或模块出口。
+  - 完成后，Timeline 对每种终态产生稳定、真实的用户可见投影，并能提供结果卡片焦点信息。
+  - _Requirements: 2.1, 2.2, 2.3, 2.8, 6.3, 6.4_
+  - _Boundary: Dedicated TUI Timeline projection and renderer_
+  - _Depends: 1.2, 2.3_
+- [ ] 3.2 (P) 构建 Artifact Workspace 状态与 Results viewport
+  - 实现 Summary、Results、SQL、Schema 和 Evidence 五个页签，默认进入 Results，并支持 Tab 与 Shift+Tab 切换。
+  - 为 Results 表格维护行列焦点、滚动窗口和边界安全的移动规则，只在当前 viewport 中保留待渲染单元格。
+  - Artifact 内部导航只产生本地状态变化，不生成 Query、Tool 或 resume action。
+  - 在独立 Artifact 模块内完成 reducer 与 viewport 测试，不修改共享 app、顶层 renderer 或模块出口。
+  - 完成后，五页签和二维表格状态可独立驱动，任意移动都不会越界或触发执行副作用。
+  - _Requirements: 2.4, 2.5, 2.6, 2.7, 2.8, 6.3, 6.7_
+  - _Boundary: Dedicated TUI Artifact workspace reducer and Results viewport_
+  - _Depends: 1.3, 2.3_
+- [ ] 3.3 构建 Policy-limited Artifact 投影与专用渲染
+  - 将已授权的持久化 Artifact workspace 投影为五页签内容，并明确显示缺失、Policy 受限和 UI 截断原因。
+  - 将 SQL 标记为只读且不可重跑，保持 Query warning 与 UI Preview 截断语义分离。
+  - Results 只渲染当前 viewport，不遍历或复制 viewport 之外的行列；外部 cell 内容经过控制字符清理与宽度限制。
+  - 在独立 Artifact 模块内完成五页签 projection 与 renderer tests，不修改共享 app、顶层 renderer 或模块出口。
+  - 完成后，五页签能从真实安全内容稳定渲染，受限内容和大型结果不会越过 Policy 或 viewport 边界。
+  - _Requirements: 2.5, 2.6, 2.7, 2.8, 6.3, 6.7_
+  - _Boundary: Dedicated TUI Artifact projection and renderer_
+  - _Depends: 3.2_
+- [ ] 3.4 (P) 构建 Model Selection 专用渲染
+  - 渲染 Providers/Plans 页签、顶层状态、唯一 Current 标记、Model 验证状态、搜索结果和稳定错误/恢复动作。
+  - 对 Needs setup、不可用、发现失败、空 Catalog 和进行中操作显示真实状态，不暴露 Credential、URL、参数正文、validation digest 或原始 Provider 回显。
+  - 在独立 Model Selection 模块内完成各状态 renderer tests，不修改共享 app、顶层 renderer 或模块出口。
+  - 完成后，每种候选和失败状态都有可判别的安全 UI，且不存在假候选或假 Ready 状态。
+  - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 6.3, 6.4, 6.5_
+  - _Boundary: Dedicated TUI Model Selection renderer_
+  - _Depends: 2.5_
+- [ ] 3.5 组合响应式壳层与顶层渲染分发
+  - 按原型组合 Header、主要内容、固定 Composer、Footer、边框层级和 deep-navy 配色，并接入三个专用视图 renderer。
+  - Header 只组合 Display Context、本地 Mode 和权威 Active Provider view；外部文本先清理控制字符，再限制宽度并安全换行。
+  - 在 Wide、Standard、Compact 布局中保持 Header、Composer 和 Footer 可见；低于 `60×12` 时显示不重叠的尺寸提示并保留退出或返回键。
+  - Footer 与帮助界面读取唯一命令目录；完成结果卡片和 Artifact 页分别显示规定的 Enter 与 Esc 提示。
+  - 完成后，`>=120×30`、`>=80×20`、`>=60×12` 和低于最小尺寸的生产 renderer 均不重叠、不 panic，且保留当前可执行键位。
+  - _Requirements: 1.1, 1.2, 1.4, 1.5, 1.6, 2.2, 2.3, 3.2, 6.2, 6.3, 6.6, 6.7_
+  - _Boundary: TUI responsive shell, Header, Composer, Footer, and top-level renderer_
+  - _Depends: 3.1, 3.3, 3.4_
+
+- [ ] 4. 完成 TUI 与 AgentService 的跨边界集成
+- [ ] 4.1 集成 Display Context 生命周期
+  - 在启动、Query 状态变化、数据源变化、Provider 操作完成和用户 retry 时通过 AgentService 刷新 Display Context，禁止每帧刷新。
+  - 刷新失败时由 Controller 保留最后一次成功值并显示 `status unavailable`；没有历史值时显示真实不可用状态，不读取本地配置或猜测 Header。
+  - 把 Workspace、数据源、只读状态与 Query 状态写入 Header read model，同时保持 Mode 与当前模型的独立权威来源。
+  - 完成后，五类刷新触发均可观察，失败不会清空或伪造最后成功的 Display Context。
+  - _Requirements: 1.2, 1.3, 1.4, 6.1, 6.2, 6.4_
+  - _Boundary: TUI Controller Display Context lifecycle adapter_
+  - _Depends: 1.2, 2.4, 3.5_
+- [ ] 4.2 集成 Event、Snapshot 与 Timeline 校准
+  - 从单一 Event subscription 读取 typed Event，以持久化 sequence cursor 去重；断档、lag 或重连时重新读取 Run Snapshot。
+  - 消费 Event 后只更新有界 Timeline 投影，不把 raw payload 或完整 Event 历史复制进 TUI 状态。
+  - 将 Service Reply、运行 Snapshot、终态 Snapshot 与 Artifact completion 送入 Timeline 的事实优先级投影，禁止旧 Event 覆盖终态。
+  - 等待输入、warning、denied、failed、cancelled 和成功主要 Artifact 都通过同一 Controller 路径更新用户状态。
+  - 完成后，事件断档与乱序集成测试能恢复权威 Timeline，且每个非成功状态都有原因和下一步。
+  - _Requirements: 2.1, 2.2, 2.3, 6.4, 6.5_
+  - _Boundary: TUI Controller Event and Run Snapshot integration_
+  - _Depends: 3.1, 4.1_
+- [ ] 4.3 集成结果卡片与 Artifact 只读导航
+  - 让结果卡片获得焦点后 Enter 打开 Artifact 的 Results 页；鼠标启用时点击同一卡片执行完全相同的 typed navigation action。
+  - 进入 Artifact 时只通过 AgentService 读取受 Policy 限制的持久化内容与 Preview；缺失或受限时显示真实原因。
+  - 切换页签、滚动表格和 Esc 返回 Timeline 时保留 Timeline 状态，且不调用 send_message、resume_task、Query 或 Tool API。
+  - 完成后，调用计数测试证明整个打开、切页和返回流程的 Query、Tool 与 resume 调用数均为零。
+  - _Requirements: 2.4, 2.5, 2.6, 2.7, 6.4, 6.7_
+  - _Boundary: TUI Controller Artifact navigation adapter_
+  - _Depends: 1.3, 3.3, 4.2_
+- [ ] 4.4 集成 Needs setup 与既有 Provider Management
+  - `/model` 的 Needs setup 候选只能进入既有 Provider 配置流程，不恢复独立 `/providers` 命令或隐藏解析入口。
+  - Provider 配置完成、失败、取消或返回后重新读取 selection snapshot，并恢复原页签、搜索、高亮与 Composer 内容。
+  - 网络认证、发现和验证期间保持事件循环可响应；安全取消后原活动模型和已输入的非敏感内容不变。
+  - 完成后，Needs setup 端到端路径可返回原 Model Selection 位置，且不会在配置完成前发出模型切换请求。
+  - _Requirements: 3.2, 3.8, 4.5, 4.9, 6.4, 6.5_
+  - _Boundary: TUI Controller Model Selection to Provider Management integration_
+  - _Depends: 2.4, 2.5, 3.4, 3.5_
+- [ ] 4.5 集成验证、激活与权威模型刷新
+  - Ready 候选通过 AgentService 请求切换；未配置、未验证、验证失效或能力不足候选在 TUI 边界被阻止并显示下一步。
+  - 激活成功后依次重新读取 Active Provider、selection snapshot 与 Display Context，只有权威 readback 完成后才更新 Header 和唯一 Current 标记。
+  - 激活失败、超时、取消、冲突或迟到 completion 时保留原活动模型、原 Header、原选择位置和非敏感输入。
+  - 完成后，成功路径的 Header 与 Current 精确匹配活动配置，全部失败路径保持切换前状态。
+  - _Requirements: 4.3, 4.4, 4.6, 4.7, 4.8, 4.9, 5.1, 5.2, 5.3, 6.4, 6.5_
+  - _Boundary: TUI Controller model validation, activation, and authoritative refresh integration_
+  - _Depends: 1.5, 4.4_
+- [ ] 4.6 集成活动模型与新 Run 边界
+  - 启动时从已保存活动 Profile 恢复 Header 当前模型；没有可用活动模型时显示明确不可用状态并阻止无法执行的 Query 提交。
+  - 在 Query 启动边界验证新 Run 使用当时的权威 Provider binding，不让 TUI 直接选择 Credential、参数或 Runtime Provider 实例。
+  - 证明切换前已运行的 Run A 保持原 Provider、Model、Credential generation 与参数，切换后启动的 Run B 使用新 binding。
+  - 完成后，应用重启和模型切换都只影响后续 Run，运行中的 Run 行为与已持久化 binding 一致。
+  - _Requirements: 3.7, 5.4, 5.5, 5.6, 6.1_
+  - _Boundary: TUI-AgentService active-model readiness and immutable Run binding integration_
+  - _Depends: 4.5_
+
+- [ ] 5. 验证真实交互、安全渲染与发布门禁
+- [ ] 5.1 验证命令、Mode 与页面导航的真实键盘路径
+  - 使用真实 Crossterm KeyEvent 驱动公开输入路径，覆盖命令起始位置、实时搜索、无匹配、↑/↓、Enter、Esc 和 Overlay→View→Composer 优先级。
+  - 证明命令面板、解析器、Footer 与帮助界面只公开 `/mode` 和 `/model`，旧命令不能通过隐藏路径执行。
+  - 覆盖 Auto/Query 确认与取消、结果卡片 Enter、Artifact 五页签和逐层返回，不直接修改 reducer 私有字段。
+  - 完成后，所有必需键盘操作均通过生产输入路径，取消操作能恢复原 Mode、页面与 Composer。
+  - _Requirements: 2.4, 2.7, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.8, 4.2, 4.9_
+  - _Boundary: TUI public KeyEvent interaction tests_
+  - _Depends: 4.3, 4.6_
+- [ ] 5.2 验证 Model Selection、Provider 配置与异步交互
+  - 使用真实 KeyEvent 覆盖 Providers/Plans 切换、搜索、两级进入、逐层返回、Needs setup 和不可用候选阻断。
+  - 覆盖发现失败保留已保存候选、空 Catalog retry、Current 唯一性，以及不同 Profile 同名模型不合并。
+  - 以可控异步 completion 验证 Provider mutation 串行、安全取消和 operation ID/route key 丢弃陈旧结果。
+  - 完成后，键盘选择、Provider 配置返回与异步竞态在公开 TUI 路径上均满足状态恢复和 fail-closed 约束。
+  - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 6.5_
+  - _Boundary: TUI Model Selection and Provider setup integration tests_
+  - _Depends: 4.4, 4.5, 5.1_
+- [ ] 5.3 验证激活原子性、重启恢复与 Run binding
+  - 覆盖模型切换成功、失败、超时、取消、Profile revision 冲突和 activation revision 冲突，断言失败时 active pointer 与 Header 不变。
+  - 覆盖成功后的 Active Provider、selection snapshot、Display Context readback 顺序，以及应用重启恢复当前模型。
+  - 覆盖 Run A/Run B 不可变绑定和无活动模型阻止 Query，证明 Mode 选择不会改变 Provider binding 或 Query 治理。
+  - 完成后，Provider 生命周期和并发集成测试能证明切换只影响之后启动的 Run。
+  - _Requirements: 3.7, 4.7, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 6.4_
+  - _Boundary: Provider activation, restart, and Run binding integration tests_
+  - _Depends: 4.5, 4.6, 5.2_
+- [ ] 5.4 验证 Display Context 刷新与 last-good 行为
+  - 覆盖启动、Query 状态变化、数据源变化、Provider 操作完成和用户 retry 五类刷新触发，并证明不会每帧刷新。
+  - 注入刷新失败，验证 Controller 保留最后成功值并显示不可用；没有历史值时显示真实空状态而非本地猜测。
+  - 检查 Workspace、数据源、只读与 Query 状态只来自 AgentService completion，Mode 与当前模型保持独立权威来源。
+  - 完成后，Display Context 生命周期 contract tests 对成功、失败、恢复和连续刷新产生确定性结果。
+  - _Requirements: 1.2, 1.3, 1.4, 6.1, 6.2, 6.4_
+  - _Boundary: TUI Display Context lifecycle contract tests_
+  - _Depends: 4.1, 5.1_
+- [ ] 5.5 验证 Artifact Policy、Preview 与无重跑导航
+  - 覆盖 Artifact Policy 拒绝、缺失内容、100 行、cell 256 字符和总 64 KiB 上限，以及 Query warning 与 UI 截断的独立语义。
+  - 验证 Results 只渲染当前 viewport，大型持久化结果不会被完整复制进 TUI 状态或渲染树。
+  - 使用真实 Crossterm MouseEvent 证明启用鼠标时点击结果卡片与 Enter 产生同一个 typed navigation action。
+  - 对打开、切页、表格导航和 Esc 返回执行调用计数断言，确保 send_message、resume_task、Query 与 Tool 均为零。
+  - 完成后，Artifact 读取和结果导航 tests 能证明 policy-first、有界 Preview、viewport-only 和 no-rerun。
+  - _Requirements: 2.4, 2.5, 2.6, 2.7, 2.8, 6.1, 6.3, 6.7, 6.8_
+  - _Boundary: TUI Artifact policy, Preview, viewport, mouse, and no-rerun tests_
+  - _Depends: 4.3, 5.1_
+- [ ] 5.6 验证响应式 golden 与非成功状态语义
+  - 用 `150×40`、`100×28`、`60×12` 及低于最小尺寸输入生成生产 renderer golden。
+  - 检查 Header、主要内容、固定 Composer、Footer、五页签和尺寸提示不重叠、不 panic，并保留当前可执行键位。
+  - 渲染 waiting、warning、denied、failed、cancelled、成功和缺失 Artifact 状态，验证非成功状态不使用成功色或 verified。
+  - 完成后，四类尺寸和完整状态矩阵的 golden tests 均与生产 renderer 稳定一致。
+  - _Requirements: 1.1, 1.2, 1.4, 1.5, 1.6, 2.1, 2.2, 2.3, 6.2, 6.4, 6.6, 6.7, 6.8_
+  - _Boundary: TUI responsive renderer golden and non-success state tests_
+  - _Depends: 3.5, 4.2, 4.3, 5.1_
+- [ ] 5.7 验证敏感信息、外部文本与生产数据边界
+  - 向 Display Context、候选、Artifact 和错误输入 Secret、DSN、内部 ID、raw payload、Provider 回显和受限业务行，证明默认渲染树与可序列化安全视图均不泄露。
+  - 注入控制字符与超长文本，验证清理、限制宽度和安全换行不会改变状态语义或破坏布局。
+  - 扫描并运行负向测试，确保 Timeline、Artifact 和 Model Selection 不使用生产 fixture、固定 SQL、演示数据或伪造候选。
+  - 完成后，安全 canary、文本清理和 no-fixture leak regressions 全部通过，错误只显示稳定 code 与恢复动作。
+  - _Requirements: 2.8, 4.3, 4.8, 6.1, 6.2, 6.3, 6.4, 6.8_
+  - _Boundary: TUI safe-view, external-text, and no-fixture leak regression tests_
+  - _Depends: 3.1, 3.3, 3.4, 5.4, 5.5, 5.6_
+- [ ] 5.8 运行 Feature 最终自动化门禁
+  - 运行格式、workspace lint、全 workspace 测试和 v0.2 production-like release gate，并只修复本 Feature 边界内暴露的回归。
+  - 确认真实键盘、关键渲染、失败原子性、结果导航不重跑、新旧 Run binding 和安全泄漏测试均包含在可重复执行的自动化门禁中。
+  - 检查生产依赖方向，证明 TUI 只通过 AgentService/Provider Management port 获取状态和发起副作用，且没有数据库、Repository、Artifact Store、Secret Store 或 Model Provider 直连。
+  - 完成后，所有 canonical quality commands 与 release gate 在当前提交上以新鲜证据通过，任务图中不存在未验证的验收标准。
+  - _Requirements: 6.1, 6.3, 6.5, 6.8_
+  - _Boundary: TUI interaction feature-wide automated release validation_
+  - _Depends: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
