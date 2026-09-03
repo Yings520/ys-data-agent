@@ -112,7 +112,7 @@
   - _Requirements: 2.4, 2.5, 2.6, 2.7, 2.8, 6.3, 6.7_
   - _Boundary: Dedicated TUI Artifact workspace reducer and Results viewport_
   - _Depends: 1.3, 2.3_
-- [ ] 3.3 构建 Policy-limited Artifact 投影与专用渲染
+- [x] 3.3 构建 Policy-limited Artifact 投影与专用渲染
   - 将已授权的持久化 Artifact workspace 投影为五页签内容，并明确显示缺失、Policy 受限和 UI 截断原因。
   - 将 SQL 标记为只读且不可重跑，保持 Query warning 与 UI Preview 截断语义分离。
   - Results 只渲染当前 viewport，不遍历或复制 viewport 之外的行列；外部 cell 内容经过控制字符清理与宽度限制。
