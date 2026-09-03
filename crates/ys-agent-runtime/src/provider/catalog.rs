@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use ys_agent_core::{CredentialKind, ParameterApplicability, ProviderId, ProviderParameterKey};
+use ys_agent_core::{
+    CredentialKind, ParameterApplicability, ProviderId, ProviderParameterKey, ProviderPlanId,
+    SelectionTarget,
+};
 
 use super::evidence::EvidenceKind;
 
@@ -87,6 +90,17 @@ impl ProviderCatalogEntry {
 
     pub fn required_evidence(&self) -> &BTreeSet<EvidenceKind> {
         &self.required_evidence
+    }
+
+    pub fn selection_target(&self) -> SelectionTarget {
+        match self.id {
+            ProviderId::ChatGptSubscription => SelectionTarget::Plan {
+                provider: self.id,
+                plan: ProviderPlanId::new("chatgpt_subscription")
+                    .expect("governed plan ID is a valid static token"),
+            },
+            provider => SelectionTarget::Provider(provider),
+        }
     }
 }
 

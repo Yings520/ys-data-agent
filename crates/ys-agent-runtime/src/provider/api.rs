@@ -4,18 +4,21 @@
 //! probing, and Doctor. Callers receive core view types and stable `ProviderManagementError`s;
 //! neither a repository nor a credential lease escapes it.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use ys_agent_core::{
     ActivateProfileRequest, ActivationPrecondition, ActiveProviderView, CompatibilityEvidenceView,
     CredentialGeneration, CredentialMutationRequest, CredentialVault, CredentialViewStatus,
     DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
-    ModelDiscovery, OAuthConnectionView, OperationId, ProfileDetail, ProfileId, ProfileName,
-    ProfileRevision, ProviderCatalogView, ProviderClientBinding, ProviderClientFactory,
-    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField,
-    ProviderManagementApi, ProviderManagementError, ProviderProfileRepository, ProviderRemediation,
-    ProviderResult, RunProviderBindingRepository, ValidateProfileRequest, ValidationCommit,
+    ListModelCandidatesRequest, ModelCandidateBatch, ModelCandidateKey, ModelCandidateStatus,
+    ModelCandidateView, ModelDiscovery, ModelSelectionSnapshot, OAuthConnectionView, OperationId,
+    ProfileDetail, ProfileId, ProfileName, ProfileRevision, ProfileState, ProviderCatalogView,
+    ProviderClientBinding, ProviderClientFactory, ProviderCredentialReference, ProviderDoctorView,
+    ProviderErrorCode, ProviderField, ProviderManagementApi, ProviderManagementError,
+    ProviderModelId, ProviderProfileRepository, ProviderRemediation, ProviderResult,
+    ProviderSupportStatus, RunProviderBindingRepository, SelectionAvailability,
+    SelectionCurrentStatus, SelectionTargetView, ValidateProfileRequest, ValidationCommit,
     ValidationCommitPrecondition,
 };
 
@@ -34,6 +37,7 @@ use crate::doctor::ProviderDoctorCheck;
 /// Catalog views are injected as already-sanitized, offline data. Evidence collection decides
 /// their support status elsewhere; this facade never calls an external registry while rendering.
 pub struct InProcessProviderManagementApi {
+    catalog: GovernedProviderCatalog,
     catalog_views: Vec<ProviderCatalogView>,
     profiles: Arc<dyn ProviderProfileRepository>,
     vault: Arc<dyn CredentialVault>,
@@ -61,6 +65,7 @@ impl InProcessProviderManagementApi {
         factory: Arc<dyn ProviderClientFactory>,
     ) -> Self {
         Self {
+            catalog: catalog.clone(),
             catalog_views,
             doctor: ProviderDoctorCheck::new(profiles.clone(), vault.clone()),
             local_validator: LocalProfileValidator::new(catalog.clone()),
@@ -139,6 +144,174 @@ impl InProcessProviderManagementApi {
 impl ProviderManagementApi for InProcessProviderManagementApi {
     async fn catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>> {
         Ok(self.catalog_views.clone())
+    }
+
+    async fn model_selection_snapshot(&self) -> ProviderResult<ModelSelectionSnapshot> {
+        let profiles = self.lifecycle.list_profiles().await?;
+        let active = self
+            .lifecycle
+            .active_snapshot()
+            .await?
+            .as_ref()
+            .map(ActiveProviderView::from);
+        let mut seen = HashSet::new();
+        let mut targets = Vec::with_capacity(self.catalog_views.len());
+
+        for view in &self.catalog_views {
+            if !seen.insert(view.provider) {
+                return Err(catalog_unavailable());
+            }
+            let current = if active
+                .as_ref()
+                .is_some_and(|active| active.provider == view.provider)
+            {
+                SelectionCurrentStatus::Current
+            } else {
+                SelectionCurrentStatus::NotCurrent
+            };
+            let configured = profiles
+                .iter()
+                .any(|profile| profile.provider == view.provider);
+            let availability = match view.support_status {
+                ProviderSupportStatus::Blocked => SelectionAvailability::Unavailable,
+                ProviderSupportStatus::Supported | ProviderSupportStatus::Candidate
+                    if configured =>
+                {
+                    SelectionAvailability::Configured
+                }
+                ProviderSupportStatus::Supported | ProviderSupportStatus::Candidate => {
+                    SelectionAvailability::NeedsSetup
+                }
+            };
+            targets.push(
+                SelectionTargetView::new(
+                    self.catalog.entry(view.provider).selection_target(),
+                    view.display_name.clone(),
+                    availability,
+                    current,
+                )
+                .map_err(|_| catalog_unavailable())?,
+            );
+        }
+
+        if active
+            .as_ref()
+            .is_some_and(|active| !seen.contains(&active.provider))
+        {
+            return Err(catalog_unavailable());
+        }
+        ModelSelectionSnapshot::new(targets).map_err(|_| catalog_unavailable())
+    }
+
+    async fn list_model_candidates(
+        &self,
+        request: ListModelCandidatesRequest,
+    ) -> ProviderResult<ModelCandidateBatch> {
+        let provider = request.target.provider();
+        let mut catalog_views = self
+            .catalog_views
+            .iter()
+            .filter(|view| view.provider == provider);
+        let catalog_view = catalog_views.next().ok_or_else(catalog_unavailable)?;
+        if catalog_views.next().is_some() {
+            return Err(catalog_unavailable());
+        }
+        if self.catalog.entry(provider).selection_target() != request.target {
+            return Err(invalid_selection_target());
+        }
+
+        let active = self
+            .lifecycle
+            .active_snapshot()
+            .await?
+            .as_ref()
+            .map(ActiveProviderView::from);
+        let expected_activation_revision = active.as_ref().map(|active| active.activation_revision);
+        let summaries = self.lifecycle.list_profiles().await?;
+        let mut candidates = Vec::new();
+
+        for summary in summaries
+            .into_iter()
+            .filter(|summary| summary.provider == provider)
+        {
+            let revision = self
+                .profiles
+                .load_current_revision(summary.profile_id)
+                .await?;
+            if revision.provider() != provider {
+                return Err(catalog_unavailable());
+            }
+            let credential_status = match revision.credential_generation() {
+                Some(generation) => {
+                    self.vault
+                        .credential_status(ProviderCredentialReference {
+                            profile_id: summary.profile_id,
+                            generation,
+                        })
+                        .await?
+                }
+                None => CredentialViewStatus::Missing,
+            };
+            let current = candidate_current_status(active.as_ref(), &revision);
+            let saved_status = candidate_status(
+                summary.state,
+                credential_status,
+                &catalog_view.support_status,
+                current,
+            );
+            candidates.push(model_candidate_view(
+                summary.profile_id,
+                revision.revision(),
+                expected_activation_revision,
+                provider,
+                revision.model().clone(),
+                &summary.name,
+                saved_status,
+                current,
+            )?);
+
+            if catalog_view.support_status == ProviderSupportStatus::Blocked
+                || credential_status != CredentialViewStatus::Saved
+            {
+                continue;
+            }
+            let Some(credential_generation) = revision.credential_generation() else {
+                continue;
+            };
+            let discovered = self
+                .discover_models(DiscoverModelsRequest {
+                    operation_id: OperationId::new(),
+                    profile_id: summary.profile_id,
+                    profile_revision: revision.revision(),
+                    provider,
+                    credential_generation,
+                })
+                .await;
+            let Ok(discovered) = discovered else {
+                continue;
+            };
+            let mut seen_models = HashSet::from([revision.model().as_str().to_owned()]);
+            for discovered in discovered {
+                let Ok(model) = ProviderModelId::new(provider, discovered.model) else {
+                    continue;
+                };
+                if !seen_models.insert(model.as_str().to_owned()) {
+                    continue;
+                }
+                candidates.push(model_candidate_view(
+                    summary.profile_id,
+                    revision.revision(),
+                    expected_activation_revision,
+                    provider,
+                    model,
+                    &summary.name,
+                    ModelCandidateStatus::NeedsValidation,
+                    SelectionCurrentStatus::NotCurrent,
+                )?);
+            }
+        }
+
+        ModelCandidateBatch::new(request.target, candidates).map_err(|_| catalog_unavailable())
     }
 
     async fn list_profiles(&self) -> ProviderResult<Vec<ys_agent_core::ProfileSummary>> {
@@ -406,6 +579,84 @@ fn require_saved_credential(status: CredentialViewStatus) -> ProviderResult<()> 
             ProviderRemediation::ConfigureCredentialStore,
         )),
     }
+}
+
+fn candidate_current_status(
+    active: Option<&ActiveProviderView>,
+    revision: &ProfileRevision,
+) -> SelectionCurrentStatus {
+    if active.is_some_and(|active| {
+        active.profile_id == revision.profile_id()
+            && active.profile_revision == revision.revision()
+            && active.provider == revision.provider()
+            && active.model == *revision.model()
+    }) {
+        SelectionCurrentStatus::Current
+    } else {
+        SelectionCurrentStatus::NotCurrent
+    }
+}
+
+fn candidate_status(
+    state: ProfileState,
+    credential_status: CredentialViewStatus,
+    support_status: &ProviderSupportStatus,
+    current: SelectionCurrentStatus,
+) -> ModelCandidateStatus {
+    if current.is_current() {
+        return ModelCandidateStatus::Ready;
+    }
+    if *support_status == ProviderSupportStatus::Blocked {
+        return ModelCandidateStatus::CapabilityInsufficient;
+    }
+    if credential_status != CredentialViewStatus::Saved {
+        return ModelCandidateStatus::Unavailable;
+    }
+    match state {
+        ProfileState::Ready => ModelCandidateStatus::Ready,
+        ProfileState::Draft => ModelCandidateStatus::NeedsValidation,
+        ProfileState::Invalid => ModelCandidateStatus::ValidationExpired,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn model_candidate_view(
+    profile_id: ProfileId,
+    profile_revision: u64,
+    activation_revision: Option<u64>,
+    provider: ys_agent_core::ProviderId,
+    model: ProviderModelId,
+    profile_name: &str,
+    status: ModelCandidateStatus,
+    current: SelectionCurrentStatus,
+) -> ProviderResult<ModelCandidateView> {
+    let model_display_name = model.as_str().to_owned();
+    let key = ModelCandidateKey::new(
+        profile_id,
+        profile_revision,
+        activation_revision,
+        provider,
+        model,
+    )
+    .map_err(|_| catalog_unavailable())?;
+    ModelCandidateView::new(key, profile_name, model_display_name, status, current)
+        .map_err(|_| catalog_unavailable())
+}
+
+fn invalid_selection_target() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::ModelIncompatible,
+        Some(ProviderField::Provider),
+        ProviderRemediation::ReturnToEdit,
+    )
+}
+
+fn catalog_unavailable() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::ProtocolIncompatible,
+        Some(ProviderField::Provider),
+        ProviderRemediation::Retry,
+    )
 }
 
 fn credential_missing() -> ProviderManagementError {

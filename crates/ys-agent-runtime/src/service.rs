@@ -13,13 +13,14 @@ use ys_agent_core::{
     ContextManifest, CoreError, CoreResult, CredentialGeneration, CredentialKind,
     CredentialMutationRequest, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
     DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, EventActor, EventEnvelope,
-    ExportFormat, ModelMessage, ModelProvider, ModelRequest, ModelRole, OAuthConnectionView,
-    OperationId, PendingRunEvent, Principal, ProfileDetail, ProfileId, ProfileName,
-    ProfileRevision, ProfileRevisionRepository, ProfileSummary, ProviderCatalogView,
-    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId,
-    ProviderManagementApi, ProviderManagementError, ProviderModelId, ProviderParameters,
-    ProviderRemediation, ProviderResult, PutArtifact, QueryResult, RemoteRevocationOutcome,
-    RetentionPolicy, Run, RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
+    ExportFormat, ListModelCandidatesRequest, ModelCandidateBatch, ModelMessage, ModelProvider,
+    ModelRequest, ModelRole, ModelSelectionSnapshot, OAuthConnectionView, OperationId,
+    PendingRunEvent, Principal, ProfileDetail, ProfileId, ProfileName, ProfileRevision,
+    ProfileRevisionRepository, ProfileSummary, ProviderCatalogView, ProviderCredentialReference,
+    ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi,
+    ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
+    ProviderResult, PutArtifact, QueryResult, RemoteRevocationOutcome, RetentionPolicy, Run,
+    RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
     RunProviderBindingSource, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore,
     Sensitivity, Session, SessionId, Task, TaskId, ValidateProfileRequest, ValidationVersions,
     WorkflowKind, WorkspaceId,
@@ -478,6 +479,17 @@ pub trait AgentServiceApi: Send + Sync {
 
     async fn provider_catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>> {
         provider_api(self)?.catalog().await
+    }
+
+    async fn provider_model_selection_snapshot(&self) -> ProviderResult<ModelSelectionSnapshot> {
+        provider_api(self)?.model_selection_snapshot().await
+    }
+
+    async fn provider_list_model_candidates(
+        &self,
+        request: ListModelCandidatesRequest,
+    ) -> ProviderResult<ModelCandidateBatch> {
+        provider_api(self)?.list_model_candidates(request).await
     }
 
     async fn provider_list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>> {

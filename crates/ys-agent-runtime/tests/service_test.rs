@@ -269,6 +269,13 @@ async fn provider_management_is_available_only_through_the_service_boundary() {
         .expect_err("an uncomposed service must not expose a repository or Vault fallback");
 
     assert_eq!(error.code(), "provider.internal");
+
+    let error = fixture
+        .service
+        .provider_model_selection_snapshot()
+        .await
+        .expect_err("an uncomposed service must fail closed for model selection too");
+    assert_eq!(error.code(), "provider.internal");
 }
 
 #[tokio::test]

@@ -27,7 +27,7 @@
   - _Requirements: 2.5, 2.6, 2.8, 6.1, 6.3_
   - _Boundary: Runtime Artifact policy and Query result Preview_
   - _Depends: 1.2_
-- [ ] 1.4 组合 Model Selection 快照与候选列表
+- [x] 1.4 组合 Model Selection 快照与候选列表
   - 从 Catalog、Profile、活动配置和模型发现结果组合 Providers/Plans 顶层快照与下层 Model 候选，不在 TUI 维护分类常量。
   - 对不同 Profile 的同名模型保留独立稳定键，并明确模型的验证状态与可执行下一步。
   - 发现失败时保留已保存且状态可证明的候选；Catalog 失败、为空或无法证明的候选返回明确错误或空状态，不生成假数据。
