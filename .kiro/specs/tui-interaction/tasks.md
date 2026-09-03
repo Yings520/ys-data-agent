@@ -207,7 +207,7 @@
   - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 6.5_
   - _Boundary: TUI Model Selection and Provider setup integration tests_
   - _Depends: 4.4, 4.5, 5.1_
-- [ ] 5.3 验证激活原子性、重启恢复与 Run binding
+- [x] 5.3 验证激活原子性、重启恢复与 Run binding
   - 覆盖模型切换成功、失败、超时、取消、Profile revision 冲突和 activation revision 冲突，断言失败时 active pointer 与 Header 不变。
   - 覆盖成功后的 Active Provider、selection snapshot、Display Context readback 顺序，以及应用重启恢复当前模型。
   - 覆盖 Run A/Run B 不可变绑定和无活动模型阻止 Query，证明 Mode 选择不会改变 Provider binding 或 Query 治理。
