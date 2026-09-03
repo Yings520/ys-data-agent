@@ -121,7 +121,7 @@
   - _Requirements: 2.5, 2.6, 2.7, 2.8, 6.3, 6.7_
   - _Boundary: Dedicated TUI Artifact projection and renderer_
   - _Depends: 3.2_
-- [ ] 3.4 (P) 构建 Model Selection 专用渲染
+- [x] 3.4 (P) 构建 Model Selection 专用渲染
   - 渲染 Providers/Plans 页签、顶层状态、唯一 Current 标记、Model 验证状态、搜索结果和稳定错误/恢复动作。
   - 对 Needs setup、不可用、发现失败、空 Catalog 和进行中操作显示真实状态，不暴露 Credential、URL、参数正文、validation digest 或原始 Provider 回显。
   - 在独立 Model Selection 模块内完成各状态 renderer tests，不修改共享 app、顶层 renderer 或模块出口。

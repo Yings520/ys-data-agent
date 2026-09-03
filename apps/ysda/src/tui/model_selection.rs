@@ -434,11 +434,159 @@ fn matches_query(value: &str, query: &str) -> bool {
 }
 
 pub fn render_lines(state: &ModelSelectionState) -> Vec<String> {
-    let mut lines = vec!["Model Selection".to_owned()];
+    const VISIBLE_ROWS: usize = 6;
+    let mut lines = vec!["Model Selection".to_owned(), render_tabs(state.tab)];
+    if state.current_target_count() == 0 {
+        lines.push("Current · unavailable · Query submission is blocked".to_owned());
+    }
+    if state.level == ModelSelectionLevel::Models
+        && let Some(target) = state.model_target_view()
+    {
+        lines.push(format!("Models · {}", target.display_name()));
+    }
     if !state.search.is_empty() {
         lines.push(format!("Search · {}", state.search));
     }
+    match state.load_state() {
+        ModelSelectionLoadState::Loading => {
+            lines.push(match state.level {
+                ModelSelectionLevel::Targets => "Loading governed Catalog…".to_owned(),
+                ModelSelectionLevel::Models => "Loading governed models… · Esc back".to_owned(),
+            });
+        }
+        ModelSelectionLoadState::Empty => {
+            lines.push(match state.level {
+                ModelSelectionLevel::Targets => "Catalog is empty · Retry".to_owned(),
+                ModelSelectionLevel::Models => "No saved or discovered models · Retry".to_owned(),
+            });
+        }
+        ModelSelectionLoadState::Failed(code) => {
+            lines.push(format!(
+                "Unavailable · {}",
+                stable_error_code(code).unwrap_or("provider.status_unavailable")
+            ));
+            lines.push("Retry · no active model or input was changed".to_owned());
+        }
+        ModelSelectionLoadState::Ready => match state.level {
+            ModelSelectionLevel::Targets => {
+                let targets = state.visible_targets();
+                if targets.is_empty() {
+                    lines.push("No matches · keep typing or clear search".to_owned());
+                } else {
+                    lines.extend(
+                        targets
+                            .into_iter()
+                            .skip(state.scroll)
+                            .take(VISIBLE_ROWS)
+                            .enumerate()
+                            .map(|(visible, target)| {
+                                let selected =
+                                    state.scroll + visible == state.highlighted.unwrap_or(0);
+                                render_target_row(target, selected)
+                            }),
+                    );
+                }
+            }
+            ModelSelectionLevel::Models => {
+                let candidates = state.visible_candidates();
+                if candidates.is_empty() {
+                    lines.push("No matches · keep typing or clear search".to_owned());
+                } else {
+                    lines.extend(
+                        candidates
+                            .into_iter()
+                            .skip(state.scroll)
+                            .take(VISIBLE_ROWS)
+                            .enumerate()
+                            .map(|(visible, candidate)| {
+                                let selected =
+                                    state.scroll + visible == state.highlighted.unwrap_or(0);
+                                render_candidate_row(candidate, selected)
+                            }),
+                    );
+                }
+            }
+        },
+    }
     lines
+}
+
+impl ModelSelectionState {
+    fn model_target_view(&self) -> Option<&SelectionTargetView> {
+        let target = self.model_target.as_ref()?;
+        self.snapshot
+            .as_ref()?
+            .targets()
+            .iter()
+            .find(|view| view.target() == target)
+    }
+}
+
+fn render_tabs(active: ModelSelectionTab) -> String {
+    match active {
+        ModelSelectionTab::Providers => "[Providers]  Plans".to_owned(),
+        ModelSelectionTab::Plans => "Providers  [Plans]".to_owned(),
+    }
+}
+
+fn render_target_row(target: &SelectionTargetView, selected: bool) -> String {
+    let availability = match target.availability() {
+        SelectionAvailability::Configured => "Configured",
+        SelectionAvailability::NeedsSetup => "Needs setup",
+        SelectionAvailability::Unavailable => "Unavailable",
+    };
+    let current = if target.current().is_current() {
+        " · Current"
+    } else {
+        ""
+    };
+    let action = match target.availability() {
+        SelectionAvailability::Configured => " · Enter models",
+        SelectionAvailability::NeedsSetup => " · Enter setup",
+        SelectionAvailability::Unavailable => " · Choose another option",
+    };
+    format!(
+        "{}{} · {availability}{current}{action}",
+        if selected { "> " } else { "  " },
+        target.display_name()
+    )
+}
+
+fn render_candidate_row(candidate: &ModelCandidateView, selected: bool) -> String {
+    let (status, action) = match candidate.status() {
+        ModelCandidateStatus::Ready => ("Ready", "Enter activate"),
+        ModelCandidateStatus::NeedsValidation => {
+            ("Needs validation", "Enter validate and activate")
+        }
+        ModelCandidateStatus::ValidationExpired => {
+            ("Validation expired", "Enter revalidate and activate")
+        }
+        ModelCandidateStatus::CapabilityInsufficient => {
+            ("Capability insufficient", "Choose another model")
+        }
+        ModelCandidateStatus::Unavailable => ("Unavailable", "Choose another model"),
+    };
+    let current = if candidate.current().is_current() {
+        " · Current"
+    } else {
+        ""
+    };
+    format!(
+        "{}{} · {status}{current} · {} · {action}",
+        if selected { "> " } else { "  " },
+        candidate.model_display_name(),
+        candidate.profile_display_name()
+    )
+}
+
+fn stable_error_code(value: &str) -> Option<&str> {
+    let code = value.split_whitespace().next()?;
+    (!code.is_empty()
+        && code.len() <= 80
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+    .then_some(code)
 }
 
 #[cfg(test)]
@@ -733,5 +881,74 @@ mod tests {
 
         assert_eq!(state.highlighted, parent_highlight);
         assert_eq!(state.scroll, parent_scroll);
+    }
+
+    #[test]
+    fn renderer_shows_only_catalog_tabs_real_target_states_and_one_current_marker() {
+        let mut state = ModelSelectionState::default();
+        state.reduce(ModelSelectionAction::SnapshotLoaded(snapshot()));
+        let rendered = render_lines(&state).join("\n");
+
+        assert!(rendered.contains("[Providers]  Plans"));
+        assert!(rendered.contains("DeepSeek · Configured · Current"));
+        assert!(rendered.contains("xAI · Needs setup"));
+        assert!(rendered.contains("Anthropic · Unavailable"));
+        assert_eq!(rendered.matches("Current").count(), 1);
+        assert!(!rendered.contains("Credential"));
+        assert!(!rendered.contains("http"));
+        assert!(!rendered.contains("validation digest"));
+
+        state.reduce(ModelSelectionAction::SearchChanged("not-found".to_owned()));
+        let no_match = render_lines(&state).join("\n");
+        assert!(no_match.contains("No matches"));
+        assert!(no_match.contains("Search · not-found"));
+    }
+
+    #[test]
+    fn renderer_distinguishes_every_model_validation_state_without_fake_ready_rows() {
+        let mut state = ModelSelectionState::default();
+        state.reduce(ModelSelectionAction::SnapshotLoaded(snapshot()));
+        enter_models(&mut state);
+        let rendered = render_lines(&state).join("\n");
+
+        for expected in [
+            "Model ready · Ready",
+            "Model new · Needs validation",
+            "Model expired · Validation expired",
+            "Model insufficient · Capability insufficient",
+            "Model unavailable · Unavailable",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected}");
+        }
+        assert_eq!(rendered.matches(" · Ready").count(), 1);
+        assert!(rendered.contains("Profile ready"));
+    }
+
+    #[test]
+    fn renderer_has_safe_loading_empty_and_retryable_failure_states() {
+        let mut state = ModelSelectionState::default();
+        assert!(
+            render_lines(&state)
+                .join("\n")
+                .contains("Loading governed Catalog")
+        );
+
+        state.reduce(ModelSelectionAction::SnapshotLoaded(
+            ModelSelectionSnapshot::new(Vec::new()).expect("empty snapshot"),
+        ));
+        assert!(
+            render_lines(&state)
+                .join("\n")
+                .contains("Catalog is empty · Retry")
+        );
+
+        state.reduce(ModelSelectionAction::SnapshotFailed(
+            "provider.catalog_unavailable\nBearer sk-secret".to_owned(),
+        ));
+        let failed = render_lines(&state).join("\n");
+        assert!(failed.contains("provider.catalog_unavailable"));
+        assert!(failed.contains("Retry"));
+        assert!(!failed.contains("Bearer"));
+        assert!(!failed.contains("sk-secret"));
     }
 }
