@@ -582,6 +582,10 @@ async fn handle_terminal_event(
                 handle_theme_picker_key(app, key)?;
                 return Ok(false);
             }
+            if app.transient == Some(TransientView::ModePicker) {
+                handle_mode_picker_key(app, key);
+                return Ok(false);
+            }
             if app.transient == Some(TransientView::SlashPalette) {
                 handle_palette_key(app, controller, key).await?;
                 return Ok(false);
@@ -771,14 +775,14 @@ async fn handle_palette_key(
                 return Ok(());
             };
             app.slash_palette.clear();
-            app.palette_draft = None;
+            let palette_draft = app.palette_draft.take().unwrap_or_default();
             app.transient = None;
             if requires_arguments {
                 app.composer.set_text(&format!("{command} "));
             } else if key.code == KeyCode::Tab {
                 app.composer.set_text(&command);
             } else {
-                app.composer.clear();
+                app.composer.set_text(&palette_draft);
                 let action = parse_input(&command).map_err(|error| {
                     CoreError::validation("invalid_slash_command", error.to_string())
                 })?;
@@ -793,6 +797,31 @@ async fn handle_palette_key(
         }
     }
     Ok(())
+}
+
+fn handle_mode_picker_key(app: &mut TuiApp, key: KeyEvent) {
+    let action = match key.code {
+        KeyCode::Up => Some(super::ModePickerAction::MoveUp),
+        KeyCode::Down => Some(super::ModePickerAction::MoveDown),
+        KeyCode::Enter => Some(super::ModePickerAction::Confirm),
+        KeyCode::Backspace => Some(super::ModePickerAction::Backspace),
+        KeyCode::Char(character) if key.modifiers.is_empty() => {
+            Some(super::ModePickerAction::Insert(character))
+        }
+        _ => None,
+    };
+    let Some(action) = action else {
+        return;
+    };
+    let Some(picker) = app.mode_picker.as_mut() else {
+        app.transient = None;
+        return;
+    };
+    if let super::ModePickerOutcome::Confirmed(mode) = picker.reduce(action) {
+        app.query_mode = mode;
+        app.mode_picker = None;
+        app.transient = app.mode_picker_return.take();
+    }
 }
 
 fn handle_theme_picker_key(app: &mut TuiApp, key: KeyEvent) -> CoreResult<()> {

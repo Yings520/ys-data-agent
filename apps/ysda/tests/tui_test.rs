@@ -1,8 +1,9 @@
 use ratatui::layout::Rect;
 use ys_agent_core::Principal;
 use ysda::tui::{
-    ColorSpec, DetailKind, DetailView, InputAction, LayoutMode, ThemeRegistry, TransientView,
-    TuiApp, UiPreferences, bottom_panel_height, parse_input, render_to_string,
+    ColorSpec, DetailKind, DetailView, InputAction, LayoutMode, ModePickerAction,
+    ModePickerOutcome, ModePickerState, ThemeRegistry, TransientView, TuiApp, TuiQueryMode,
+    UiPreferences, bottom_panel_height, parse_input, render_to_string,
 };
 
 #[test]
@@ -51,6 +52,61 @@ fn v02_tui_does_not_offer_unimplemented_modes() {
     let rendered = render_to_string(&app, 100, 28);
     assert!(!rendered.contains("Build mode"));
     assert!(!rendered.contains("Analysis mode"));
+}
+
+#[test]
+fn mode_picker_confirms_or_cancels_without_leaking_partial_state() {
+    let mut picker = ModePickerState::new(TuiQueryMode::Auto, "draft question".to_owned());
+    assert_eq!(picker.options(), [TuiQueryMode::Auto, TuiQueryMode::Query]);
+    assert_eq!(
+        picker.reduce(ModePickerAction::MoveDown),
+        ModePickerOutcome::Open
+    );
+    assert_eq!(
+        picker.reduce(ModePickerAction::Confirm),
+        ModePickerOutcome::Confirmed(TuiQueryMode::Query)
+    );
+    assert_eq!(
+        TuiQueryMode::Auto.workflow(),
+        TuiQueryMode::Query.workflow()
+    );
+
+    let mut cancelled = ModePickerState::new(TuiQueryMode::Query, "kept draft".to_owned());
+    assert_eq!(
+        cancelled.reduce(ModePickerAction::Cancel),
+        ModePickerOutcome::Cancelled {
+            mode: TuiQueryMode::Query,
+            composer: "kept draft".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn cancelling_mode_picker_restores_mode_composer_and_page() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    app.query_mode = TuiQueryMode::Query;
+    app.composer.set_text("kept question");
+    app.show_detail(
+        DetailKind::Sql,
+        DetailView {
+            title: "SQL".to_owned(),
+            lines: vec!["select 1".to_owned()],
+        },
+    );
+
+    app.open_mode_picker();
+    assert_eq!(app.transient, Some(TransientView::ModePicker));
+    let rendered = render_to_string(&app, 100, 28);
+    assert!(rendered.contains("Auto"));
+    assert!(rendered.contains("Query"));
+    assert!(!rendered.contains("Build"));
+    assert!(!rendered.contains("Analysis"));
+    app.close_transient();
+
+    assert_eq!(app.query_mode, TuiQueryMode::Query);
+    assert_eq!(app.composer.text(), "kept question");
+    assert_eq!(app.transient, Some(TransientView::Detail(DetailKind::Sql)));
+    assert_eq!(app.detail.as_ref().expect("restored detail").title, "SQL");
 }
 
 #[test]

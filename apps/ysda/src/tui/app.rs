@@ -19,6 +19,7 @@ use super::input::{DetailRequest, InputAction};
 use super::{
     AsyncOperationRegistry, ProviderOperationCompletion, ProviderOperationPolicy,
     composer::ComposerState,
+    mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQueryMode},
     palette::SlashPalette,
     provider_management::{
         ProviderManagementScreen, ProviderManagementScreenView, ProviderManagementStep,
@@ -51,6 +52,7 @@ pub enum DetailKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransientView {
     SlashPalette,
+    ModePicker,
     ThemePicker,
     Detail(DetailKind),
     Help,
@@ -116,6 +118,9 @@ pub struct TuiApp {
     pub composer: ComposerState,
     pub slash_palette: SlashPalette,
     pub palette_draft: Option<String>,
+    pub query_mode: TuiQueryMode,
+    pub mode_picker: Option<ModePickerState>,
+    pub mode_picker_return: Option<TransientView>,
     pub theme_registry: ThemeRegistry,
     pub theme_names: Vec<String>,
     pub theme_selected: usize,
@@ -154,6 +159,9 @@ impl TuiApp {
             composer: ComposerState::new(),
             slash_palette: SlashPalette::with_default_commands(),
             palette_draft: None,
+            query_mode: TuiQueryMode::Auto,
+            mode_picker: None,
+            mode_picker_return: None,
             theme_registry,
             theme_names,
             theme_selected: 0,
@@ -235,11 +243,27 @@ impl TuiApp {
                 .set_text(&self.palette_draft.take().unwrap_or_default());
             self.slash_palette.clear();
         }
+        if self.transient == Some(TransientView::ModePicker)
+            && let Some(mut picker) = self.mode_picker.take()
+            && let ModePickerOutcome::Cancelled { mode, composer } =
+                picker.reduce(ModePickerAction::Cancel)
+        {
+            self.query_mode = mode;
+            self.composer.set_text(&composer);
+            self.transient = self.mode_picker_return.take();
+            return;
+        }
         if self.transient == Some(TransientView::ThemePicker) {
             self.preview_theme = None;
         }
         self.transient = None;
         self.detail = None;
+    }
+
+    pub fn open_mode_picker(&mut self) {
+        self.mode_picker_return = self.transient;
+        self.mode_picker = Some(ModePickerState::new(self.query_mode, self.composer.text()));
+        self.transient = Some(TransientView::ModePicker);
     }
 
     pub fn push_transcript(&mut self, item: TranscriptItem) {
@@ -767,12 +791,7 @@ impl TuiController {
                 },
             ),
             InputAction::Providers => self.open_provider_management(app, false).await?,
-            InputAction::Mode => {
-                return Err(ys_agent_core::CoreError::validation(
-                    "mode_selection_unavailable",
-                    "Mode selection is not active",
-                ));
-            }
+            InputAction::Mode => app.open_mode_picker(),
             InputAction::Model => self.open_provider_management(app, true).await?,
             InputAction::Doctor => {
                 let report = self.service.doctor().await?;

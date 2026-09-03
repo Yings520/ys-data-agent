@@ -63,9 +63,9 @@ pub fn render(frame: &mut Frame<'_>, app: &TuiApp) {
 
 pub fn bottom_panel_height(app: &TuiApp, area: Rect) -> u16 {
     match app.transient {
-        Some(TransientView::SlashPalette | TransientView::ThemePicker) => {
-            10_u16.min(area.height.saturating_sub(2))
-        }
+        Some(
+            TransientView::SlashPalette | TransientView::ModePicker | TransientView::ThemePicker,
+        ) => 10_u16.min(area.height.saturating_sub(2)),
         _ => 4_u16.min(area.height.saturating_sub(2)),
     }
 }
@@ -339,6 +339,35 @@ fn render_bottom(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, _mode: LayoutM
                 Line::from("Search commands"),
             ];
             lines.extend(rows);
+            frame.render_widget(
+                Paragraph::new(Text::from(lines))
+                    .style(Style::default().bg(theme.surface))
+                    .block(
+                        Block::default()
+                            .borders(Borders::TOP)
+                            .border_style(Style::default().fg(theme.border)),
+                    ),
+                area,
+            );
+        }
+        Some(TransientView::ModePicker) => {
+            frame.render_widget(Clear, area);
+            let mut lines = vec![Line::from(Span::styled(
+                "Mode",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ))];
+            if let Some(picker) = &app.mode_picker {
+                lines.push(Line::from(format!("Search modes  {}", picker.query())));
+                lines.extend(picker.rows().map(|(selected, mode)| {
+                    let marker = if selected { "›" } else { " " };
+                    Line::from(Span::styled(
+                        format!("{marker} {}", mode.label()),
+                        Style::default().fg(if selected { theme.accent } else { theme.text }),
+                    ))
+                }));
+            }
             frame.render_widget(
                 Paragraph::new(Text::from(lines))
                     .style(Style::default().bg(theme.surface))

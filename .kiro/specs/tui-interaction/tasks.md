@@ -57,7 +57,7 @@
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 6.6, 6.7_
   - _Boundary: TUI command catalog and shared selection reducer_
   - _Depends: 1.5_
-- [ ] 2.2 实现 Auto 与 Query Mode Picker
+- [x] 2.2 实现 Auto 与 Query Mode Picker
   - 在通用选择器上只提供 `Auto` 和 `Query`，并以本地 UI 状态保存用户意图。
   - 使 Auto 在 v0.2 解析为 Query、Query 显式锁定 Query，同时保证两者不改变 Policy、Tool Runtime、QueryBudget、数据外发、Provider binding 或 Completion Gate。
   - Enter 提交新 Mode；Esc 恢复原 Mode、Composer 内容和原页面。
