@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use ys_agent_runtime::QueryDisplayState;
 
 use super::{
     TransientView, TuiApp,
@@ -18,6 +19,7 @@ use super::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
+    TooSmall,
     Compact,
     Standard,
     Wide,
@@ -25,9 +27,11 @@ pub enum LayoutMode {
 
 impl LayoutMode {
     pub fn resolve(area: Rect) -> Self {
-        if area.width < 80 || area.height < 20 {
+        if area.width < 60 || area.height < 12 {
+            Self::TooSmall
+        } else if area.width < 80 || area.height < 20 {
             Self::Compact
-        } else if area.width >= 130 {
+        } else if area.width >= 120 && area.height >= 30 {
             Self::Wide
         } else {
             Self::Standard
@@ -43,6 +47,10 @@ pub fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         Block::default().style(Style::default().bg(theme.background).fg(theme.text)),
         area,
     );
+    if mode == LayoutMode::TooSmall {
+        render_too_small(frame, app, area);
+        return;
+    }
     let regions = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -75,10 +83,12 @@ pub fn bottom_panel_height(app: &TuiApp, area: Rect) -> u16 {
 
 fn render_header(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMode) {
     let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
-    let readiness = match &app.doctor_report {
-        Some(report) if report.allows_query_submission() => ("ready", theme.success),
-        Some(_) => ("blocked", theme.warning),
-        None => ("not checked", theme.muted),
+    let header = app.header_view();
+    let value_width = match mode {
+        LayoutMode::Wide => 28,
+        LayoutMode::Standard => 14,
+        LayoutMode::Compact => 10,
+        LayoutMode::TooSmall => 8,
     };
     let mut spans = vec![
         Span::styled(
@@ -88,27 +98,59 @@ fn render_header(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMo
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(safe(&app.workspace_name), Style::default().fg(theme.text)),
         Span::styled(
-            format!(" · {}", readiness.0),
-            Style::default().fg(readiness.1),
+            format!("W:{}", safe_width(header.workspace, value_width)),
+            Style::default().fg(theme.text),
         ),
     ];
-    if mode != LayoutMode::Compact {
+    if mode == LayoutMode::Compact {
         spans.extend([
             Span::styled(
-                format!(" · {}", safe(&app.model_label)),
-                Style::default().fg(theme.muted),
+                format!(" · {}", mode_label(app)),
+                Style::default().fg(theme.accent),
             ),
             Span::styled(
-                format!(" · {}", safe(&app.connection_label)),
-                Style::default().fg(theme.muted),
-            ),
-            Span::styled(
-                format!(" · {}", safe(&app.permission_label)),
-                Style::default().fg(theme.muted),
+                format!(" · {}", safe_width(header.query, value_width)),
+                Style::default().fg(query_color(
+                    header.query_state,
+                    header.context_unavailable,
+                    theme,
+                )),
             ),
         ]);
+    } else {
+        spans.extend([
+            Span::styled(
+                format!(" · D:{}", safe_width(header.datasource, value_width)),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(
+                format!(" · M:{}", mode_label(app)),
+                Style::default().fg(theme.accent),
+            ),
+            Span::styled(
+                format!(" · Model:{}", safe_width(header.current_model, value_width)),
+                Style::default().fg(theme.accent),
+            ),
+            Span::styled(
+                format!(" · {}", safe_width(header.read_only, value_width)),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(
+                format!(" · {}", safe_width(header.query, value_width)),
+                Style::default().fg(query_color(
+                    header.query_state,
+                    header.context_unavailable,
+                    theme,
+                )),
+            ),
+        ]);
+    }
+    if header.context_unavailable {
+        spans.push(Span::styled(
+            " · status unavailable",
+            Style::default().fg(theme.warning),
+        ));
     }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.header)),
@@ -116,34 +158,85 @@ fn render_header(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMo
     );
 }
 
+fn query_color(
+    state: QueryDisplayState,
+    unavailable: bool,
+    theme: &super::theme::YsdaTheme,
+) -> ratatui::style::Color {
+    if unavailable {
+        return theme.warning;
+    }
+    match state {
+        QueryDisplayState::Ready => theme.muted,
+        QueryDisplayState::Running => theme.accent,
+        QueryDisplayState::WaitingForInput => theme.warning,
+        QueryDisplayState::Completed => theme.success,
+        QueryDisplayState::NonSuccess { .. } => theme.error,
+    }
+}
+
 fn render_body(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMode) {
     let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
     let text = match app.transient {
-        Some(TransientView::Help) => help_lines(),
+        Some(TransientView::Help) => help_lines(app),
         Some(TransientView::Repair) => repair_lines(app),
         _ => match app.navigation.current() {
             ContentRoute::Timeline => match app.transient {
                 Some(TransientView::Detail(_)) => detail_lines(app),
                 _ => {
                     let mut text = transcript_lines(app);
-                    text.lines.extend(
-                        timeline::render_lines(&app.timeline_state)
-                            .into_iter()
-                            .map(Line::from),
-                    );
+                    let timeline_tone = app.timeline_state.view().status.tone();
+                    text.lines
+                        .extend(timeline::render_lines(&app.timeline_state).into_iter().map(
+                            |line| {
+                                Line::from(Span::styled(
+                                    safe(&line),
+                                    Style::default().fg(timeline_color(timeline_tone, theme)),
+                                ))
+                            },
+                        ));
                     text
                 }
             },
             ContentRoute::Artifact => Text::from(
                 artifact::render_lines(&app.artifact_workspace)
                     .into_iter()
-                    .map(Line::from)
+                    .map(|line| {
+                        let color = if line.contains("restricted") || line.contains("missing") {
+                            theme.error
+                        } else if line.contains("Warning") || line.contains("preview limited") {
+                            theme.warning
+                        } else if line.contains("Verification · Verified") {
+                            theme.success
+                        } else {
+                            theme.text
+                        };
+                        Line::from(Span::styled(safe(&line), Style::default().fg(color)))
+                    })
                     .collect::<Vec<_>>(),
             ),
             ContentRoute::ModelSelection => Text::from(
                 model_selection::render_lines(&app.model_selection_state)
                     .into_iter()
-                    .map(Line::from)
+                    .map(|line| {
+                        let color = if line.contains(" · Current") {
+                            theme.accent
+                        } else if line.contains("Needs setup")
+                            || line.contains("Needs validation")
+                            || line.contains("Validation expired")
+                        {
+                            theme.warning
+                        } else if line.contains("Unavailable")
+                            || line.contains("Capability insufficient")
+                        {
+                            theme.error
+                        } else if line.contains(" · Ready") {
+                            theme.success
+                        } else {
+                            theme.text
+                        };
+                        Line::from(Span::styled(safe(&line), Style::default().fg(color)))
+                    })
                     .collect::<Vec<_>>(),
             ),
             ContentRoute::ProviderManagement | ContentRoute::Diagnostics => detail_lines(app),
@@ -180,6 +273,18 @@ fn render_body(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMode
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+fn timeline_color(
+    tone: timeline::TimelineTone,
+    theme: &super::theme::YsdaTheme,
+) -> ratatui::style::Color {
+    match tone {
+        timeline::TimelineTone::Neutral => theme.text,
+        timeline::TimelineTone::Warning => theme.warning,
+        timeline::TimelineTone::Danger => theme.error,
+        timeline::TimelineTone::Success => theme.success,
+    }
 }
 
 fn transcript_lines(app: &TuiApp) -> Text<'static> {
@@ -302,7 +407,7 @@ fn detail_lines(app: &TuiApp) -> Text<'static> {
         return Text::from("No detail available");
     };
     let mut lines = vec![Line::from(Span::styled(
-        detail.title.clone(),
+        safe(&detail.title),
         Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
@@ -311,13 +416,14 @@ fn detail_lines(app: &TuiApp) -> Text<'static> {
     Text::from(lines)
 }
 
-fn help_lines() -> Text<'static> {
+fn help_lines(app: &TuiApp) -> Text<'static> {
     let mut lines = vec![Line::from("Commands")];
     lines.extend(
         command_catalog()
             .iter()
             .map(|command| Line::from(format!("/{} · {}", command.name, command.description))),
     );
+    lines.push(Line::from(format!("Keys · {}", context_key_hint(app))));
     Text::from(lines)
 }
 
@@ -441,11 +547,7 @@ fn render_bottom(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, _mode: LayoutM
             );
         }
         _ => {
-            let hint = if app.query_submission_enabled() {
-                format!("{}  Enter submit · Ctrl-C detach", command_hint())
-            } else {
-                format!("{}  readiness unavailable · Ctrl-C detach", command_hint())
-            };
+            let hint = footer_hint(app);
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(safe(&app.composer.text())),
@@ -464,7 +566,84 @@ fn render_bottom(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, _mode: LayoutM
 }
 
 fn safe(value: &str) -> String {
-    value.replace('\u{1b}', "?")
+    safe_width(value, 240)
+}
+
+fn safe_width(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(max_chars)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn mode_label(app: &TuiApp) -> &'static str {
+    match app.query_mode {
+        super::TuiQueryMode::Auto => "AUTO › QUERY",
+        super::TuiQueryMode::Query => "QUERY",
+    }
+}
+
+fn footer_hint(app: &TuiApp) -> String {
+    format!("{}  {}", command_hint(), context_key_hint(app))
+}
+
+fn context_key_hint(app: &TuiApp) -> &'static str {
+    match app.navigation.current() {
+        ContentRoute::Timeline => timeline_key_hint(
+            app.timeline_state.view().result_card.is_some(),
+            app.query_submission_enabled(),
+        ),
+        ContentRoute::Artifact => "Esc back",
+        ContentRoute::ModelSelection => "Tab switch · Enter select · Esc back",
+        ContentRoute::ProviderManagement => "Esc cancel/back",
+        ContentRoute::Diagnostics => "Esc back",
+    }
+}
+
+fn timeline_key_hint(has_result_card: bool, submission_enabled: bool) -> &'static str {
+    if has_result_card {
+        "Enter open results"
+    } else if submission_enabled {
+        "Enter submit · Ctrl-C detach"
+    } else {
+        "readiness unavailable · Ctrl-C detach"
+    }
+}
+
+fn render_too_small(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
+    let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
+    let key = if app.navigation.current() == ContentRoute::Timeline {
+        "Ctrl-C detach"
+    } else {
+        "Esc back"
+    };
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            "Agent",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("Terminal too small · resize to at least 60×12"),
+        Line::from(format!("Composer · {}", safe(&app.composer.text()))),
+        Line::from(key),
+    ]);
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(theme.text).bg(theme.background))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 pub fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {
@@ -490,4 +669,15 @@ pub fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {
 #[allow(dead_code)]
 fn _detail_kind_is_used(kind: DetailKind) -> DetailKind {
     kind
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timeline_key_hint;
+
+    #[test]
+    fn completed_timeline_footer_prioritizes_open_results() {
+        assert_eq!(timeline_key_hint(true, true), "Enter open results");
+        assert_eq!(timeline_key_hint(true, false), "Enter open results");
+    }
 }

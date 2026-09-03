@@ -1,5 +1,10 @@
 use ratatui::layout::Rect;
-use ys_agent_core::Principal;
+use ys_agent_core::{
+    ActiveProviderView, Principal, ProfileId, ProviderId, ProviderModelId, ProviderParameters,
+};
+use ys_agent_runtime::{
+    DatasourceDisplayState, QueryDisplayState, TuiDisplayContext, TuiDisplayContextInput,
+};
 use ysda::tui::{
     ArtifactWorkspaceState, AsyncChannel, AsyncResultGuard, ColorSpec, ContentRoute, DetailKind,
     DetailView, FocusTarget, HitRegion, InputAction, InputLayer, LayoutMode, ModePickerAction,
@@ -354,6 +359,94 @@ fn supported_terminal_sizes_render_without_panicking() {
 }
 
 #[test]
+fn responsive_shell_keeps_product_content_composer_and_context_keys_visible() {
+    let mut app = TuiApp::test_home(
+        "workspace\ncontrol",
+        "warehouse\tdatasource",
+        "read-only",
+        "deepseek/chat",
+    );
+    app.query_mode = TuiQueryMode::Query;
+    app.composer.set_text("kept question");
+
+    for (width, height) in [(60, 12), (80, 20), (120, 30), (150, 40)] {
+        let rendered = render_to_string(&app, width, height);
+        assert!(rendered.contains("Agent"));
+        assert!(rendered.contains("Ask a governed data question"));
+        assert!(rendered.contains("kept question"));
+        assert!(rendered.contains("/mode  /model"));
+        assert!(!rendered.contains('\n') || !rendered.contains("workspace\ncontrol"));
+    }
+    let standard = render_to_string(&app, 100, 28);
+    assert!(standard.contains("QUERY"));
+    assert!(standard.contains("deepseek/chat"));
+    assert!(!standard.contains('\t'));
+}
+
+#[test]
+fn header_reads_typed_display_context_mode_and_authoritative_active_model() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    app.workspace_name = "spoofed-local-workspace".to_owned();
+    app.model_label = "spoofed-local-model".to_owned();
+    app.apply_display_context(TuiDisplayContext::from(
+        TuiDisplayContextInput::new(
+            "Governed Workspace",
+            DatasourceDisplayState::active("Orders Warehouse").expect("safe datasource label"),
+            true,
+            QueryDisplayState::Running,
+        )
+        .expect("safe display context"),
+    ));
+    app.apply_active_provider_view(Some(&ActiveProviderView {
+        activation_revision: 1,
+        profile_id: ProfileId::new(),
+        profile_revision: 1,
+        provider: ProviderId::DeepSeek,
+        model: ProviderModelId::new(ProviderId::DeepSeek, "deepseek/governed-chat")
+            .expect("valid model"),
+        parameters: ProviderParameters::default(),
+    }));
+    app.query_mode = TuiQueryMode::Auto;
+
+    let rendered = render_to_string(&app, 150, 40);
+    assert!(rendered.contains("Governed Workspace"));
+    assert!(rendered.contains("Orders Warehouse"));
+    assert!(rendered.contains("AUTO › QUERY"));
+    assert!(rendered.contains("deepseek/governed-chat"));
+    assert!(rendered.contains("read-only"));
+    assert!(rendered.contains("query running"));
+    assert!(!rendered.contains("spoofed-local"));
+
+    app.mark_display_context_unavailable();
+    let unavailable = render_to_string(&app, 150, 40);
+    assert!(unavailable.contains("Governed Workspace"));
+    assert!(unavailable.contains("status unavailable"));
+}
+
+#[test]
+fn undersized_shell_has_a_non_overlapping_recovery_view() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    app.composer.set_text("draft");
+    let rendered = render_to_string(&app, 50, 8);
+
+    assert!(rendered.contains("Agent"));
+    assert!(rendered.contains("Terminal too small"));
+    assert!(rendered.contains("draft"));
+    assert!(rendered.contains("Ctrl-C detach"));
+    for (width, height) in [(1, 1), (20, 3), (59, 11)] {
+        let _ = render_to_string(&app, width, height);
+    }
+}
+
+#[test]
+fn artifact_footer_uses_the_shared_command_catalog_and_back_hint() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
+    app.push_route(ContentRoute::Artifact);
+    let rendered = render_to_string(&app, 100, 28);
+    assert!(rendered.contains("/mode  /model  Esc back"));
+}
+
+#[test]
 fn footer_and_palette_expose_only_the_product_catalog() {
     let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
     let footer = render_to_string(&app, 100, 28);
@@ -440,6 +533,10 @@ fn theme_preview_escape_restores_the_active_theme() {
 #[test]
 fn layout_modes_never_encode_a_sidebar_mode() {
     assert_eq!(
+        LayoutMode::resolve(Rect::new(0, 0, 59, 11)),
+        LayoutMode::TooSmall
+    );
+    assert_eq!(
         LayoutMode::resolve(Rect::new(0, 0, 60, 12)),
         LayoutMode::Compact
     );
@@ -448,7 +545,7 @@ fn layout_modes_never_encode_a_sidebar_mode() {
         LayoutMode::Standard
     );
     assert_eq!(
-        LayoutMode::resolve(Rect::new(0, 0, 150, 40)),
+        LayoutMode::resolve(Rect::new(0, 0, 120, 30)),
         LayoutMode::Wide
     );
 }

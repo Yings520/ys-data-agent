@@ -129,7 +129,7 @@
   - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 6.3, 6.4, 6.5_
   - _Boundary: Dedicated TUI Model Selection renderer_
   - _Depends: 2.5_
-- [ ] 3.5 组合响应式壳层与顶层渲染分发
+- [x] 3.5 组合响应式壳层与顶层渲染分发
   - 按原型组合 Header、主要内容、固定 Composer、Footer、边框层级和 deep-navy 配色，并接入三个专用视图 renderer。
   - Header 只组合 Display Context、本地 Mode 和权威 Active Provider view；外部文本先清理控制字符，再限制宽度并安全换行。
   - 在 Wide、Standard、Compact 布局中保持 Header、Composer 和 Footer 可见；低于 `60×12` 时显示不重叠的尺寸提示并保留退出或返回键。

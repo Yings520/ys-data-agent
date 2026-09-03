@@ -3,16 +3,18 @@ use std::{sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 
 use ys_agent_core::{
-    ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, CommandId, CredentialGeneration,
-    CredentialKind, CredentialMutation, CredentialMutationIntent, CredentialMutationRequest,
-    EventEnvelope, ExportFormat, OperationId, Principal, ProfileId, ProfileName, ProfileRevision,
-    ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode, ProviderField,
-    ProviderId, ProviderManagementError, ProviderRemediation, RunEventKind, RunId, RunStatus,
-    SaveProfileRequest, SaveProfileRevision, Sensitivity, SessionId, StepId, TaskId, WorkspaceId,
+    ActiveProviderView, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, CommandId,
+    CredentialGeneration, CredentialKind, CredentialMutation, CredentialMutationIntent,
+    CredentialMutationRequest, EventEnvelope, ExportFormat, OperationId, Principal, ProfileId,
+    ProfileName, ProfileRevision, ProtectedCredentialWrite, ProviderCredentialReference,
+    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError, ProviderRemediation,
+    RunEventKind, RunId, RunStatus, SaveProfileRequest, SaveProfileRevision, Sensitivity,
+    SessionId, StepId, TaskId, WorkspaceId,
 };
 use ys_agent_runtime::{
-    AgentServiceApi, CreateTaskRequest, EventSubscription, QueryArtifact, SendMessageRequest,
-    ServiceReply, doctor::DoctorReport, export::PersistedResultBody,
+    AgentServiceApi, CreateTaskRequest, DatasourceDisplayState, DatasourceUnavailableReason,
+    EventSubscription, QueryArtifact, QueryDisplayState, QueryNonSuccessReason, SendMessageRequest,
+    ServiceReply, TuiDisplayContext, doctor::DoctorReport, export::PersistedResultBody,
 };
 
 use super::input::{DetailRequest, InputAction};
@@ -105,6 +107,43 @@ pub struct DiagnosticsView {
     pub query_phase: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeaderReadModel {
+    workspace: String,
+    datasource: String,
+    read_only: String,
+    query: String,
+    query_state: QueryDisplayState,
+    current_model: String,
+    context_unavailable: bool,
+}
+
+impl Default for HeaderReadModel {
+    fn default() -> Self {
+        Self {
+            workspace: "status unavailable".to_owned(),
+            datasource: "status unavailable".to_owned(),
+            read_only: "status unavailable".to_owned(),
+            query: "status unavailable".to_owned(),
+            query_state: QueryDisplayState::NonSuccess {
+                reason: QueryNonSuccessReason::StatusUnavailable,
+            },
+            current_model: "model unavailable".to_owned(),
+            context_unavailable: true,
+        }
+    }
+}
+
+pub(super) struct HeaderView<'a> {
+    pub workspace: &'a str,
+    pub datasource: &'a str,
+    pub read_only: &'a str,
+    pub query: &'a str,
+    pub query_state: QueryDisplayState,
+    pub current_model: &'a str,
+    pub context_unavailable: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiApp {
     pub navigation: NavigationState,
@@ -112,6 +151,7 @@ pub struct TuiApp {
     pub artifact_workspace: ArtifactWorkspaceState,
     pub model_selection_state: ModelSelectionState,
     pub provider_navigation: ProviderNavigationState,
+    header: HeaderReadModel,
     pub workspace_name: String,
     pub principal_name: String,
     pub model_label: String,
@@ -158,6 +198,7 @@ impl TuiApp {
             artifact_workspace: ArtifactWorkspaceState::default(),
             model_selection_state: ModelSelectionState::default(),
             provider_navigation: ProviderNavigationState::default(),
+            header: HeaderReadModel::default(),
             workspace_name: "local".to_owned(),
             principal_name: principal.display_name,
             model_label: "not checked".to_owned(),
@@ -200,6 +241,15 @@ impl TuiApp {
         app.connection_label = connection.to_owned();
         app.permission_label = permission.to_owned();
         app.model_label = model.to_owned();
+        app.header = HeaderReadModel {
+            workspace: workspace.to_owned(),
+            datasource: connection.to_owned(),
+            read_only: permission.to_owned(),
+            query: "ready".to_owned(),
+            query_state: QueryDisplayState::Ready,
+            current_model: model.to_owned(),
+            context_unavailable: false,
+        };
         app
     }
 
@@ -225,6 +275,69 @@ impl TuiApp {
         self.doctor_report
             .as_ref()
             .is_some_and(DoctorReport::allows_query_submission)
+    }
+
+    pub fn apply_display_context(&mut self, context: TuiDisplayContext) {
+        self.header.workspace = context.workspace_display_name().to_owned();
+        self.header.datasource = match context.datasource() {
+            DatasourceDisplayState::Active { display_name } => display_name.clone(),
+            DatasourceDisplayState::NotConfigured => "datasource not configured".to_owned(),
+            DatasourceDisplayState::Unavailable { reason } => match reason {
+                DatasourceUnavailableReason::ConnectionUnavailable => {
+                    "datasource connection unavailable".to_owned()
+                }
+                DatasourceUnavailableReason::ValidationRequired => {
+                    "datasource validation required".to_owned()
+                }
+                DatasourceUnavailableReason::StatusUnavailable => {
+                    "datasource status unavailable".to_owned()
+                }
+            },
+        };
+        self.header.read_only = if context.read_only() {
+            "read-only"
+        } else {
+            "write access"
+        }
+        .to_owned();
+        self.header.query_state = context.query_state();
+        self.header.query = match context.query_state() {
+            QueryDisplayState::Ready => "query ready",
+            QueryDisplayState::Running => "query running",
+            QueryDisplayState::WaitingForInput => "query waiting for input",
+            QueryDisplayState::Completed => "query completed",
+            QueryDisplayState::NonSuccess { reason } => match reason {
+                QueryNonSuccessReason::Rejected => "query rejected",
+                QueryNonSuccessReason::Failed => "query failed",
+                QueryNonSuccessReason::Cancelled => "query cancelled",
+                QueryNonSuccessReason::Unsupported => "query unsupported",
+                QueryNonSuccessReason::StatusUnavailable => "query status unavailable",
+            },
+        }
+        .to_owned();
+        self.header.context_unavailable = false;
+    }
+
+    pub fn mark_display_context_unavailable(&mut self) {
+        self.header.context_unavailable = true;
+    }
+
+    pub fn apply_active_provider_view(&mut self, active: Option<&ActiveProviderView>) {
+        self.header.current_model = active
+            .map(|view| view.model.as_str().to_owned())
+            .unwrap_or_else(|| "model unavailable".to_owned());
+    }
+
+    pub(super) fn header_view(&self) -> HeaderView<'_> {
+        HeaderView {
+            workspace: &self.header.workspace,
+            datasource: &self.header.datasource,
+            read_only: &self.header.read_only,
+            query: &self.header.query,
+            query_state: self.header.query_state,
+            current_model: &self.header.current_model,
+            context_unavailable: self.header.context_unavailable,
+        }
     }
 
     pub fn sync_slash_palette(&mut self) {
