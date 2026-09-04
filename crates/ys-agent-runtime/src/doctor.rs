@@ -221,7 +221,7 @@ impl ProviderDoctorCheck {
             )),
         }
 
-        if protection != Some(CredentialProtectionStatus::ConfirmedNative) {
+        if !protection.is_some_and(CredentialProtectionStatus::is_confirmed) {
             blockers.push(provider_error(
                 ProviderErrorCode::CredentialProtectionUnavailable,
                 ProviderField::Credential,

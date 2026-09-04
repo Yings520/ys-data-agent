@@ -1,6 +1,7 @@
-//! Credential storage adapter boundary.
+//! Credential storage adapters.
 //!
-//! Concrete native-store behavior belongs in `keyring`; this module owns no
-//! production fallback or configuration discovery.
+//! Production credentials are encrypted in the workspace-local vault. The in-memory adapter is
+//! an explicit test double and never selected by production composition.
 
-pub mod keyring;
+pub mod local;
+pub mod memory;

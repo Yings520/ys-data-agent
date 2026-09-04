@@ -161,7 +161,11 @@ fn credential_journal_contract_preserves_only_valid_non_secret_recovery_state() 
 
 #[test]
 fn provider_catalog_is_exact_and_model_prefixes_are_fail_closed() {
-    assert_eq!(ProviderId::ALL.len(), 9);
+    assert_eq!(ProviderId::ALL.len(), 17);
+    assert_eq!(ProviderId::PROVIDERS.len(), 9);
+    assert_eq!(ProviderId::PLANS.len(), 8);
+    assert!(ProviderId::PLANS.contains(&ProviderId::OpenCodeGo));
+    assert!(!ProviderId::PROVIDERS.contains(&ProviderId::OpenCodeGo));
     assert_eq!(ProviderId::ChatGptSubscription.model_prefix(), "chatgpt/");
     assert_eq!(ProviderId::OpenCodeGo.model_prefix(), "opencode-go/");
     assert_eq!(ProviderId::OpenCodeZen.model_prefix(), "opencode/");

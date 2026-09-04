@@ -79,7 +79,6 @@ pub async fn dispatch(cli: Cli, dependencies: AppDependencies) -> CoreResult<()>
 }
 
 async fn dispatch_run(dependencies: &AppDependencies, question: String) -> CoreResult<()> {
-    ensure_query_ready(dependencies, "query submission").await?;
     let session = dependencies
         .service
         .create_session(CommandId::new(), dependencies.principal.clone())

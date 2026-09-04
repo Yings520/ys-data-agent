@@ -1,30 +1,44 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use ys_agent_core::{
-    ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, CommandId, CredentialGeneration,
-    CredentialKind, CredentialMutation, CredentialMutationIntent, CredentialMutationRequest,
-    EventEnvelope, ExportFormat, OperationId, Principal, ProfileId, ProfileName, ProfileRevision,
-    ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode, ProviderField,
-    ProviderId, ProviderManagementError, ProviderRemediation, RunEventKind, RunId, RunStatus,
-    SaveProfileRequest, SaveProfileRevision, Sensitivity, SessionId, StepId, TaskId, WorkspaceId,
+    ActiveProviderView, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactId, CommandId,
+    CredentialGeneration, CredentialKind, CredentialMutation, CredentialMutationIntent,
+    CredentialMutationRequest, DeviceAuthorizationView, EventEnvelope, ExportFormat, OperationId,
+    Principal, ProfileId, ProfileName, ProfileRevision, ProtectedCredentialWrite,
+    ProviderCredentialReference, ProviderErrorCode, ProviderField, ProviderId,
+    ProviderManagementError, ProviderRemediation, RunEventKind, RunId, RunStatus,
+    SaveProfileRequest, SaveProfileRevision, SelectionTarget, Sensitivity, SessionId, StepId,
+    SwitchModelRequest, TaskId, WorkspaceId,
 };
 use ys_agent_runtime::{
-    AgentServiceApi, CreateTaskRequest, EventSubscription, QueryArtifact, SendMessageRequest,
-    ServiceReply, doctor::DoctorReport, export::PersistedResultBody,
+    AgentServiceApi, CreateTaskRequest, DatasourceDisplayState, DatasourceUnavailableReason,
+    EventSubscription, QueryArtifact, QueryDisplayState, QueryNonSuccessReason, SendMessageRequest,
+    ServiceReply, TuiDisplayContext, doctor::DoctorReport, export::PersistedResultBody,
 };
 
 use super::input::{DetailRequest, InputAction};
 use super::{
-    AsyncOperationRegistry, ProviderOperationCompletion, ProviderOperationPolicy,
+    AsyncChannel, AsyncOperationRegistry, AsyncOperationTicket, AsyncResultGuard,
+    ProviderOperationCompletion, ProviderOperationPolicy, RouteKey,
+    artifact::{
+        ArtifactAction, ArtifactOutcome, ArtifactUnavailableReason, ArtifactWorkspaceProjection,
+        ArtifactWorkspaceState, AuthorizedResultsPreview, ResultsAccess, ResultsViewportPage,
+        ResultsViewportRequest, project_results_viewport,
+    },
     composer::ComposerState,
+    mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQueryMode},
+    model_selection::{ModelSelectionAction, ModelSelectionOutcome, ModelSelectionState},
+    navigation::{ContentRoute, FocusTarget, NavigationState, ProviderNavigationState},
     palette::SlashPalette,
     provider_management::{
-        ProviderManagementScreen, ProviderManagementScreenView, ProviderManagementStep,
-        ProviderManagementView, ProviderOperationKind, ProviderProfileView, ProviderResultOutcome,
+        ProviderAuthentication, ProviderManagementScreen, ProviderManagementScreenView,
+        ProviderManagementStep, ProviderManagementView, ProviderOperationKind, ProviderProfileView,
+        ProviderResultOutcome,
     },
     theme::{ThemeRegistry, UiPreferences, YsdaTheme},
+    timeline::TimelineState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,10 +65,40 @@ pub enum DetailKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransientView {
     SlashPalette,
+    ModePicker,
     ThemePicker,
     Detail(DetailKind),
     Help,
     Repair,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayContextRefreshTrigger {
+    Startup,
+    QueryStateChanged,
+    DatasourceChanged,
+    ProviderOperationCompleted,
+    UserRetry,
+}
+
+impl DisplayContextRefreshTrigger {
+    pub const ALL: [Self; 5] = [
+        Self::Startup,
+        Self::QueryStateChanged,
+        Self::DatasourceChanged,
+        Self::ProviderOperationCompleted,
+        Self::UserRetry,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Startup => 0,
+            Self::QueryStateChanged => 1,
+            Self::DatasourceChanged => 2,
+            Self::ProviderOperationCompleted => 3,
+            Self::UserRetry => 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,8 +143,57 @@ pub struct DiagnosticsView {
     pub query_phase: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeaderReadModel {
+    workspace: String,
+    datasource: String,
+    read_only: String,
+    query: String,
+    query_state: QueryDisplayState,
+    current_model: String,
+    active_model_available: bool,
+    context_unavailable: bool,
+}
+
+impl Default for HeaderReadModel {
+    fn default() -> Self {
+        Self {
+            workspace: "local".to_owned(),
+            datasource: "No datasource".to_owned(),
+            read_only: "setup required".to_owned(),
+            query: "setup required".to_owned(),
+            query_state: QueryDisplayState::NonSuccess {
+                reason: QueryNonSuccessReason::StatusUnavailable,
+            },
+            current_model: "No model".to_owned(),
+            active_model_available: false,
+            context_unavailable: false,
+        }
+    }
+}
+
+pub(super) struct HeaderView<'a> {
+    #[allow(dead_code)]
+    pub workspace: &'a str,
+    pub datasource: &'a str,
+    pub read_only: &'a str,
+    #[allow(dead_code)]
+    pub query: &'a str,
+    #[allow(dead_code)]
+    pub query_state: QueryDisplayState,
+    pub current_model: &'a str,
+    pub active_model_available: bool,
+    pub context_unavailable: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiApp {
+    pub navigation: NavigationState,
+    pub timeline_state: TimelineState,
+    pub artifact_workspace: ArtifactWorkspaceState,
+    pub model_selection_state: ModelSelectionState,
+    pub provider_navigation: ProviderNavigationState,
+    header: HeaderReadModel,
     pub workspace_name: String,
     pub principal_name: String,
     pub model_label: String,
@@ -109,6 +202,7 @@ pub struct TuiApp {
     pub doctor_report: Option<DoctorReport>,
     pub focused_task: Option<TaskSummary>,
     pub transcript: Vec<TranscriptItem>,
+    transcript_error_fingerprints: BTreeSet<String>,
     pub runtime_status: Option<String>,
     pub primary_artifact_id: Option<ArtifactId>,
     pub rendered_answer_artifact_id: Option<ArtifactId>,
@@ -116,6 +210,9 @@ pub struct TuiApp {
     pub composer: ComposerState,
     pub slash_palette: SlashPalette,
     pub palette_draft: Option<String>,
+    pub query_mode: TuiQueryMode,
+    pub mode_picker: Option<ModePickerState>,
+    pub mode_picker_return: Option<TransientView>,
     pub theme_registry: ThemeRegistry,
     pub theme_names: Vec<String>,
     pub theme_selected: usize,
@@ -139,6 +236,12 @@ impl TuiApp {
         let theme_names = theme_registry.names().map(str::to_owned).collect();
         let active_theme = theme_registry.resolve("deep-navy").expect("built-in theme");
         Self {
+            navigation: NavigationState::new(),
+            timeline_state: TimelineState::default(),
+            artifact_workspace: ArtifactWorkspaceState::default(),
+            model_selection_state: ModelSelectionState::default(),
+            provider_navigation: ProviderNavigationState::default(),
+            header: HeaderReadModel::default(),
             workspace_name: "local".to_owned(),
             principal_name: principal.display_name,
             model_label: "not checked".to_owned(),
@@ -147,6 +250,7 @@ impl TuiApp {
             doctor_report: None,
             focused_task: None,
             transcript: Vec::new(),
+            transcript_error_fingerprints: BTreeSet::new(),
             runtime_status: None,
             primary_artifact_id: None,
             rendered_answer_artifact_id: None,
@@ -154,6 +258,9 @@ impl TuiApp {
             composer: ComposerState::new(),
             slash_palette: SlashPalette::with_default_commands(),
             palette_draft: None,
+            query_mode: TuiQueryMode::Auto,
+            mode_picker: None,
+            mode_picker_return: None,
             theme_registry,
             theme_names,
             theme_selected: 0,
@@ -178,6 +285,16 @@ impl TuiApp {
         app.connection_label = connection.to_owned();
         app.permission_label = permission.to_owned();
         app.model_label = model.to_owned();
+        app.header = HeaderReadModel {
+            workspace: workspace.to_owned(),
+            datasource: connection.to_owned(),
+            read_only: permission.to_owned(),
+            query: "ready".to_owned(),
+            query_state: QueryDisplayState::Ready,
+            current_model: model.to_owned(),
+            active_model_available: true,
+            context_unavailable: false,
+        };
         app
     }
 
@@ -203,6 +320,78 @@ impl TuiApp {
         self.doctor_report
             .as_ref()
             .is_some_and(DoctorReport::allows_query_submission)
+            && self.header.active_model_available
+    }
+
+    /// Chat needs only an active Provider. Datasource readiness remains a separate requirement
+    /// for governed Query Runs.
+    pub fn conversation_submission_enabled(&self) -> bool {
+        self.header.active_model_available
+    }
+
+    pub fn apply_display_context(&mut self, context: TuiDisplayContext) {
+        self.header.workspace = context.workspace_display_name().to_owned();
+        self.header.datasource = match context.datasource() {
+            DatasourceDisplayState::Active { display_name } => display_name.clone(),
+            DatasourceDisplayState::NotConfigured => "No datasource".to_owned(),
+            DatasourceDisplayState::Unavailable { reason } => match reason {
+                DatasourceUnavailableReason::ConnectionUnavailable => {
+                    "Datasource offline".to_owned()
+                }
+                DatasourceUnavailableReason::ValidationRequired => "Datasource setup".to_owned(),
+                DatasourceUnavailableReason::StatusUnavailable => "No datasource".to_owned(),
+            },
+        };
+        self.header.read_only = if context.read_only() {
+            "read-only"
+        } else {
+            "write access"
+        }
+        .to_owned();
+        self.header.query_state = context.query_state();
+        self.header.query = match context.query_state() {
+            QueryDisplayState::Ready => "query ready",
+            QueryDisplayState::Running => "query running",
+            QueryDisplayState::WaitingForInput => "query waiting for input",
+            QueryDisplayState::Completed => "query completed",
+            QueryDisplayState::NonSuccess { reason } => match reason {
+                QueryNonSuccessReason::Rejected => "query rejected",
+                QueryNonSuccessReason::Failed => "query failed",
+                QueryNonSuccessReason::Cancelled => "query cancelled",
+                QueryNonSuccessReason::Unsupported => "query unsupported",
+                QueryNonSuccessReason::StatusUnavailable => "query status unavailable",
+            },
+        }
+        .to_owned();
+        self.header.context_unavailable = false;
+    }
+
+    pub fn mark_display_context_unavailable(&mut self) {
+        self.header.context_unavailable = true;
+    }
+
+    pub fn display_context_unavailable(&self) -> bool {
+        self.header.context_unavailable
+    }
+
+    pub fn apply_active_provider_view(&mut self, active: Option<&ActiveProviderView>) {
+        self.header.active_model_available = active.is_some();
+        self.header.current_model = active
+            .map(|view| view.model.as_str().to_owned())
+            .unwrap_or_else(|| "No model".to_owned());
+    }
+
+    pub(super) fn header_view(&self) -> HeaderView<'_> {
+        HeaderView {
+            workspace: &self.header.workspace,
+            datasource: &self.header.datasource,
+            read_only: &self.header.read_only,
+            query: &self.header.query,
+            query_state: self.header.query_state,
+            current_model: &self.header.current_model,
+            active_model_available: self.header.active_model_available,
+            context_unavailable: self.header.context_unavailable,
+        }
     }
 
     pub fn sync_slash_palette(&mut self) {
@@ -214,23 +403,15 @@ impl TuiApp {
         }
 
         let was_open = self.transient == Some(TransientView::SlashPalette);
-        let command_has_argument = self
-            .composer
-            .text()
-            .strip_prefix('/')
-            .is_some_and(|command| {
-                command
-                    .split_once(char::is_whitespace)
-                    .is_some_and(|(token, _)| !token.is_empty())
-            });
-        let visible = if command_has_argument {
-            self.slash_palette.clear();
-            false
-        } else {
-            self.slash_palette.update(self.composer.text())
-        };
+        let visible = self.slash_palette.update(self.composer.text());
         if visible && !was_open {
-            self.palette_draft = Some(String::new());
+            let draft = self
+                .composer
+                .text()
+                .find('/')
+                .map(|slash| self.composer.text()[..slash].to_owned())
+                .unwrap_or_default();
+            self.palette_draft = Some(draft);
         } else if !visible {
             self.palette_draft = None;
         }
@@ -243,6 +424,16 @@ impl TuiApp {
                 .set_text(&self.palette_draft.take().unwrap_or_default());
             self.slash_palette.clear();
         }
+        if self.transient == Some(TransientView::ModePicker)
+            && let Some(mut picker) = self.mode_picker.take()
+            && let ModePickerOutcome::Cancelled { mode, composer } =
+                picker.reduce(ModePickerAction::Cancel)
+        {
+            self.query_mode = mode;
+            self.composer.set_text(&composer);
+            self.transient = self.mode_picker_return.take();
+            return;
+        }
         if self.transient == Some(TransientView::ThemePicker) {
             self.preview_theme = None;
         }
@@ -250,9 +441,44 @@ impl TuiApp {
         self.detail = None;
     }
 
+    pub fn open_mode_picker(&mut self) {
+        self.mode_picker_return = self.transient;
+        self.mode_picker = Some(ModePickerState::new(self.query_mode, self.composer.text()));
+        self.transient = Some(TransientView::ModePicker);
+    }
+
+    pub fn push_route(&mut self, route: ContentRoute) {
+        self.navigation.push(route);
+    }
+
+    pub fn pop_route(&mut self) -> Option<ContentRoute> {
+        self.navigation.pop()
+    }
+
     pub fn push_transcript(&mut self, item: TranscriptItem) {
+        match &item {
+            TranscriptItem::UserMessage(_)
+            | TranscriptItem::Answer(_)
+            | TranscriptItem::Clarification { .. } => self.begin_transcript_attempt(),
+            TranscriptItem::Error(message) => {
+                if !self
+                    .transcript_error_fingerprints
+                    .insert(transcript_error_fingerprint(message))
+                {
+                    return;
+                }
+            }
+            TranscriptItem::Warning(_) => {}
+        }
         self.transcript.push(item);
         self.scroll = u16::MAX;
+    }
+
+    /// Start a new user-visible action. Repeated status observations within one action should not
+    /// fill the transcript with the same provider failure, while an explicit retry may show its
+    /// own outcome.
+    pub fn begin_transcript_attempt(&mut self) {
+        self.transcript_error_fingerprints.clear();
     }
 
     pub fn set_runtime_status(&mut self, status: impl Into<String>) {
@@ -280,6 +506,28 @@ impl TuiApp {
     }
 }
 
+fn transcript_error_fingerprint(message: &str) -> String {
+    let stable_code = message
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
+        })
+        .map(|token| token.trim_end_matches('.'))
+        .find(|token| {
+            let Some((namespace, remainder)) = token.split_once('.') else {
+                return false;
+            };
+            !namespace.is_empty()
+                && !remainder.is_empty()
+                && namespace
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase())
+        });
+    stable_code.map_or_else(
+        || format!("message:{message}"),
+        |code| format!("code:{code}"),
+    )
+}
+
 /// Maps typed terminal actions onto the single AgentService boundary.
 pub struct TuiController {
     service: Arc<dyn AgentServiceApi>,
@@ -288,11 +536,43 @@ pub struct TuiController {
     session_id: Option<SessionId>,
     focused_task_id: Option<TaskId>,
     focused_run_id: Option<RunId>,
+    event_sequence_cursor: u64,
     subscription: Option<EventSubscription>,
     pending_command_id: Option<CommandId>,
     pending_submission: Option<JoinHandle<ys_agent_core::CoreResult<SubmissionCompletion>>>,
     provider_screen: Option<ProviderManagementScreen>,
     provider_operations: AsyncOperationRegistry<ProviderOperationPayload>,
+    provider_route_key: Option<RouteKey>,
+    pending_oauth_operation_id: Option<OperationId>,
+    provider_revalidation_pending: bool,
+    provider_activation_candidate: Option<ys_agent_core::ModelCandidateKey>,
+    provider_expected_activation_revision: Option<u64>,
+    display_context_guard: AsyncResultGuard,
+    display_context_tasks: JoinSet<(
+        AsyncOperationTicket,
+        ys_agent_core::CoreResult<TuiDisplayContext>,
+    )>,
+    doctor_refresh_tasks: JoinSet<ys_agent_core::CoreResult<DoctorReport>>,
+    display_context_refresh_counts: [usize; 5],
+    artifact_guard: AsyncResultGuard,
+    artifact_tasks: JoinSet<(
+        AsyncOperationTicket,
+        ys_agent_core::CoreResult<ArtifactReadPayload>,
+    )>,
+    artifact_result_id: Option<ArtifactId>,
+    model_selection_checkpoint: Option<(ModelSelectionState, String)>,
+    model_catalog_guard: AsyncResultGuard,
+    model_catalog_tasks: JoinSet<(
+        AsyncOperationTicket,
+        ModelCatalogRequestKind,
+        ys_agent_core::ProviderResult<ModelCatalogPayload>,
+    )>,
+    model_switch_guard: AsyncResultGuard,
+    model_switch_tasks: JoinSet<(
+        AsyncOperationTicket,
+        ys_agent_core::CoreResult<ActiveProviderView>,
+    )>,
+    model_switch_cancel_requested: Option<OperationId>,
 }
 
 pub(super) enum SubmissionCompletion {
@@ -303,14 +583,58 @@ pub(super) enum SubmissionCompletion {
     ClarificationAnswered,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TimelineEventOutcome {
+    Applied,
+    Duplicate,
+    Gap,
+    Ignored,
+}
+
+pub(super) enum ArtifactReadPayload {
+    Projection {
+        result_id: Option<ArtifactId>,
+        projection: ArtifactWorkspaceProjection,
+    },
+    Viewport(ResultsViewportPage),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCatalogRequestKind {
+    InitialSnapshot,
+    RefreshSnapshot,
+    Candidates,
+}
+
+enum ModelCatalogPayload {
+    Snapshot(ys_agent_core::ModelSelectionSnapshot),
+    Candidates(ys_agent_core::ModelCandidateBatch),
+}
+
 pub(super) enum ProviderOperationPayload {
     Discovery(Vec<ys_agent_core::DiscoveredModel>),
     Saved {
-        browse: ProviderManagementView,
+        browse: Option<ProviderManagementView>,
         profile_id: ProfileId,
         resume_step: ProviderManagementStep,
     },
-    Committed(ProviderManagementView),
+    SaveFailedAfterDraft {
+        browse: Option<ProviderManagementView>,
+        profile_id: ProfileId,
+        error: ProviderManagementError,
+    },
+    Validated {
+        browse: ProviderManagementView,
+        candidate: ys_agent_core::ModelCandidateKey,
+    },
+    Activated(ActiveProviderView),
+    OAuthStarted {
+        browse: Option<ProviderManagementView>,
+        authorization: DeviceAuthorizationView,
+    },
+    OAuthCompleted {
+        browse: Option<ProviderManagementView>,
+    },
 }
 
 impl TuiController {
@@ -326,6 +650,7 @@ impl TuiController {
             session_id: None,
             focused_task_id: None,
             focused_run_id: None,
+            event_sequence_cursor: 0,
             subscription: None,
             pending_command_id: None,
             pending_submission: None,
@@ -334,7 +659,207 @@ impl TuiController {
                 ProviderOperationPolicy::new(Duration::from_secs(30), 2)
                     .expect("fixed Provider operation policy is valid"),
             ),
+            provider_route_key: None,
+            pending_oauth_operation_id: None,
+            provider_revalidation_pending: false,
+            provider_activation_candidate: None,
+            provider_expected_activation_revision: None,
+            display_context_guard: AsyncResultGuard::default(),
+            display_context_tasks: JoinSet::new(),
+            doctor_refresh_tasks: JoinSet::new(),
+            display_context_refresh_counts: [0; 5],
+            artifact_guard: AsyncResultGuard::default(),
+            artifact_tasks: JoinSet::new(),
+            artifact_result_id: None,
+            model_selection_checkpoint: None,
+            model_catalog_guard: AsyncResultGuard::default(),
+            model_catalog_tasks: JoinSet::new(),
+            model_switch_guard: AsyncResultGuard::default(),
+            model_switch_tasks: JoinSet::new(),
+            model_switch_cancel_requested: None,
         }
+    }
+
+    /// Refreshes the authoritative header snapshot in the background. A newer request supersedes
+    /// an older one, and route admission prevents a late completion from mutating another view.
+    pub fn request_display_context_refresh(
+        &mut self,
+        app: &TuiApp,
+        trigger: DisplayContextRefreshTrigger,
+    ) {
+        self.display_context_refresh_counts[trigger.index()] += 1;
+        let ticket = self
+            .display_context_guard
+            .start(AsyncChannel::DisplayContext, app.navigation.route_key())
+            .expect("Display Context is a replaceable read lane");
+        let service = self.service.clone();
+        self.display_context_tasks.spawn(async move {
+            let result = service.tui_display_context().await;
+            (ticket, result)
+        });
+    }
+
+    /// Applies every ready refresh whose operation and route are still current. Failures preserve
+    /// the last known-good values and expose only the typed unavailable marker.
+    pub fn apply_ready_display_context(&mut self, app: &mut TuiApp) -> bool {
+        let mut applied = false;
+        while let Some(completion) = self.display_context_tasks.try_join_next() {
+            let Ok((ticket, result)) = completion else {
+                continue;
+            };
+            if !self
+                .display_context_guard
+                .accept_completion(ticket, app.navigation.route_key())
+            {
+                continue;
+            }
+            match result {
+                Ok(context) => app.apply_display_context(context),
+                Err(_) => app.mark_display_context_unavailable(),
+            }
+            applied = true;
+        }
+        applied
+    }
+
+    pub fn display_context_refresh_count(&self, trigger: DisplayContextRefreshTrigger) -> usize {
+        self.display_context_refresh_counts[trigger.index()]
+    }
+
+    #[cfg(test)]
+    pub(super) const fn event_sequence_cursor(&self) -> u64 {
+        self.event_sequence_cursor
+    }
+
+    pub(super) fn reset_event_subscription(&mut self) {
+        self.subscription = None;
+    }
+
+    pub(super) fn request_open_artifact(
+        &mut self,
+        app: &mut TuiApp,
+    ) -> ys_agent_core::CoreResult<bool> {
+        if app.navigation.current() != ContentRoute::Timeline
+            || app.timeline_state.focus != FocusTarget::TimelineResultCard
+            || app.timeline_state.view().result_card.is_none()
+        {
+            return Ok(false);
+        }
+        let query_id = app.primary_artifact_id.ok_or_else(|| {
+            ys_agent_core::CoreError::validation(
+                "primary_artifact_missing",
+                "The focused result card has no persisted Query Artifact",
+            )
+        })?;
+        app.push_route(ContentRoute::Artifact);
+        app.artifact_workspace = ArtifactWorkspaceState::default();
+        app.scroll = 0;
+        self.artifact_result_id = None;
+        let request = app.artifact_workspace.results().request();
+        let source_display_name = app.header.datasource.clone();
+        let access = self.access(ArtifactAccessPurpose::TuiPreview);
+        let ticket = self
+            .artifact_guard
+            .start(AsyncChannel::Artifact, app.navigation.route_key())
+            .expect("Artifact is a replaceable read lane");
+        let service = self.service.clone();
+        self.artifact_tasks.spawn(async move {
+            let result = load_artifact_projection(
+                service.as_ref(),
+                query_id,
+                access,
+                &source_display_name,
+                request,
+            )
+            .await;
+            (ticket, result)
+        });
+        Ok(true)
+    }
+
+    pub(super) fn apply_ready_artifact(&mut self, app: &mut TuiApp) -> bool {
+        let mut applied = false;
+        while let Some(completion) = self.artifact_tasks.try_join_next() {
+            let Ok((ticket, result)) = completion else {
+                continue;
+            };
+            if !self
+                .artifact_guard
+                .accept_completion(ticket, app.navigation.route_key())
+            {
+                continue;
+            }
+            match result {
+                Ok(ArtifactReadPayload::Projection {
+                    result_id,
+                    projection,
+                }) => {
+                    self.artifact_result_id = result_id;
+                    app.artifact_workspace
+                        .reduce(ArtifactAction::ProjectionLoaded(projection));
+                }
+                Ok(ArtifactReadPayload::Viewport(page)) => {
+                    app.artifact_workspace
+                        .reduce(ArtifactAction::ViewportLoaded(page));
+                }
+                Err(error) => {
+                    app.safe_warning = Some(error.code().to_owned());
+                    app.artifact_workspace
+                        .reduce(ArtifactAction::ProjectionLoaded(
+                            ArtifactWorkspaceProjection::unavailable(
+                                ArtifactUnavailableReason::StatusUnavailable,
+                            ),
+                        ));
+                }
+            }
+            applied = true;
+        }
+        applied
+    }
+
+    pub(super) fn apply_artifact_action(
+        &mut self,
+        app: &mut TuiApp,
+        action: ArtifactAction,
+    ) -> ArtifactOutcome {
+        let outcome = app.artifact_workspace.reduce(action);
+        match outcome {
+            ArtifactOutcome::ViewportRequested(request) => {
+                self.request_artifact_viewport(app, request);
+            }
+            ArtifactOutcome::Close => self.close_artifact(app),
+            ArtifactOutcome::Changed | ArtifactOutcome::Ignored => {}
+        }
+        outcome
+    }
+
+    fn request_artifact_viewport(&mut self, app: &TuiApp, request: ResultsViewportRequest) {
+        let Some(result_id) = self.artifact_result_id else {
+            return;
+        };
+        let access = self.access(ArtifactAccessPurpose::TuiPreview);
+        let ticket = self
+            .artifact_guard
+            .start(AsyncChannel::Artifact, app.navigation.route_key())
+            .expect("Artifact is a replaceable read lane");
+        let service = self.service.clone();
+        self.artifact_tasks.spawn(async move {
+            let result = service
+                .query_result_preview(&result_id, access)
+                .await
+                .map(|preview| {
+                    ArtifactReadPayload::Viewport(project_results_viewport(
+                        AuthorizedResultsPreview::from(&preview),
+                        request,
+                    ))
+                });
+            (ticket, result)
+        });
+    }
+
+    fn close_artifact(&mut self, app: &mut TuiApp) {
+        let _ = app.pop_route();
+        self.artifact_result_id = None;
     }
 
     pub fn submission_in_flight(&self) -> bool {
@@ -349,13 +874,30 @@ impl TuiController {
     /// and receives only its committed result; all data access remains behind `AgentServiceApi`.
     pub fn start_provider_operation(
         &mut self,
+        app: &mut TuiApp,
         kind: ProviderOperationKind,
     ) -> ys_agent_core::CoreResult<OperationId> {
+        if kind != ProviderOperationKind::Activate {
+            self.provider_activation_candidate = None;
+        }
+        let oauth_completion_id = (kind == ProviderOperationKind::OAuth)
+            .then_some(self.pending_oauth_operation_id)
+            .flatten();
+        let completes_oauth = oauth_completion_id.is_some();
+        let activation_candidate = (kind == ProviderOperationKind::Activate)
+            .then(|| self.provider_activation_candidate.clone())
+            .flatten();
+        if kind == ProviderOperationKind::Activate && activation_candidate.is_none() {
+            return Err(ys_agent_core::CoreError::validation(
+                "provider_activation_not_ready",
+                "Validate the selected model before activation",
+            ));
+        }
         let (command, secret, resume_step) = {
             let screen = self.provider_screen.as_mut().ok_or_else(|| {
                 ys_agent_core::CoreError::validation(
                     "provider_screen_not_open",
-                    "Open /providers before starting a Provider operation",
+                    "Open Provider setup before starting a Provider operation",
                 )
             })?;
             let command = screen.edit_command().ok_or_else(|| {
@@ -367,6 +909,22 @@ impl TuiController {
             let secret = (kind == ProviderOperationKind::SaveDraft)
                 .then(|| screen.take_secret_input())
                 .flatten();
+            let has_saved_credential = command.profile_id.is_some_and(|profile_id| {
+                screen.view().browse.profiles.iter().any(|profile| {
+                    profile.profile_id == profile_id
+                        && profile.credential_status == ys_agent_core::CredentialViewStatus::Saved
+                })
+            });
+            if kind == ProviderOperationKind::SaveDraft
+                && command.authentication == ProviderAuthentication::ApiKey
+                && secret.is_none()
+                && !has_saved_credential
+            {
+                return Err(ys_agent_core::CoreError::validation(
+                    "provider.credential_missing",
+                    "Enter an API key before continuing",
+                ));
+            }
             (command, secret, screen.view().step)
         };
         let profile_id = command.profile_id;
@@ -383,92 +941,169 @@ impl TuiController {
             )
         })?;
         let service = self.service.clone();
+        let expected_activation_revision = self.provider_expected_activation_revision;
         let mut secret = secret;
-        let operation_id = self
-            .provider_operations
-            .start(kind, move |operation_id, _| {
-                let service = service.clone();
-                let command = command.clone();
-                let secret = secret.take();
-                async move {
-                    let payload = match kind {
-                        ProviderOperationKind::DiscoverModels => {
-                            let profile_id =
-                                profile_id.expect("non-save operations require a Profile");
-                            let detail = service.provider_load_profile(profile_id).await?;
-                            let generation = detail.credential_generation.ok_or_else(|| {
-                                ys_agent_core::ProviderManagementError::new(
-                                    ys_agent_core::ProviderErrorCode::CredentialMissing,
-                                    Some(ys_agent_core::ProviderField::Credential),
-                                    ys_agent_core::ProviderRemediation::ConfigureCredentialStore,
-                                )
-                            })?;
-                            let models = service
-                                .provider_discover_models(ys_agent_core::DiscoverModelsRequest {
-                                    operation_id,
-                                    profile_id,
-                                    profile_revision: detail.revision,
-                                    provider: command.provider,
-                                    credential_generation: generation,
-                                })
-                                .await?;
-                            ProviderOperationPayload::Discovery(models)
-                        }
-                        ProviderOperationKind::Validate => {
-                            let profile_id =
-                                profile_id.expect("non-save operations require a Profile");
-                            let detail = service.provider_load_profile(profile_id).await?;
-                            service
-                                .provider_validate(ys_agent_core::ValidateProfileRequest {
-                                    operation_id,
-                                    profile_id,
-                                    revision: detail.revision,
-                                    observed_context_limit: command.observed_context_limit,
-                                })
-                                .await?;
-                            ProviderOperationPayload::Committed(
-                                load_provider_management_view(service.as_ref()).await?,
+        let route_key = self.provider_route_key.ok_or_else(|| {
+            ys_agent_core::CoreError::validation(
+                "provider_route_not_open",
+                "Open Provider setup before starting a Provider operation",
+            )
+        })?;
+        let operation = move |operation_id, _| {
+            let service = service.clone();
+            let command = command.clone();
+            let secret = secret.take();
+            let activation_candidate = activation_candidate.clone();
+            async move {
+                let payload = match kind {
+                    ProviderOperationKind::DiscoverModels => {
+                        let profile_id = profile_id.expect("non-save operations require a Profile");
+                        let detail = service.provider_load_profile(profile_id).await?;
+                        let generation = detail.credential_generation.ok_or_else(|| {
+                            ys_agent_core::ProviderManagementError::new(
+                                ys_agent_core::ProviderErrorCode::CredentialMissing,
+                                Some(ys_agent_core::ProviderField::Credential),
+                                ys_agent_core::ProviderRemediation::ConfigureCredentialStore,
                             )
+                        })?;
+                        let models = service
+                            .provider_discover_models(ys_agent_core::DiscoverModelsRequest {
+                                operation_id,
+                                profile_id,
+                                profile_revision: detail.revision,
+                                provider: command.provider,
+                                credential_generation: generation,
+                            })
+                            .await?;
+                        ProviderOperationPayload::Discovery(models)
+                    }
+                    ProviderOperationKind::Validate => {
+                        let profile_id = profile_id.expect("non-save operations require a Profile");
+                        let detail = service.provider_load_profile(profile_id).await?;
+                        let selected_model = command
+                            .model
+                            .clone()
+                            .expect("validation requires a selected model");
+                        if detail.model != selected_model {
+                            return Err(ProviderManagementError::new(
+                                ProviderErrorCode::OperationStale,
+                                Some(ProviderField::Model),
+                                ProviderRemediation::ReturnToEdit,
+                            ));
                         }
-                        ProviderOperationKind::Activate => {
-                            let profile_id =
-                                profile_id.expect("non-save operations require a Profile");
-                            service
-                                .provider_activate_current(profile_id, operation_id)
-                                .await?;
-                            ProviderOperationPayload::Committed(
-                                load_provider_management_view(service.as_ref()).await?,
+                        let validated_revision = detail.revision;
+                        let validation = service
+                            .provider_validate(ys_agent_core::ValidateProfileRequest {
+                                operation_id,
+                                profile_id,
+                                revision: detail.revision,
+                                observed_context_limit: command.observed_context_limit,
+                            })
+                            .await?;
+                        if validation.state != ys_agent_core::ProfileState::Ready {
+                            return Err(provider_edit_error(
+                                ProviderErrorCode::ValidationStale,
+                                ProviderField::Validation,
+                            ));
+                        }
+                        let detail = service.provider_load_profile(profile_id).await?;
+                        ensure_validated_revision_is_current(
+                            validated_revision,
+                            &selected_model,
+                            detail.revision,
+                            &detail.model,
+                        )?;
+                        let candidate = ys_agent_core::ModelCandidateKey::new(
+                            profile_id,
+                            detail.revision,
+                            expected_activation_revision,
+                            detail.summary.provider,
+                            detail.model,
+                        )
+                        .map_err(|_| {
+                            provider_edit_error(
+                                ProviderErrorCode::Internal,
+                                ProviderField::Validation,
                             )
+                        })?;
+                        ProviderOperationPayload::Validated {
+                            browse: load_provider_management_view(service.as_ref()).await?,
+                            candidate,
                         }
-                        ProviderOperationKind::OAuth => {
-                            let profile_id =
-                                profile_id.expect("non-save operations require a Profile");
-                            service
+                    }
+                    ProviderOperationKind::Activate => {
+                        let active = service
+                            .provider_switch_model(SwitchModelRequest::new(
+                                operation_id,
+                                activation_candidate
+                                    .expect("activation requires a validated candidate"),
+                            ))
+                            .await?;
+                        ProviderOperationPayload::Activated(active)
+                    }
+                    ProviderOperationKind::OAuth => {
+                        let profile_id = profile_id.expect("non-save operations require a Profile");
+                        if completes_oauth {
+                            service.provider_complete_oauth(operation_id).await?;
+                            ProviderOperationPayload::OAuthCompleted {
+                                browse: load_provider_management_view(service.as_ref()).await.ok(),
+                            }
+                        } else {
+                            let authorization = service
                                 .provider_start_oauth(profile_id, operation_id)
                                 .await?;
-                            ProviderOperationPayload::Committed(
-                                load_provider_management_view(service.as_ref()).await?,
-                            )
-                        }
-                        ProviderOperationKind::SaveDraft => {
-                            let detail = save_provider_draft(
-                                service.as_ref(),
-                                command,
-                                secret,
-                                operation_id,
-                                resume_step,
-                            )
-                            .await?;
-                            ProviderOperationPayload::Saved {
-                                browse: load_provider_management_view(service.as_ref()).await?,
-                                profile_id: detail.summary.profile_id,
-                                resume_step,
+                            ProviderOperationPayload::OAuthStarted {
+                                browse: load_provider_management_view(service.as_ref()).await.ok(),
+                                authorization,
                             }
                         }
-                    };
-                    Ok(payload)
-                }
-            });
+                    }
+                    ProviderOperationKind::SaveDraft => {
+                        let outcome = save_provider_draft(
+                            service.as_ref(),
+                            command,
+                            secret,
+                            operation_id,
+                            resume_step,
+                        )
+                        .await?;
+                        let browse = load_provider_management_view(service.as_ref()).await.ok();
+                        match outcome {
+                            SaveProviderDraftOutcome::Saved(detail) => {
+                                ProviderOperationPayload::Saved {
+                                    browse,
+                                    profile_id: detail.summary.profile_id,
+                                    resume_step,
+                                }
+                            }
+                            SaveProviderDraftOutcome::CredentialFailed { profile_id, error } => {
+                                ProviderOperationPayload::SaveFailedAfterDraft {
+                                    browse,
+                                    profile_id,
+                                    error,
+                                }
+                            }
+                        }
+                    }
+                };
+                Ok(payload)
+            }
+        };
+        let scheduled = match oauth_completion_id {
+            Some(operation_id) => {
+                self.provider_operations
+                    .resume_on_route(operation_id, kind, route_key, operation)
+            }
+            None => self
+                .provider_operations
+                .start_on_route(kind, route_key, operation),
+        };
+        let operation_id = scheduled.map_err(|_| {
+            ys_agent_core::CoreError::validation(
+                "provider_operation_in_flight",
+                "Wait for or cancel the active Provider operation",
+            )
+        })?;
         let screen = self
             .provider_screen
             .as_mut()
@@ -480,6 +1115,8 @@ impl TuiController {
                 "The current Provider screen state does not allow this operation",
             ));
         }
+        app.begin_transcript_attempt();
+        refresh_provider_detail(app, screen);
         Ok(operation_id)
     }
 
@@ -489,6 +1126,18 @@ impl TuiController {
         };
         let advanced = screen.next_step();
         if advanced {
+            let view = screen.view();
+            if view.step == Some(ProviderManagementStep::Authentication)
+                && let Some(provider) = view.edit.and_then(|edit| edit.provider)
+                && let Some(authentication) = view
+                    .browse
+                    .catalog
+                    .iter()
+                    .find(|entry| entry.provider == provider)
+                    .map(|entry| ProviderAuthentication::from(entry.credential_kind))
+            {
+                let _ = screen.select_authentication(authentication);
+            }
             refresh_provider_detail(app, screen);
         }
         advanced
@@ -527,21 +1176,6 @@ impl TuiController {
         selected
     }
 
-    pub(super) fn select_provider_authentication(
-        &mut self,
-        app: &mut TuiApp,
-        authentication: super::provider_management::ProviderAuthentication,
-    ) -> bool {
-        let Some(screen) = self.provider_screen.as_mut() else {
-            return false;
-        };
-        let selected = screen.select_authentication(authentication);
-        if selected {
-            refresh_provider_detail(app, screen);
-        }
-        selected
-    }
-
     pub(super) fn append_provider_text(&mut self, app: &mut TuiApp, character: char) -> bool {
         let Some(screen) = self.provider_screen.as_mut() else {
             return false;
@@ -550,9 +1184,20 @@ impl TuiController {
             Some(ProviderManagementStep::Authentication) => {
                 screen.append_secret_character(character)
             }
-            Some(ProviderManagementStep::Model) => screen.append_manual_model_character(character),
+            Some(ProviderManagementStep::Model) => screen.append_model_filter_character(character),
             _ => false,
         };
+        if changed {
+            refresh_provider_detail(app, screen);
+        }
+        changed
+    }
+
+    pub(super) fn append_provider_secret_paste(&mut self, app: &mut TuiApp, value: String) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let changed = screen.append_secret_text(value);
         if changed {
             refresh_provider_detail(app, screen);
         }
@@ -565,7 +1210,7 @@ impl TuiController {
         };
         let changed = match screen.view().step {
             Some(ProviderManagementStep::Authentication) => screen.delete_secret_character(),
-            Some(ProviderManagementStep::Model) => screen.delete_manual_model_character(),
+            Some(ProviderManagementStep::Model) => screen.delete_model_filter_character(),
             _ => false,
         };
         if changed {
@@ -574,11 +1219,73 @@ impl TuiController {
         changed
     }
 
-    pub fn request_provider_activation(&mut self) -> ys_agent_core::CoreResult<OperationId> {
+    pub(super) fn append_provider_model_filter_paste(
+        &mut self,
+        app: &mut TuiApp,
+        value: &str,
+    ) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let changed = screen.append_model_filter_text(value);
+        if changed {
+            refresh_provider_detail(app, screen);
+        }
+        changed
+    }
+
+    pub(super) fn clear_provider_model_filter(&mut self, app: &mut TuiApp) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let changed = screen.clear_model_filter();
+        if changed {
+            refresh_provider_detail(app, screen);
+        }
+        changed
+    }
+
+    pub(super) fn move_provider_model(&mut self, app: &mut TuiApp, delta: isize) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let changed = screen.move_discovered_model(delta);
+        if changed {
+            refresh_provider_detail(app, screen);
+        }
+        changed
+    }
+
+    pub(super) fn move_provider_model_page(&mut self, app: &mut TuiApp, direction: isize) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let changed = screen.move_discovered_model_page(direction);
+        if changed {
+            refresh_provider_detail(app, screen);
+        }
+        changed
+    }
+
+    pub(super) fn select_highlighted_provider_model(&mut self, app: &mut TuiApp) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let selected = screen.select_highlighted_model();
+        if selected {
+            refresh_provider_detail(app, screen);
+        }
+        selected
+    }
+
+    pub fn request_provider_activation(
+        &mut self,
+        app: &mut TuiApp,
+    ) -> ys_agent_core::CoreResult<OperationId> {
         let screen = self.provider_screen.as_mut().ok_or_else(|| {
             ys_agent_core::CoreError::validation(
                 "provider_screen_not_open",
-                "Open /providers before activating a Provider",
+                "Open Provider setup before activating a Provider",
             )
         })?;
         if !screen.request_activation() || screen.confirm_activation().is_none() {
@@ -587,10 +1294,13 @@ impl TuiController {
                 "Validate the current Provider revision before activation",
             ));
         }
-        self.start_provider_operation(ProviderOperationKind::Activate)
+        self.start_provider_operation(app, ProviderOperationKind::Activate)
     }
 
-    pub fn retry_provider_operation(&mut self) -> ys_agent_core::CoreResult<Option<OperationId>> {
+    pub fn retry_provider_operation(
+        &mut self,
+        app: &mut TuiApp,
+    ) -> ys_agent_core::CoreResult<Option<OperationId>> {
         let Some(screen) = self.provider_screen.as_mut() else {
             return Ok(None);
         };
@@ -598,7 +1308,18 @@ impl TuiController {
             return Ok(None);
         };
         let super::provider_management::ProviderScreenRequest::Operation(kind) = request;
-        self.start_provider_operation(kind).map(Some)
+        self.start_provider_operation(app, kind).map(Some)
+    }
+
+    pub(super) fn return_provider_result_to_edit(&mut self, app: &mut TuiApp) -> bool {
+        let Some(screen) = self.provider_screen.as_mut() else {
+            return false;
+        };
+        let changed = screen.return_to_edit();
+        if changed {
+            refresh_provider_detail(app, screen);
+        }
+        changed
     }
 
     pub(super) fn take_ready_provider_operation(
@@ -612,12 +1333,44 @@ impl TuiController {
         app: &mut TuiApp,
         completion: ProviderOperationCompletion<ProviderOperationPayload>,
     ) {
+        if app.navigation.route_key() != completion.route_key
+            || self.provider_route_key != Some(completion.route_key)
+        {
+            return;
+        }
+        let operation_kind = completion.kind;
         let Some(screen) = self.provider_screen.as_mut() else {
             return;
         };
+        let mut followup = None;
+        let mut refresh_doctor = false;
+        let mut activated = None;
         match completion.result {
             Ok(ProviderOperationPayload::Discovery(models)) => {
-                let _ = screen.complete_discovery(completion.operation_id, models);
+                let revalidation_model = self.provider_revalidation_pending.then(|| {
+                    screen
+                        .view()
+                        .edit
+                        .and_then(|edit| edit.model)
+                        .expect("revalidation starts from a saved model")
+                });
+                let completed = screen.complete_discovery(completion.operation_id, models);
+                if completed && self.provider_revalidation_pending {
+                    self.provider_revalidation_pending = false;
+                    let exact_model_available = revalidation_model
+                        .as_ref()
+                        .is_some_and(|model| screen.selected_discovered_model_matches(model));
+                    if exact_model_available {
+                        let _ = screen.next_step();
+                        let _ = screen.next_step();
+                        followup = Some(ProviderOperationKind::Validate);
+                        app.set_runtime_status("Revalidating selected model…");
+                    } else {
+                        app.set_runtime_status(
+                            "Saved model is no longer available · choose another model",
+                        );
+                    }
+                }
             }
             Ok(ProviderOperationPayload::Saved {
                 browse,
@@ -626,15 +1379,107 @@ impl TuiController {
             }) => {
                 let _ =
                     screen.complete_saved_draft(completion.operation_id, profile_id, resume_step);
-                screen.replace_browse(browse);
-                app.set_runtime_status("Provider Draft saved; run Validate before activation");
+                if let Some(browse) = browse {
+                    screen.replace_browse(browse);
+                }
+                match (
+                    resume_step,
+                    screen.view().edit.and_then(|edit| edit.authentication),
+                ) {
+                    (
+                        ProviderManagementStep::Authentication,
+                        Some(ProviderAuthentication::ApiKey),
+                    ) => {
+                        let _ = screen.next_step();
+                        followup = Some(ProviderOperationKind::DiscoverModels);
+                        app.set_runtime_status("API key saved · loading models…");
+                    }
+                    (
+                        ProviderManagementStep::Authentication,
+                        Some(ProviderAuthentication::OAuth),
+                    ) => {
+                        followup = Some(ProviderOperationKind::OAuth);
+                        app.set_runtime_status("Opening ChatGPT sign-in…");
+                    }
+                    (ProviderManagementStep::Validate, _) => {
+                        followup = Some(ProviderOperationKind::Validate);
+                        app.set_runtime_status("Validating selected model…");
+                    }
+                    (ProviderManagementStep::Model, _) => {
+                        let _ = screen.next_step();
+                        let _ = screen.next_step();
+                        followup = Some(ProviderOperationKind::Validate);
+                        app.set_runtime_status("Validating selected model…");
+                    }
+                    _ => app.set_runtime_status("Provider settings saved"),
+                }
             }
-            Ok(ProviderOperationPayload::Committed(browse)) => {
+            Ok(ProviderOperationPayload::SaveFailedAfterDraft {
+                browse,
+                profile_id,
+                error,
+            }) => {
+                let _ = screen.complete_partially_saved_draft(
+                    completion.operation_id,
+                    profile_id,
+                    error,
+                );
+                if let Some(browse) = browse {
+                    screen.replace_browse(browse);
+                }
+            }
+            Ok(ProviderOperationPayload::Validated { browse, candidate }) => {
                 let _ = screen
                     .complete_operation(completion.operation_id, ProviderResultOutcome::Succeeded);
                 screen.replace_browse(browse);
+                self.provider_activation_candidate = Some(candidate);
+                let _ = screen.request_activation();
+                followup = Some(ProviderOperationKind::Activate);
+                app.set_runtime_status("Activating model…");
+            }
+            Ok(ProviderOperationPayload::Activated(active)) => {
+                self.provider_activation_candidate = None;
+                let _ = screen
+                    .complete_operation(completion.operation_id, ProviderResultOutcome::Succeeded);
+                screen.apply_active_provider(active.clone());
+                app.apply_active_provider_view(Some(&active));
+                app.set_runtime_status("Model ready for chat");
+                refresh_doctor = true;
+                activated = Some(active);
+            }
+            Ok(ProviderOperationPayload::OAuthStarted {
+                browse,
+                authorization,
+            }) => {
+                let _ = screen
+                    .complete_operation(completion.operation_id, ProviderResultOutcome::Succeeded);
+                let _ = screen.return_to_edit();
+                if let Some(browse) = browse {
+                    screen.replace_browse(browse);
+                }
+                screen.set_oauth_authorization(Some(authorization));
+                self.pending_oauth_operation_id = Some(completion.operation_id);
+                app.set_runtime_status("Complete ChatGPT sign-in in the browser");
+                followup = Some(ProviderOperationKind::OAuth);
+            }
+            Ok(ProviderOperationPayload::OAuthCompleted { browse }) => {
+                let _ = screen
+                    .complete_operation(completion.operation_id, ProviderResultOutcome::Succeeded);
+                if let Some(browse) = browse {
+                    screen.replace_browse(browse);
+                }
+                self.pending_oauth_operation_id = None;
+                screen.set_oauth_authorization(None);
+                let _ = screen.return_to_edit();
+                let _ = screen.next_step();
+                followup = Some(ProviderOperationKind::DiscoverModels);
+                app.set_runtime_status("ChatGPT sign-in connected · loading models…");
             }
             Err(error) => {
+                if operation_kind == ProviderOperationKind::OAuth {
+                    self.pending_oauth_operation_id = None;
+                    screen.set_oauth_authorization(None);
+                }
                 let _ = screen.complete_operation(
                     completion.operation_id,
                     ProviderResultOutcome::Failed(error),
@@ -642,18 +1487,107 @@ impl TuiController {
             }
         }
         refresh_provider_detail(app, screen);
+        if refresh_doctor {
+            self.request_doctor_refresh();
+        }
+        if let Some(active) = activated.as_ref() {
+            self.finish_provider_setup_after_activation(app, active);
+        }
+        if let Some(kind) = followup
+            && let Err(error) = self.start_provider_operation(app, kind)
+        {
+            app.push_transcript(TranscriptItem::Error(format!(
+                "Provider setup could not continue · {}",
+                error.code()
+            )));
+        }
     }
 
     pub async fn cancel_provider_operation(&mut self, app: &mut TuiApp) {
         let Some(screen) = self.provider_screen.as_mut() else {
             return;
         };
+        if screen.view().busy.is_some_and(|busy| {
+            matches!(
+                busy.kind,
+                ProviderOperationKind::Activate | ProviderOperationKind::SaveDraft
+            )
+        }) {
+            app.set_runtime_status("Saving or activating model…");
+            return;
+        }
         let Some(operation_id) = screen.cancel_busy() else {
             return;
         };
+        if self.pending_oauth_operation_id == Some(operation_id) {
+            self.pending_oauth_operation_id = None;
+            screen.set_oauth_authorization(None);
+        }
         let _ = self.provider_operations.cancel(operation_id);
         let _ = self.service.cancel_provider_operation(operation_id).await;
         refresh_provider_detail(app, screen);
+    }
+
+    fn request_doctor_refresh(&mut self) {
+        let service = self.service.clone();
+        self.doctor_refresh_tasks
+            .spawn(async move { service.doctor().await });
+    }
+
+    pub(super) fn apply_ready_doctor_refresh(&mut self, app: &mut TuiApp) -> bool {
+        let mut applied = false;
+        while let Some(completion) = self.doctor_refresh_tasks.try_join_next() {
+            match completion {
+                Ok(Ok(report)) => {
+                    app.doctor_report = Some(report);
+                    app.safe_warning = None;
+                }
+                Ok(Err(error)) => app.safe_warning = Some(error.code().to_owned()),
+                Err(_) => app.safe_warning = Some("doctor.status_unavailable".to_owned()),
+            }
+            applied = true;
+        }
+        applied
+    }
+
+    pub async fn close_provider_management(&mut self, app: &mut TuiApp) {
+        if let Some(operation_id) = self.pending_oauth_operation_id.take() {
+            let _ = self.service.cancel_provider_operation(operation_id).await;
+        }
+        self.provider_revalidation_pending = false;
+        self.provider_activation_candidate = None;
+        self.provider_expected_activation_revision = None;
+        app.close_transient();
+        let _ = app.pop_route();
+        self.provider_route_key = None;
+        if let Some((mut state, composer)) = self.model_selection_checkpoint.take() {
+            if let Ok(snapshot) = self.service.provider_model_selection_snapshot().await {
+                state.refresh_snapshot(snapshot);
+            }
+            app.model_selection_state = state;
+            app.composer.set_text(&composer);
+        }
+    }
+
+    fn finish_provider_setup_after_activation(
+        &mut self,
+        app: &mut TuiApp,
+        active: &ActiveProviderView,
+    ) {
+        let Some((mut state, composer)) = self.model_selection_checkpoint.take() else {
+            return;
+        };
+        state.apply_active_provider(active);
+        app.close_transient();
+        let _ = app.pop_route();
+        app.model_selection_state = state;
+        app.composer.set_text(&composer);
+        self.provider_screen = None;
+        self.provider_route_key = None;
+        self.provider_revalidation_pending = false;
+        self.provider_activation_candidate = None;
+        self.provider_expected_activation_revision = None;
+        self.request_model_selection_snapshot(app, ModelCatalogRequestKind::RefreshSnapshot);
     }
 
     pub(super) async fn take_ready_submission(
@@ -775,7 +1709,8 @@ impl TuiController {
                 },
             ),
             InputAction::Providers => self.open_provider_management(app, false).await?,
-            InputAction::Model => self.open_provider_management(app, true).await?,
+            InputAction::Mode => app.open_mode_picker(),
+            InputAction::Model => self.open_model_selection(app).await?,
             InputAction::Doctor => {
                 let report = self.service.doctor().await?;
                 app.transient =
@@ -819,11 +1754,13 @@ impl TuiController {
         self.session_id = Some(session.id);
         self.focused_task_id = None;
         self.focused_run_id = None;
+        self.event_sequence_cursor = 0;
         self.subscription = None;
         app.focused_task = None;
         app.transcript.clear();
         app.primary_artifact_id = None;
         app.rendered_answer_artifact_id = None;
+        app.timeline_state = TimelineState::default();
         app.runtime_status = None;
         app.detail = None;
         app.transient = None;
@@ -882,6 +1819,8 @@ impl TuiController {
                 .map_err(provider_to_core)?;
             profiles.push(ProviderProfileView::from_detail(detail, None));
         }
+        self.provider_expected_activation_revision =
+            active.as_ref().map(|active| active.activation_revision);
         let browse = ProviderManagementView::new(catalog, profiles, active, false);
         let mut screen = ProviderManagementScreen::new(browse);
         if open_model_step {
@@ -905,6 +1844,12 @@ impl TuiController {
             }
         }
         let view = screen.view();
+        app.push_route(if open_model_step {
+            ContentRoute::ModelSelection
+        } else {
+            ContentRoute::ProviderManagement
+        });
+        self.provider_route_key = Some(app.navigation.route_key());
         app.show_detail(
             DetailKind::Providers,
             DetailView {
@@ -914,6 +1859,369 @@ impl TuiController {
         );
         self.provider_screen = Some(screen);
         Ok(())
+    }
+
+    async fn open_model_selection(&mut self, app: &mut TuiApp) -> ys_agent_core::CoreResult<()> {
+        app.model_selection_state = ModelSelectionState::default();
+        app.push_route(ContentRoute::ModelSelection);
+        app.transient = None;
+        self.request_model_selection_snapshot(app, ModelCatalogRequestKind::InitialSnapshot);
+        Ok(())
+    }
+
+    pub(super) async fn apply_model_selection_action(
+        &mut self,
+        app: &mut TuiApp,
+        action: ModelSelectionAction,
+    ) -> ys_agent_core::CoreResult<ModelSelectionOutcome> {
+        let outcome = app.model_selection_state.reduce(action);
+        match &outcome {
+            ModelSelectionOutcome::ReloadSnapshot => {
+                self.request_model_selection_snapshot(
+                    app,
+                    ModelCatalogRequestKind::InitialSnapshot,
+                );
+            }
+            ModelSelectionOutcome::LoadCandidates(request) => {
+                self.request_model_candidates(app, request.clone());
+            }
+            ModelSelectionOutcome::OpenProviderManagement(target) => {
+                self.open_provider_setup(app, target.clone(), None).await?;
+            }
+            ModelSelectionOutcome::Blocked(block) => {
+                app.set_runtime_status(format!("Model selection blocked · {block:?}"));
+            }
+            ModelSelectionOutcome::Close => {
+                let _ = app.pop_route();
+            }
+            ModelSelectionOutcome::Activate(key)
+            | ModelSelectionOutcome::ValidateThenActivate(key) => {
+                if self.model_switch_in_flight() {
+                    app.set_runtime_status("Model activation already in progress…");
+                } else {
+                    self.request_model_switch(app, key.clone())?;
+                    app.set_runtime_status("Validating and activating model…");
+                }
+            }
+            ModelSelectionOutcome::RevalidateThenActivate(key) => {
+                self.open_provider_setup(
+                    app,
+                    SelectionTarget::Provider(key.provider()),
+                    Some(key.profile_id()),
+                )
+                .await?;
+                app.set_runtime_status("Validation expired · validate this model again");
+            }
+            ModelSelectionOutcome::AlreadyCurrent => {
+                app.set_runtime_status("Model is already current");
+            }
+            ModelSelectionOutcome::Changed | ModelSelectionOutcome::Ignored => {}
+        }
+        Ok(outcome)
+    }
+
+    fn request_model_candidates(
+        &mut self,
+        app: &TuiApp,
+        request: ys_agent_core::ListModelCandidatesRequest,
+    ) {
+        let ticket = self
+            .model_catalog_guard
+            .start(AsyncChannel::Catalog, app.navigation.route_key())
+            .expect("the model Catalog is a replaceable read lane");
+        let service = self.service.clone();
+        self.model_catalog_tasks.spawn(async move {
+            let result = match tokio::time::timeout(
+                Duration::from_secs(30),
+                service.provider_list_model_candidates(request),
+            )
+            .await
+            {
+                Ok(result) => result.map(ModelCatalogPayload::Candidates),
+                Err(_) => Err(ProviderManagementError::new(
+                    ProviderErrorCode::Timeout,
+                    Some(ProviderField::Model),
+                    ProviderRemediation::Retry,
+                )),
+            };
+            (ticket, ModelCatalogRequestKind::Candidates, result)
+        });
+    }
+
+    fn request_model_selection_snapshot(&mut self, app: &TuiApp, kind: ModelCatalogRequestKind) {
+        debug_assert!(matches!(
+            kind,
+            ModelCatalogRequestKind::InitialSnapshot | ModelCatalogRequestKind::RefreshSnapshot
+        ));
+        let ticket = self
+            .model_catalog_guard
+            .start(AsyncChannel::Catalog, app.navigation.route_key())
+            .expect("the model Catalog is a replaceable read lane");
+        let service = self.service.clone();
+        self.model_catalog_tasks.spawn(async move {
+            let result = match tokio::time::timeout(
+                Duration::from_secs(30),
+                service.provider_model_selection_snapshot(),
+            )
+            .await
+            {
+                Ok(result) => result.map(ModelCatalogPayload::Snapshot),
+                Err(_) => Err(ProviderManagementError::new(
+                    ProviderErrorCode::Timeout,
+                    Some(ProviderField::Model),
+                    ProviderRemediation::Retry,
+                )),
+            };
+            (ticket, kind, result)
+        });
+    }
+
+    pub(super) fn apply_ready_model_candidates(&mut self, app: &mut TuiApp) -> bool {
+        let mut applied = false;
+        while let Some(completion) = self.model_catalog_tasks.try_join_next() {
+            let Ok((ticket, kind, result)) = completion else {
+                continue;
+            };
+            if !self
+                .model_catalog_guard
+                .accept_completion(ticket, app.navigation.route_key())
+            {
+                continue;
+            }
+            match (kind, result) {
+                (
+                    ModelCatalogRequestKind::InitialSnapshot,
+                    Ok(ModelCatalogPayload::Snapshot(snapshot)),
+                ) => {
+                    app.model_selection_state
+                        .reduce(ModelSelectionAction::SnapshotLoaded(snapshot));
+                }
+                (
+                    ModelCatalogRequestKind::RefreshSnapshot,
+                    Ok(ModelCatalogPayload::Snapshot(snapshot)),
+                ) => app.model_selection_state.refresh_snapshot(snapshot),
+                (
+                    ModelCatalogRequestKind::Candidates,
+                    Ok(ModelCatalogPayload::Candidates(batch)),
+                ) => {
+                    app.model_selection_state
+                        .reduce(ModelSelectionAction::CandidatesLoaded(batch));
+                }
+                (ModelCatalogRequestKind::InitialSnapshot, Err(error)) => {
+                    app.model_selection_state
+                        .reduce(ModelSelectionAction::SnapshotFailed(
+                            error.code().to_owned(),
+                        ));
+                }
+                (ModelCatalogRequestKind::RefreshSnapshot, Err(error)) => app.set_runtime_status(
+                    format!("Model activated · refresh failed · {}", error.code()),
+                ),
+                (ModelCatalogRequestKind::Candidates, Err(error)) => {
+                    app.model_selection_state
+                        .reduce(ModelSelectionAction::CandidatesFailed(
+                            error.code().to_owned(),
+                        ));
+                }
+                _ => {}
+            }
+            applied = true;
+        }
+        applied
+    }
+
+    pub(super) fn request_model_switch(
+        &mut self,
+        app: &TuiApp,
+        key: ys_agent_core::ModelCandidateKey,
+    ) -> ys_agent_core::CoreResult<OperationId> {
+        let ticket = self
+            .model_switch_guard
+            .start(AsyncChannel::ProviderMutation, app.navigation.route_key())
+            .map_err(|_| {
+                ys_agent_core::CoreError::validation(
+                    "model_switch_in_flight",
+                    "Wait for or cancel the active model switch",
+                )
+            })?;
+        let service = self.service.clone();
+        self.model_switch_tasks.spawn(async move {
+            let operation_id = ticket.operation_id;
+            let result = service
+                .provider_switch_model(SwitchModelRequest::new(operation_id, key))
+                .await
+                .map_err(provider_to_core);
+            (ticket, result)
+        });
+        self.model_switch_cancel_requested = None;
+        Ok(ticket.operation_id)
+    }
+
+    pub(super) fn apply_ready_model_switch(&mut self, app: &mut TuiApp) -> bool {
+        let mut applied = false;
+        while let Some(completion) = self.model_switch_tasks.try_join_next() {
+            let Ok((ticket, result)) = completion else {
+                continue;
+            };
+            if !self
+                .model_switch_guard
+                .accept_completion(ticket, app.navigation.route_key())
+            {
+                continue;
+            }
+            let cancel_was_requested = self.model_switch_cancel_requested.take().is_some();
+            match result {
+                Ok(active) => {
+                    app.model_selection_state.apply_active_provider(&active);
+                    app.apply_active_provider_view(Some(&active));
+                    app.set_runtime_status(if cancel_was_requested {
+                        "Model activation completed before cancellation"
+                    } else {
+                        "Model activated for new Runs"
+                    });
+                    self.refresh_candidates_after_model_mutation(app);
+                    self.request_display_context_refresh(
+                        app,
+                        DisplayContextRefreshTrigger::ProviderOperationCompleted,
+                    );
+                    self.request_doctor_refresh();
+                }
+                Err(error) => {
+                    app.set_runtime_status(format!(
+                        "Model activation failed · {} · Press Enter to retry",
+                        error.code()
+                    ));
+                    self.refresh_candidates_after_model_mutation(app);
+                }
+            }
+            applied = true;
+        }
+        applied
+    }
+
+    fn refresh_candidates_after_model_mutation(&mut self, app: &mut TuiApp) {
+        if let Some(request) = app.model_selection_state.current_candidates_request() {
+            let _ = app
+                .model_selection_state
+                .reduce(ModelSelectionAction::Retry);
+            self.request_model_candidates(app, request);
+        } else {
+            self.request_model_selection_snapshot(app, ModelCatalogRequestKind::RefreshSnapshot);
+        }
+    }
+
+    pub(super) fn model_switch_in_flight(&self) -> bool {
+        self.model_switch_guard
+            .active(AsyncChannel::ProviderMutation)
+            .is_some()
+    }
+
+    pub(super) async fn cancel_model_switch(&mut self, app: &mut TuiApp) {
+        let Some(ticket) = self
+            .model_switch_guard
+            .active(AsyncChannel::ProviderMutation)
+        else {
+            return;
+        };
+        if self.model_switch_cancel_requested.is_none() {
+            self.model_switch_cancel_requested = Some(ticket.operation_id);
+            let _ = self
+                .service
+                .cancel_provider_operation(ticket.operation_id)
+                .await;
+            app.set_runtime_status("Cancelling model activation…");
+        }
+    }
+
+    async fn open_provider_setup(
+        &mut self,
+        app: &mut TuiApp,
+        target: SelectionTarget,
+        preferred_profile_id: Option<ProfileId>,
+    ) -> ys_agent_core::CoreResult<()> {
+        let browse = load_provider_management_view(self.service.as_ref())
+            .await
+            .map_err(provider_to_core)?;
+        self.provider_expected_activation_revision = browse
+            .active
+            .as_ref()
+            .map(|active| active.activation_revision);
+        let catalog_entry = browse
+            .catalog
+            .iter()
+            .find(|entry| entry.provider == target.provider())
+            .cloned()
+            .ok_or_else(|| {
+                ys_agent_core::CoreError::validation(
+                    "provider.catalog_unavailable",
+                    "The selected Provider is not present in the governed catalog",
+                )
+            })?;
+        self.model_selection_checkpoint =
+            Some((app.model_selection_state.clone(), app.composer.text()));
+        let mut screen = ProviderManagementScreen::new(browse);
+        let mut revalidate_existing = false;
+        let existing_profile = screen
+            .view()
+            .browse
+            .profiles
+            .iter()
+            .filter(|profile| profile.provider == target.provider())
+            .min_by_key(|profile| {
+                (
+                    preferred_profile_id.is_some_and(|preferred| profile.profile_id != preferred),
+                    !profile.is_active,
+                    !profile.model.is_setup_pending(),
+                    profile.credential_status == ys_agent_core::CredentialViewStatus::Saved,
+                    profile.name.clone(),
+                )
+            })
+            .cloned();
+        if let Some(profile) = existing_profile {
+            if screen.start_edit(&profile) {
+                let steps = if preferred_profile_id == Some(profile.profile_id) {
+                    revalidate_existing = true;
+                    2
+                } else {
+                    1
+                };
+                for _ in 0..steps {
+                    let _ = screen.next_step();
+                }
+            }
+        } else if screen.start_create(format!("{} default", catalog_entry.display_name)) {
+            let _ = screen.select_provider(target.provider());
+            let _ = screen.next_step();
+            let _ = screen.select_authentication(catalog_entry.credential_kind.into());
+        }
+        app.push_route(ContentRoute::ProviderManagement);
+        self.provider_route_key = Some(app.navigation.route_key());
+        let view = screen.view();
+        app.show_detail(
+            DetailKind::Providers,
+            DetailView {
+                title: "Provider setup".to_owned(),
+                lines: provider_management_lines(&view),
+            },
+        );
+        self.provider_screen = Some(screen);
+        self.provider_revalidation_pending = revalidate_existing;
+        if revalidate_existing
+            && let Err(error) =
+                self.start_provider_operation(app, ProviderOperationKind::DiscoverModels)
+        {
+            self.provider_revalidation_pending = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn refresh_model_selection_checkpoint(&mut self) {
+        let Some((state, _)) = self.model_selection_checkpoint.as_mut() else {
+            return;
+        };
+        if let Ok(snapshot) = self.service.provider_model_selection_snapshot().await {
+            state.refresh_snapshot(snapshot);
+        }
     }
 
     async fn new_task(&mut self, app: &mut TuiApp, goal: String) -> ys_agent_core::CoreResult<()> {
@@ -957,7 +2265,9 @@ impl TuiController {
         self.finish_command();
         self.focused_task_id = Some(task_id);
         self.focused_run_id = Some(run_id);
+        self.event_sequence_cursor = 0;
         self.subscription = None;
+        app.timeline_state = TimelineState::default();
         app.diagnostics.task_id = Some(task_id);
         app.diagnostics.run_id = Some(run_id);
         app.set_runtime_status("Task resumed");
@@ -999,11 +2309,11 @@ impl TuiController {
         app: &mut TuiApp,
         text: String,
     ) -> ys_agent_core::CoreResult<()> {
-        if !app.query_submission_enabled() {
-            app.transient = Some(TransientView::Repair);
-            app.push_transcript(TranscriptItem::Warning(
-                "Run /doctor and repair blockers before submitting a query".to_owned(),
-            ));
+        if !app.conversation_submission_enabled() {
+            app.transient = None;
+            let message =
+                "No active LLM model configured. Use /model to choose a Provider and model.";
+            app.push_transcript(TranscriptItem::Warning(message.to_owned()));
             return Ok(());
         }
         if self.submission_in_flight() {
@@ -1013,6 +2323,7 @@ impl TuiController {
             ));
         }
         app.push_transcript(TranscriptItem::UserMessage(text.clone()));
+        app.timeline_state.begin_query(&text);
         app.set_runtime_status("Thinking…");
 
         let service = self.service.clone();
@@ -1072,8 +2383,13 @@ impl TuiController {
     }
 
     fn apply_message_reply(&mut self, app: &mut TuiApp, reply: ServiceReply) {
+        app.timeline_state.apply_service_reply(&reply);
         match reply {
             ServiceReply::Conversation { message } => {
+                // A direct chat reply is deliberately not a governed Run. Remove the provisional
+                // question used while waiting so the timeline never fabricates an execution
+                // trace for a simple conversation.
+                app.timeline_state = TimelineState::default();
                 app.push_transcript(TranscriptItem::Answer(AnswerView {
                     state: "Chat".to_owned(),
                     conclusion: message,
@@ -1106,6 +2422,7 @@ impl TuiController {
     fn focus_run(&mut self, app: &mut TuiApp, task_id: TaskId, run_id: RunId) {
         self.focused_task_id = Some(task_id);
         self.focused_run_id = Some(run_id);
+        self.event_sequence_cursor = 0;
         self.subscription = None;
         app.diagnostics.task_id = Some(task_id);
         app.diagnostics.run_id = Some(run_id);
@@ -1233,13 +2550,27 @@ impl TuiController {
         self.service.doctor().await
     }
 
+    pub async fn refresh_active_provider(&self, app: &mut TuiApp) -> ys_agent_core::CoreResult<()> {
+        let active = self
+            .service
+            .provider_usable_active()
+            .await
+            .map_err(provider_to_core)?;
+        app.apply_active_provider_view(active.as_ref());
+        Ok(())
+    }
+
     pub async fn next_service_event(&mut self) -> ys_agent_core::CoreResult<EventEnvelope> {
         loop {
             let Some(run_id) = self.focused_run_id else {
                 return std::future::pending().await;
             };
             if self.subscription.is_none() {
-                self.subscription = Some(self.service.subscribe_events(&run_id, 0).await?);
+                self.subscription = Some(
+                    self.service
+                        .subscribe_events(&run_id, self.event_sequence_cursor)
+                        .await?,
+                );
             }
             let event = self
                 .subscription
@@ -1254,7 +2585,24 @@ impl TuiController {
         }
     }
 
-    pub fn apply_service_event(&mut self, app: &mut TuiApp, envelope: EventEnvelope) {
+    pub(super) fn apply_service_event(
+        &mut self,
+        app: &mut TuiApp,
+        envelope: EventEnvelope,
+    ) -> TimelineEventOutcome {
+        if self.focused_run_id != Some(envelope.run_id) {
+            return TimelineEventOutcome::Ignored;
+        }
+        if envelope.sequence <= self.event_sequence_cursor {
+            return TimelineEventOutcome::Duplicate;
+        }
+        if envelope.sequence != self.event_sequence_cursor.saturating_add(1) {
+            self.event_sequence_cursor = envelope.sequence;
+            self.subscription = None;
+            return TimelineEventOutcome::Gap;
+        }
+        self.event_sequence_cursor = envelope.sequence;
+        app.timeline_state.apply_event(&envelope);
         match envelope.event.kind {
             RunEventKind::StepStarted { step_id, label } => {
                 app.diagnostics.step_id = Some(step_id);
@@ -1291,7 +2639,7 @@ impl TuiController {
             RunEventKind::RunFailed { code, .. } => {
                 app.runtime_status = None;
                 app.push_transcript(TranscriptItem::Error(format!(
-                    "What happened: {code}. Use /details for diagnostics."
+                    "What happened: {code}. Open diagnostics for details."
                 )));
             }
             RunEventKind::RunCancelled { .. } => {
@@ -1299,6 +2647,17 @@ impl TuiController {
                 app.push_transcript(TranscriptItem::Warning("Run cancelled".to_owned()));
             }
             _ => {}
+        }
+        TimelineEventOutcome::Applied
+    }
+
+    pub(super) fn apply_run_snapshot(
+        &mut self,
+        app: &mut TuiApp,
+        snapshot: &ys_agent_core::RunSnapshot,
+    ) {
+        if self.focused_run_id == Some(snapshot.run_id) {
+            app.timeline_state.apply_snapshot(snapshot);
         }
     }
 
@@ -1310,6 +2669,7 @@ impl TuiController {
             return Ok(());
         };
         let snapshot = self.service.get_run(&run_id).await?;
+        self.apply_run_snapshot(app, &snapshot);
         app.diagnostics.run_id = Some(snapshot.run_id);
         app.diagnostics.task_id = Some(snapshot.task_id);
         app.diagnostics.step_id = snapshot.last_completed_step_id;
@@ -1364,7 +2724,7 @@ impl TuiController {
         if view.truncated {
             app.runtime_status = None;
             app.push_transcript(TranscriptItem::Warning(
-                "Verified answer is available through /artifact; concise preview is too large"
+                "Verified answer is available in the result Artifact; concise preview is too large"
                     .to_owned(),
             ));
             return Ok(());
@@ -1375,6 +2735,9 @@ impl TuiController {
                 error.to_string(),
             )
         })?;
+        if app.timeline_state.apply_persisted_query_artifact(&artifact) {
+            app.timeline_state.focus = FocusTarget::TimelineResultCard;
+        }
         if app.rendered_answer_artifact_id != Some(artifact_id) {
             let key_values = self.load_key_values(&artifact).await;
             app.push_transcript(TranscriptItem::Answer(AnswerView {
@@ -1430,68 +2793,213 @@ impl TuiController {
 fn provider_management_lines(
     view: &super::provider_management::ProviderManagementScreenView,
 ) -> Vec<String> {
-    let mut lines = match &view.browse.active {
-        Some(active) => vec![format!(
-            "Active · {:?} · {} · {}",
-            active.provider,
-            active.model.as_str(),
-            active.profile_revision
-        )],
-        None => vec!["No active Provider Profile".to_owned()],
+    let Some(edit) = &view.edit else {
+        let mut lines = vec!["Configured models".to_owned()];
+        if view.browse.profiles.is_empty() {
+            lines.push("No providers configured. Use /model to choose one.".to_owned());
+        } else {
+            lines.extend(view.browse.profiles.iter().map(|profile| {
+                let marker = if profile.is_active {
+                    "← current"
+                } else {
+                    "✓"
+                };
+                let provider = provider_display_name(view, profile.provider);
+                format!("{provider}  {marker}")
+            }));
+        }
+        lines.push("Esc back".to_owned());
+        return lines;
     };
-    lines.extend(view.browse.profiles.iter().map(|profile| {
-        let marker = if profile.is_active { "active" } else { "saved" };
-        format!(
-            "{marker} · {} · {:?} · {} · {:?} · {:?}",
-            profile.name,
-            profile.provider,
-            profile.model.as_str(),
-            profile.state,
-            profile.credential_status,
-        )
-    }));
-    if view.browse.profiles.is_empty() {
-        lines.push(
-            "Create a Profile to configure Provider, authentication, model, and validation"
-                .to_owned(),
-        );
-    }
-    if let Some(step) = view.step {
-        lines.push(format!("Editing step · {step:?}"));
-    }
-    if let Some(edit) = &view.edit {
-        lines.push(format!("Draft · {} · {:?}", edit.name, edit.provider));
-        lines.push(format!(
-            "Authentication · {:?} · credential {}",
-            edit.authentication,
-            edit.credential_mask.unwrap_or("not entered")
-        ));
-        lines.push(format!(
-            "Model · {} · parameters {:?}",
-            edit.model
-                .as_ref()
-                .map_or("not selected", ys_agent_core::ProviderModelId::as_str),
-            edit.parameters,
-        ));
+
+    let provider = edit
+        .provider
+        .map(|provider| provider_display_name(view, provider))
+        .unwrap_or("Provider");
+    let mut lines = vec![format!("Configure {provider}")];
+    match view.step {
+        Some(ProviderManagementStep::Authentication) => match edit.authentication {
+            Some(ProviderAuthentication::ApiKey) => {
+                let is_claude_subscription = edit.provider == Some(ProviderId::ClaudeSubscription);
+                lines.push(if is_claude_subscription {
+                    "Claude setup token".to_owned()
+                } else {
+                    "API Key".to_owned()
+                });
+                lines.push(match edit.credential_mask {
+                    Some(mask) if edit.has_saved_credential => {
+                        format!("{mask}  saved · Enter keep and continue")
+                    }
+                    Some(mask) => format!("{mask}  ready to save"),
+                    None if is_claude_subscription => {
+                        "Run `claude setup-token`, then type or paste the token".to_owned()
+                    }
+                    None => "Type or paste your API key".to_owned(),
+                });
+                lines.push("Enter save and continue · Esc back".to_owned());
+            }
+            Some(ProviderAuthentication::OAuth) => {
+                lines.push("ChatGPT Subscription".to_owned());
+                if let Some(authorization) = &view.oauth_authorization {
+                    lines.push(format!("Browser  {}", authorization.verification_uri));
+                    lines.push(format!("Code     {}", authorization.user_code));
+                    lines.push(
+                        "Finish sign-in in the browser · this screen continues automatically"
+                            .to_owned(),
+                    );
+                } else {
+                    lines.push(
+                        "Sign in securely with your browser; no API key is required.".to_owned(),
+                    );
+                    lines.push("Enter open browser · Esc back".to_owned());
+                }
+            }
+            None => lines.push("Authentication method unavailable · Esc back".to_owned()),
+        },
+        Some(ProviderManagementStep::Model) => {
+            lines.push("Choose a model".to_owned());
+            if edit.discovered_models.is_empty() {
+                lines.push("Loading models…".to_owned());
+            } else {
+                if !edit.model_filter.is_empty() {
+                    lines.push(format!("Search  {}", edit.model_filter));
+                }
+                let query = edit.model_filter.trim().to_ascii_lowercase();
+                let models = edit
+                    .discovered_models
+                    .iter()
+                    .filter(|model| {
+                        query.is_empty() || model.model.to_ascii_lowercase().contains(&query)
+                    })
+                    .collect::<Vec<_>>();
+                if models.is_empty() {
+                    lines.push("No matching models · keep typing or Backspace".to_owned());
+                } else {
+                    const VISIBLE_ROWS: usize = 9;
+                    if models.len() > VISIBLE_ROWS {
+                        let start = edit.model_scroll.min(models.len() - 1);
+                        let end = start.saturating_add(VISIBLE_ROWS).min(models.len());
+                        lines.push(format!("({}-{} of {})", start + 1, end, models.len()));
+                    }
+                    let prefix = edit
+                        .provider
+                        .map(ProviderId::model_prefix)
+                        .unwrap_or_default();
+                    lines.extend(
+                        models
+                            .into_iter()
+                            .skip(edit.model_scroll)
+                            .take(VISIBLE_ROWS)
+                            .enumerate()
+                            .map(|(visible, model)| {
+                                let selected = edit.model_scroll + visible
+                                    == edit.highlighted_model.unwrap_or_default();
+                                let display =
+                                    model.model.strip_prefix(prefix).unwrap_or(&model.model);
+                                let status = if model.context_limit.is_some_and(|limit| limit > 0) {
+                                    ""
+                                } else {
+                                    "  [unavailable: context unknown]"
+                                };
+                                format!("{} {}{status}", if selected { "→" } else { " " }, display)
+                            }),
+                    );
+                }
+            }
+            lines.push("Type to filter · ↑↓ navigate · Enter select · Esc back".to_owned());
+        }
+        Some(ProviderManagementStep::Parameters) => {
+            lines.push(format!(
+                "Model  {}",
+                edit.model
+                    .as_ref()
+                    .map_or("not selected", ys_agent_core::ProviderModelId::as_str)
+            ));
+            lines.push("Enter continue · Esc back".to_owned());
+        }
+        Some(ProviderManagementStep::Validate) => {
+            lines.push(format!(
+                "Model  {}",
+                edit.model
+                    .as_ref()
+                    .map_or("not selected", ys_agent_core::ProviderModelId::as_str)
+            ));
+            lines.push("Enter validate and activate · Esc back".to_owned());
+        }
+        Some(ProviderManagementStep::SaveActivate) => {
+            lines.push("Ready to use".to_owned());
+            lines.push("Enter activate · Esc back".to_owned());
+        }
+        Some(ProviderManagementStep::Provider) => {
+            lines.push("Choose this provider to continue · Enter".to_owned());
+        }
+        None => {}
     }
     if let Some(busy) = &view.busy {
-        lines.push(format!("Operation in progress · {:?}", busy.kind));
-    }
-    if let Some(result) = &view.result
-        && let ProviderResultOutcome::Failed(error) = &result.outcome
-    {
-        lines.push(format!(
-            "Provider field error · {} · {:?}",
-            error.code(),
-            error.field()
-        ));
-        lines.push(format!("Remediation · {:?}", error.remediation()));
-    }
-    lines.push(
-        "Keys: n new · 1-9 Provider · k API key · o OAuth · Enter next · s save Draft · v validate · a activate · Esc cancel"
+        if busy.kind == ProviderOperationKind::OAuth
+            && let Some(authorization) = &view.oauth_authorization
+        {
+            lines.push(format!("Browser  {}", authorization.verification_uri));
+            lines.push(format!("Code     {}", authorization.user_code));
+        }
+        lines.push(
+            match busy.kind {
+                ProviderOperationKind::OAuth => "Waiting for browser sign-in… · Esc cancel",
+                ProviderOperationKind::Activate => "Activating model… · please wait",
+                ProviderOperationKind::SaveDraft => "Saving settings… · please wait",
+                _ => "Working… · Esc cancel",
+            }
             .to_owned(),
-    );
+        );
+    }
+    if let Some(result) = &view.result {
+        match &result.outcome {
+            ProviderResultOutcome::Succeeded => lines.push(
+                if result.operation == ProviderOperationKind::Activate {
+                    "✓ Model activated"
+                } else {
+                    "✓ Saved"
+                }
+                .to_owned(),
+            ),
+            ProviderResultOutcome::Failed(error) => {
+                lines.push(provider_error_message(error).to_owned());
+                lines.push(if result.can_retry {
+                    "r retry · Enter edit settings · Esc edit settings".to_owned()
+                } else {
+                    "Enter edit settings · Esc edit settings".to_owned()
+                });
+            }
+        }
+    }
     lines
+}
+
+fn provider_error_message(error: &ProviderManagementError) -> String {
+    let message = match error.code() {
+        "provider.operation.stale" => "Sign-in state changed before it could finish",
+        "provider.oauth.not_connected" => "Browser sign-in was not completed",
+        "provider.credential.missing" => "A credential is required to continue",
+        "provider.storage.conflict" => "Credential state conflict",
+        "provider.protocol.invalid_response" => "Provider returned an incompatible response",
+        "provider.discovery.failed" | "provider.discovery.empty" => {
+            "Could not load the online model list"
+        }
+        "provider.timeout" => "The provider did not respond in time",
+        _ => "Could not continue with these provider settings",
+    };
+    format!("{message} · {}", error.code())
+}
+
+fn provider_display_name(
+    view: &super::provider_management::ProviderManagementScreenView,
+    provider: ProviderId,
+) -> &str {
+    view.browse
+        .catalog
+        .iter()
+        .find(|entry| entry.provider == provider)
+        .map_or("Provider", |entry| entry.display_name.as_str())
 }
 
 fn refresh_provider_detail(app: &mut TuiApp, screen: &ProviderManagementScreen) {
@@ -1503,6 +3011,85 @@ fn refresh_provider_detail(app: &mut TuiApp, screen: &ProviderManagementScreen) 
             lines: provider_management_lines(&view),
         },
     );
+}
+
+async fn load_artifact_projection(
+    service: &dyn AgentServiceApi,
+    query_id: ArtifactId,
+    access: ArtifactAccessContext,
+    source_display_name: &str,
+    request: ResultsViewportRequest,
+) -> ys_agent_core::CoreResult<ArtifactReadPayload> {
+    let query_view = match service.get_artifact(&query_id, access.clone()).await {
+        Ok(view) => view,
+        Err(error) if error.code() == "not_found" => {
+            return Ok(ArtifactReadPayload::Projection {
+                result_id: None,
+                projection: ArtifactWorkspaceProjection::unavailable(
+                    ArtifactUnavailableReason::Missing,
+                ),
+            });
+        }
+        Err(error) if error.code() == "artifact_access_denied" => {
+            return Ok(ArtifactReadPayload::Projection {
+                result_id: None,
+                projection: ArtifactWorkspaceProjection::unavailable(
+                    ArtifactUnavailableReason::PolicyRestricted,
+                ),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if query_view.truncated {
+        return Err(ys_agent_core::CoreError::validation(
+            "query_artifact_preview_limited",
+            "The persisted Query Artifact cannot be safely decoded from a limited preview",
+        ));
+    }
+    let artifact: QueryArtifact = serde_json::from_slice(&query_view.preview).map_err(|_| {
+        ys_agent_core::CoreError::validation(
+            "malformed_query_artifact",
+            "The persisted Query Artifact does not match the supported schema",
+        )
+    })?;
+    let result_id = artifact
+        .result_artifact
+        .as_ref()
+        .map(|reference| reference.id());
+    let preview = match result_id {
+        Some(result_id) => match service
+            .query_result_preview(&result_id, access.clone())
+            .await
+        {
+            Ok(preview) => Some(preview),
+            Err(error) if error.code() == "not_found" => None,
+            Err(error) if error.code() == "artifact_access_denied" => {
+                return Ok(ArtifactReadPayload::Projection {
+                    result_id: Some(result_id),
+                    projection: ArtifactWorkspaceProjection::authorized(
+                        &artifact,
+                        source_display_name,
+                        ResultsAccess::PolicyRestricted,
+                        request,
+                    ),
+                });
+            }
+            Err(error) => return Err(error),
+        },
+        None => None,
+    };
+    let results = preview.as_ref().map_or(ResultsAccess::Missing, |preview| {
+        ResultsAccess::Available(AuthorizedResultsPreview::from(preview))
+    });
+    Ok(ArtifactReadPayload::Projection {
+        result_id,
+        projection: ArtifactWorkspaceProjection::authorized(
+            &artifact,
+            source_display_name,
+            results,
+            request,
+        ),
+    })
 }
 
 async fn load_provider_management_view(
@@ -1531,7 +3118,7 @@ async fn save_provider_draft(
     secret: Option<ys_agent_core::SecretValue>,
     operation_id: OperationId,
     resume_step: ProviderManagementStep,
-) -> ys_agent_core::ProviderResult<ys_agent_core::ProfileDetail> {
+) -> ys_agent_core::ProviderResult<SaveProviderDraftOutcome> {
     let required_kind = command.provider.required_credential_kind();
     let selected_kind = match command.authentication {
         super::provider_management::ProviderAuthentication::ApiKey => CredentialKind::ApiKey,
@@ -1552,7 +3139,10 @@ async fn save_provider_draft(
         && secret.is_none()
         && let Some(profile_id) = command.profile_id
     {
-        return service.provider_load_profile(profile_id).await;
+        return service
+            .provider_load_profile(profile_id)
+            .await
+            .map(SaveProviderDraftOutcome::Saved);
     }
 
     let existing = match command.profile_id {
@@ -1579,11 +3169,14 @@ async fn save_provider_draft(
             ProviderField::ProfileName,
         )
     })?;
+    let model = command
+        .model
+        .unwrap_or_else(|| ys_agent_core::ProviderModelId::setup_pending(command.provider));
     let revision = ProfileRevision::draft(
         profile_id,
         revision_number,
         command.provider,
-        command.model,
+        model,
         command.parameters,
         carried_generation,
     )
@@ -1605,7 +3198,7 @@ async fn save_provider_draft(
         .await?;
 
     let Some(secret) = secret else {
-        return Ok(saved);
+        return Ok(SaveProviderDraftOutcome::Saved(saved));
     };
     if required_kind != CredentialKind::ApiKey {
         return Err(provider_edit_error(
@@ -1638,7 +3231,7 @@ async fn save_provider_draft(
         }
     }
     .map_err(|_| provider_edit_error(ProviderErrorCode::Internal, ProviderField::Credential))?;
-    service
+    match service
         .provider_mutate_credential(CredentialMutationRequest {
             intent,
             mutation: CredentialMutation::Replace(ProtectedCredentialWrite {
@@ -1650,6 +3243,34 @@ async fn save_provider_draft(
             }),
         })
         .await
+    {
+        Ok(detail) => Ok(SaveProviderDraftOutcome::Saved(detail)),
+        Err(error) => Ok(SaveProviderDraftOutcome::CredentialFailed { profile_id, error }),
+    }
+}
+
+enum SaveProviderDraftOutcome {
+    Saved(ys_agent_core::ProfileDetail),
+    CredentialFailed {
+        profile_id: ProfileId,
+        error: ProviderManagementError,
+    },
+}
+
+fn ensure_validated_revision_is_current(
+    validated_revision: u64,
+    validated_model: &ys_agent_core::ProviderModelId,
+    current_revision: u64,
+    current_model: &ys_agent_core::ProviderModelId,
+) -> ys_agent_core::ProviderResult<()> {
+    if current_revision != validated_revision || current_model != validated_model {
+        return Err(ProviderManagementError::new(
+            ProviderErrorCode::OperationStale,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ReturnToEdit,
+        ));
+    }
+    Ok(())
 }
 
 fn provider_edit_error(code: ProviderErrorCode, field: ProviderField) -> ProviderManagementError {
@@ -1709,25 +3330,34 @@ fn user_readable_run_failure(snapshot: &ys_agent_core::RunSnapshot) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("inspect Evidence before retrying");
     format!(
-        "What happened: {what_happened}. Required action: {required_action}. Use /details for retry and Evidence diagnostics."
+        "What happened: {what_happened}. Required action: {required_action}. Open diagnostics for retry and Evidence details."
     )
 }
 
 #[cfg(test)]
 mod provider_management_tests {
-    use std::sync::Arc;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
+    use async_trait::async_trait;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ys_agent_adapters::{
-        credential::keyring::InMemoryCredentialVault,
+        credential::memory::InMemoryCredentialVault,
         model::{discovery::LiterModelDiscovery, liter::LiterProviderFactory},
     };
     use ys_agent_core::{
-        CredentialKind, ProfileId, ProfileName, ProfileRevision, ProviderCatalogView, ProviderId,
+        ProfileId, ProfileName, ProfileRevision, ProviderCatalogView, ProviderId,
         ProviderProfileRepository, ProviderSupportStatus, RevisionPrecondition,
         RunProviderBindingRepository, SaveProfileRevision, WorkspaceId,
     };
     use ys_agent_runtime::{
-        InProcessAgentService, NoopRunScheduler,
+        DatasourceDisplayState, InProcessAgentService, NoopRunScheduler, QueryDisplayState,
+        TuiDisplayContextInput, TuiDisplayContextSource,
         provider::{
             api::InProcessProviderManagementApi,
             catalog::GovernedProviderCatalog,
@@ -1736,23 +3366,114 @@ mod provider_management_tests {
     };
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
+    use crate::tui::provider_management::ProviderAuthentication;
+
     use super::*;
+
+    #[test]
+    fn concurrent_same_model_revision_is_rejected_after_validation() {
+        let model =
+            ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/same-model")
+                .expect("model");
+
+        let error = ensure_validated_revision_is_current(4, &model, 5, &model)
+            .expect_err("a new revision invalidates the completed validation");
+        assert_eq!(error.code(), "provider.operation.stale");
+        assert_eq!(error.field(), Some(&ProviderField::Validation));
+    }
+
+    #[test]
+    fn provider_setup_failures_keep_the_safe_stable_error_code_visible() {
+        let storage = ProviderManagementError::new(
+            ProviderErrorCode::StorageConflict,
+            Some(ProviderField::Credential),
+            ProviderRemediation::ReturnToEdit,
+        );
+        assert_eq!(
+            provider_error_message(&storage),
+            "Credential state conflict · provider.storage.conflict"
+        );
+
+        let protocol = ProviderManagementError::new(
+            ProviderErrorCode::ProtocolInvalidResponse,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ValidateProfile,
+        );
+        assert_eq!(
+            provider_error_message(&protocol),
+            "Provider returned an incompatible response · provider.protocol.invalid_response"
+        );
+    }
+
+    struct SequenceDisplayContextSource {
+        responses: Mutex<VecDeque<ys_agent_core::CoreResult<TuiDisplayContextInput>>>,
+        loads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TuiDisplayContextSource for SequenceDisplayContextSource {
+        async fn load(&self) -> ys_agent_core::CoreResult<TuiDisplayContextInput> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .lock()
+                .expect("display source lock")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(ys_agent_core::CoreError::validation(
+                        "display_context_test_exhausted",
+                        "no test Display Context response remains",
+                    ))
+                })
+        }
+    }
+
+    async fn apply_display_context_refresh(
+        controller: &mut TuiController,
+        app: &mut TuiApp,
+        trigger: DisplayContextRefreshTrigger,
+    ) {
+        controller.request_display_context_refresh(app, trigger);
+        for _ in 0..100 {
+            if controller.apply_ready_display_context(app) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("Display Context refresh did not complete for {trigger:?}");
+    }
 
     fn catalog_views() -> Vec<ProviderCatalogView> {
         ProviderId::ALL
             .into_iter()
-            .map(|provider| ProviderCatalogView {
-                provider,
-                display_name: format!("{provider:?}"),
-                credential_kind: provider.required_credential_kind(),
-                support_status: ProviderSupportStatus::Candidate,
-                evidence_gaps: vec!["evidence_pending".to_owned()],
+            .map(|provider| {
+                let catalog = GovernedProviderCatalog::default();
+                let entry = catalog.entry(provider);
+                ProviderCatalogView {
+                    provider,
+                    display_name: entry.display_name().to_owned(),
+                    credential_kind: provider.required_credential_kind(),
+                    support_status: ProviderSupportStatus::Candidate,
+                    evidence_gaps: vec!["evidence_pending".to_owned()],
+                }
             })
             .collect()
     }
 
+    async fn apply_model_catalog_completion(controller: &mut TuiController, app: &mut TuiApp) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if controller.apply_ready_model_candidates(app) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Model Selection snapshot completes through the service boundary");
+    }
+
     #[tokio::test]
-    async fn providers_and_legacy_model_use_one_masked_service_route() {
+    async fn model_needs_setup_uses_provider_management_and_restores_selection() {
         let directory = tempfile::tempdir().expect("temporary runtime directory");
         let store = Arc::new(
             SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -1811,7 +3532,7 @@ mod provider_management_tests {
                 .with_provider_management_api(provider_api),
         );
         let principal = Principal::local_operator("tui-provider-test");
-        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut controller = TuiController::new(service.clone(), workspace_id, principal.clone());
         let mut app = TuiApp::for_principal(principal);
 
         controller
@@ -1822,31 +3543,1183 @@ mod provider_management_tests {
             app.transient,
             Some(TransientView::Detail(DetailKind::Providers))
         );
+        assert_eq!(app.navigation.current(), ContentRoute::ProviderManagement);
         assert!(
             app.detail
                 .as_ref()
                 .expect("Provider detail")
                 .lines
                 .iter()
-                .any(|line| line.contains("TUI managed Profile"))
+                .any(|line| line.contains("deepseek"))
         );
 
+        controller.close_provider_management(&mut app).await;
+        app.composer.set_text("preserved draft");
         controller
             .apply(&mut app, InputAction::Model)
             .await
-            .expect("legacy model command reuses Provider manager");
-        let detail = app.detail.expect("same Provider detail");
-        assert_eq!(detail.title, "Provider management");
-        assert!(
-            detail
-                .lines
-                .iter()
-                .any(|line| line.contains("Editing step · Model"))
-        );
-        assert!(!format!("{detail:?}").contains("api_key"));
+            .expect("model command loads governed selection");
+        assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
+        assert_eq!(app.transient, None);
+        apply_model_catalog_completion(&mut controller, &mut app).await;
+        for key in [KeyCode::Right, KeyCode::Left] {
+            crate::tui::event_loop::handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            )
+            .await
+            .expect("switch Providers and Plans");
+        }
+        for character in "deepseek".chars() {
+            crate::tui::event_loop::handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+            )
+            .await
+            .expect("search selection");
+        }
+        let original_highlight = app.model_selection_state.highlighted;
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("Needs setup opens existing Provider flow");
+        assert_eq!(app.navigation.current(), ContentRoute::ProviderManagement);
         assert_eq!(
-            CredentialKind::ApiKey,
-            ProviderId::DeepSeek.required_credential_kind()
+            controller
+                .provider_screen_view()
+                .and_then(|view| view.edit)
+                .and_then(|edit| edit.provider),
+            Some(ProviderId::DeepSeek)
         );
+        let setup = controller
+            .provider_screen_view()
+            .expect("compact setup view");
+        assert_eq!(setup.step, Some(ProviderManagementStep::Authentication));
+        assert_eq!(
+            setup.edit.as_ref().and_then(|edit| edit.authentication),
+            Some(ProviderAuthentication::ApiKey)
+        );
+        assert_eq!(
+            setup.edit.as_ref().and_then(|edit| edit.profile_id),
+            Some(profile_id),
+            "re-entering setup must resume the existing Profile instead of creating a duplicate"
+        );
+        let missing_credential = controller
+            .start_provider_operation(&mut app, ProviderOperationKind::SaveDraft)
+            .expect_err("an existing Draft without a saved credential still requires an API key");
+        assert_eq!(missing_credential.code(), "provider.credential_missing");
+        assert_eq!(
+            controller
+                .provider_screen_view()
+                .expect("setup remains open")
+                .step,
+            Some(ProviderManagementStep::Authentication)
+        );
+        let rendered_setup = app.detail.as_ref().expect("setup detail").lines.join("\n");
+        for expected in ["Configure deepseek", "API Key", "Enter save and continue"] {
+            assert!(
+                rendered_setup.contains(expected),
+                "setup omitted required compact copy: {expected}\n{rendered_setup}"
+            );
+        }
+        for leaked_internal in [
+            "Provider Profile",
+            "Editing step",
+            "ProviderParameters",
+            "1-9 Provider",
+            "save Draft",
+        ] {
+            assert!(
+                !rendered_setup.contains(leaked_internal),
+                "setup leaked internal workflow copy: {leaked_internal}\n{rendered_setup}"
+            );
+        }
+        assert!(
+            service
+                .provider_active()
+                .await
+                .expect("read active Provider")
+                .is_none(),
+            "setup must not switch before validation"
+        );
+
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("return to Model Selection");
+        assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
+        assert_eq!(app.model_selection_state.search, "deepseek");
+        assert_eq!(app.model_selection_state.highlighted, original_highlight);
+        assert_eq!(app.composer.text(), "preserved draft");
+    }
+
+    #[tokio::test]
+    async fn display_context_refresh_preserves_last_good_and_observes_all_triggers() {
+        let directory = tempfile::tempdir().expect("temporary runtime directory");
+        let workspace_id = WorkspaceId::new();
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("open runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let source = Arc::new(SequenceDisplayContextSource {
+            responses: Mutex::new(VecDeque::from([
+                Err(ys_agent_core::CoreError::validation(
+                    "display_context_unavailable",
+                    "injected startup failure",
+                )),
+                TuiDisplayContextInput::new(
+                    "Authoritative Workspace",
+                    DatasourceDisplayState::active("Governed Warehouse").expect("safe datasource"),
+                    true,
+                    QueryDisplayState::Ready,
+                ),
+                Err(ys_agent_core::CoreError::validation(
+                    "display_context_unavailable",
+                    "injected refresh failure",
+                )),
+                TuiDisplayContextInput::new(
+                    "Recovered Workspace",
+                    DatasourceDisplayState::active("Recovered Warehouse").expect("safe datasource"),
+                    false,
+                    QueryDisplayState::Completed,
+                ),
+                TuiDisplayContextInput::new(
+                    "Recovered Workspace",
+                    DatasourceDisplayState::active("Recovered Warehouse").expect("safe datasource"),
+                    false,
+                    QueryDisplayState::Completed,
+                ),
+            ])),
+            loads: AtomicUsize::new(0),
+        });
+        let service = Arc::new(
+            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_tui_display_context_source(source.clone()),
+        );
+        let principal = Principal::local_operator("display-context-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.query_mode = TuiQueryMode::Query;
+        app.apply_active_provider_view(Some(&ys_agent_core::ActiveProviderView {
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            activation_revision: 1,
+            provider: ProviderId::DeepSeek,
+            model: ys_agent_core::ProviderModelId::new(
+                ProviderId::DeepSeek,
+                "deepseek/independent",
+            )
+            .expect("model"),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        }));
+
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
+            DisplayContextRefreshTrigger::Startup,
+        )
+        .await;
+        assert_eq!(app.header_view().workspace, "local");
+        assert!(app.header_view().context_unavailable);
+
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
+            DisplayContextRefreshTrigger::UserRetry,
+        )
+        .await;
+        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
+        assert_eq!(app.header_view().datasource, "Governed Warehouse");
+        assert_eq!(app.header_view().read_only, "read-only");
+        assert_eq!(app.header_view().query_state, QueryDisplayState::Ready);
+        assert!(!app.header_view().context_unavailable);
+
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
+            DisplayContextRefreshTrigger::QueryStateChanged,
+        )
+        .await;
+        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
+        assert_eq!(app.header_view().datasource, "Governed Warehouse");
+        assert!(app.header_view().context_unavailable);
+
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
+            DisplayContextRefreshTrigger::DatasourceChanged,
+        )
+        .await;
+        assert_eq!(app.header_view().workspace, "Recovered Workspace");
+        assert_eq!(app.header_view().datasource, "Recovered Warehouse");
+        assert_eq!(app.header_view().read_only, "write access");
+        assert_eq!(app.header_view().query_state, QueryDisplayState::Completed);
+        assert!(!app.header_view().context_unavailable);
+
+        apply_display_context_refresh(
+            &mut controller,
+            &mut app,
+            DisplayContextRefreshTrigger::ProviderOperationCompleted,
+        )
+        .await;
+        for trigger in DisplayContextRefreshTrigger::ALL {
+            assert_eq!(controller.display_context_refresh_count(trigger), 1);
+        }
+        assert_eq!(source.loads.load(Ordering::SeqCst), 5);
+        assert_eq!(app.query_mode, TuiQueryMode::Query);
+        assert_eq!(app.header_view().current_model, "deepseek/independent");
+
+        for _ in 0..3 {
+            crate::tui::ui::render_to_string(&app, 150, 46);
+            assert!(!controller.apply_ready_display_context(&mut app));
+        }
+        assert_eq!(
+            source.loads.load(Ordering::SeqCst),
+            5,
+            "rendering and empty result polling must not refresh Display Context"
+        );
+    }
+}
+
+#[cfg(test)]
+mod event_timeline_tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use chrono::Utc;
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+    use serde_json::json;
+    use ys_agent_core::{
+        ArtifactMetadata, EventActor, EventId, QueryIntent, RetentionPolicy, RunEventKind,
+        RunSnapshot, SemanticStatus, Session, SourceId, Task, VersionedRunEvent, WorkflowKind,
+    };
+    use ys_agent_runtime::{
+        ArtifactView, DatasourceDisplayState, EventSubscription, InProcessAgentService,
+        NoopRunScheduler, QueryDisplayState, QueryResultPreviewView, TuiDisplayContextInput,
+        VerificationReport, doctor::DoctorReport,
+    };
+    use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
+
+    use super::*;
+    use crate::tui::{HitRegion, timeline::TimelineStatus};
+
+    #[derive(Default)]
+    struct CountingMissingArtifactService {
+        artifact_reads: AtomicUsize,
+        query_or_tool_calls: AtomicUsize,
+        resume_calls: AtomicUsize,
+        snapshot_delay_ms: AtomicUsize,
+        snapshot_fail: AtomicBool,
+        candidate_delay_ms: AtomicUsize,
+        candidate_batch: Mutex<Option<ys_agent_core::ModelCandidateBatch>>,
+        model_readback: Mutex<Option<(ActiveProviderView, ys_agent_core::ModelSelectionSnapshot)>>,
+        display_context: Mutex<Option<TuiDisplayContext>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentServiceApi for CountingMissingArtifactService {
+        async fn tui_display_context(&self) -> ys_agent_core::CoreResult<TuiDisplayContext> {
+            self.display_context
+                .lock()
+                .expect("display context lock")
+                .clone()
+                .ok_or_else(|| {
+                    ys_agent_core::CoreError::validation(
+                        "tui_display_context_unavailable",
+                        "no test Display Context",
+                    )
+                })
+        }
+
+        async fn query_result_preview(
+            &self,
+            _artifact_id: &ArtifactId,
+            _access: ArtifactAccessContext,
+        ) -> ys_agent_core::CoreResult<QueryResultPreviewView> {
+            unreachable!("a missing primary Artifact has no Results Preview")
+        }
+
+        async fn create_session(
+            &self,
+            _command_id: CommandId,
+            _principal: Principal,
+        ) -> ys_agent_core::CoreResult<Session> {
+            unreachable!("Artifact navigation cannot create a Session")
+        }
+
+        async fn create_task(
+            &self,
+            _request: CreateTaskRequest,
+        ) -> ys_agent_core::CoreResult<Task> {
+            unreachable!("Artifact navigation cannot create a Task")
+        }
+
+        async fn send_message(
+            &self,
+            _request: SendMessageRequest,
+        ) -> ys_agent_core::CoreResult<ServiceReply> {
+            self.query_or_tool_calls.fetch_add(1, Ordering::SeqCst);
+            Err(ys_agent_core::CoreError::validation(
+                "unexpected_query_call",
+                "Artifact navigation cannot submit a Query or invoke Tools",
+            ))
+        }
+
+        async fn resume_task(
+            &self,
+            _command_id: CommandId,
+            _task_id: &TaskId,
+        ) -> ys_agent_core::CoreResult<RunId> {
+            self.resume_calls.fetch_add(1, Ordering::SeqCst);
+            Err(ys_agent_core::CoreError::validation(
+                "unexpected_resume_call",
+                "Artifact navigation cannot resume a Task",
+            ))
+        }
+
+        async fn answer_clarification(
+            &self,
+            _command_id: CommandId,
+            _run_id: &RunId,
+            _answer: String,
+        ) -> ys_agent_core::CoreResult<()> {
+            unreachable!("Artifact navigation cannot answer clarification")
+        }
+
+        async fn list_tasks(
+            &self,
+            _workspace_id: &WorkspaceId,
+        ) -> ys_agent_core::CoreResult<Vec<Task>> {
+            unreachable!("Artifact navigation cannot list Tasks")
+        }
+
+        async fn get_task(&self, _task_id: &TaskId) -> ys_agent_core::CoreResult<Task> {
+            unreachable!("Artifact navigation cannot read Tasks")
+        }
+
+        async fn get_run(&self, _run_id: &RunId) -> ys_agent_core::CoreResult<RunSnapshot> {
+            unreachable!("Artifact navigation cannot read Runs")
+        }
+
+        async fn get_artifact(
+            &self,
+            artifact_id: &ArtifactId,
+            _access: ArtifactAccessContext,
+        ) -> ys_agent_core::CoreResult<ArtifactView> {
+            self.artifact_reads.fetch_add(1, Ordering::SeqCst);
+            Err(ys_agent_core::CoreError::NotFound {
+                entity: "Artifact",
+                id: artifact_id.to_string(),
+            })
+        }
+
+        async fn subscribe_events(
+            &self,
+            _run_id: &RunId,
+            _after_sequence: u64,
+        ) -> ys_agent_core::CoreResult<EventSubscription> {
+            unreachable!("Artifact navigation cannot subscribe to Events")
+        }
+
+        async fn cancel_run(
+            &self,
+            _command_id: CommandId,
+            _run_id: &RunId,
+            _reason: String,
+        ) -> ys_agent_core::CoreResult<()> {
+            unreachable!("Artifact navigation cannot cancel Runs")
+        }
+
+        async fn doctor(&self) -> ys_agent_core::CoreResult<DoctorReport> {
+            Ok(DoctorReport {
+                blocker_codes: Vec::new(),
+                warning_codes: Vec::new(),
+                ready_capabilities: Vec::new(),
+                repairs: Vec::new(),
+            })
+        }
+
+        async fn provider_model_selection_snapshot(
+            &self,
+        ) -> ys_agent_core::ProviderResult<ys_agent_core::ModelSelectionSnapshot> {
+            let delay_ms = self.snapshot_delay_ms.load(Ordering::SeqCst);
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+            }
+            if self.snapshot_fail.load(Ordering::SeqCst) {
+                return Err(ProviderManagementError::new(
+                    ProviderErrorCode::DiscoveryFailed,
+                    Some(ProviderField::Model),
+                    ProviderRemediation::Retry,
+                ));
+            }
+            self.model_readback
+                .lock()
+                .expect("model readback lock")
+                .as_ref()
+                .map(|(_, snapshot)| snapshot.clone())
+                .ok_or_else(|| {
+                    ProviderManagementError::new(
+                        ProviderErrorCode::Internal,
+                        None,
+                        ProviderRemediation::Retry,
+                    )
+                })
+        }
+
+        async fn provider_list_model_candidates(
+            &self,
+            _request: ys_agent_core::ListModelCandidatesRequest,
+        ) -> ys_agent_core::ProviderResult<ys_agent_core::ModelCandidateBatch> {
+            let delay_ms = self.candidate_delay_ms.load(Ordering::SeqCst);
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+            }
+            self.candidate_batch
+                .lock()
+                .expect("candidate batch lock")
+                .clone()
+                .ok_or_else(|| {
+                    ProviderManagementError::new(
+                        ProviderErrorCode::DiscoveryFailed,
+                        Some(ys_agent_core::ProviderField::Model),
+                        ProviderRemediation::Retry,
+                    )
+                })
+        }
+
+        async fn provider_switch_model(
+            &self,
+            _request: SwitchModelRequest,
+        ) -> ys_agent_core::ProviderResult<ActiveProviderView> {
+            self.model_readback
+                .lock()
+                .expect("model readback lock")
+                .as_ref()
+                .map(|(active, _)| active.clone())
+                .ok_or_else(|| {
+                    ProviderManagementError::new(
+                        ProviderErrorCode::Internal,
+                        None,
+                        ProviderRemediation::Retry,
+                    )
+                })
+        }
+
+        async fn provider_active(
+            &self,
+        ) -> ys_agent_core::ProviderResult<Option<ActiveProviderView>> {
+            Ok(self
+                .model_readback
+                .lock()
+                .expect("model readback lock")
+                .as_ref()
+                .map(|(active, _)| active.clone()))
+        }
+
+        async fn export_artifact(
+            &self,
+            _command_id: CommandId,
+            _artifact_id: &ArtifactId,
+            _format: ExportFormat,
+            _access: ArtifactAccessContext,
+        ) -> ys_agent_core::CoreResult<ArtifactMetadata> {
+            unreachable!("Artifact navigation cannot export")
+        }
+    }
+
+    fn event(
+        workspace_id: WorkspaceId,
+        task_id: TaskId,
+        run_id: RunId,
+        sequence: u64,
+        kind: RunEventKind,
+    ) -> EventEnvelope {
+        EventEnvelope {
+            event_id: EventId::new(),
+            workspace_id,
+            task_id,
+            run_id,
+            sequence,
+            occurred_at: Utc::now(),
+            actor: EventActor::System,
+            event: VersionedRunEvent::v1(kind),
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_deduplicates_events_and_recovers_a_gap_from_the_snapshot() {
+        let directory = tempfile::tempdir().expect("temporary runtime directory");
+        let workspace_id = WorkspaceId::new();
+        let store = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("open runtime store"),
+        );
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let service = Arc::new(InProcessAgentService::new(
+            workspace_id,
+            store,
+            artifacts,
+            Arc::new(NoopRunScheduler),
+        ));
+        let principal = Principal::local_operator("timeline-integration-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        controller.focus_run(&mut app, task_id, run_id);
+        app.timeline_state
+            .begin_query("Why did governed orders change?");
+        controller.apply_message_reply(&mut app, ServiceReply::RunScheduled { task_id, run_id });
+        assert_eq!(app.timeline_state.view().status, TimelineStatus::Running);
+
+        assert_eq!(
+            controller.apply_service_event(
+                &mut app,
+                event(workspace_id, task_id, run_id, 1, RunEventKind::RunStarted),
+            ),
+            TimelineEventOutcome::Applied
+        );
+        assert_eq!(
+            controller.apply_service_event(
+                &mut app,
+                event(workspace_id, task_id, run_id, 1, RunEventKind::RunStarted),
+            ),
+            TimelineEventOutcome::Duplicate
+        );
+        assert_eq!(
+            controller.apply_service_event(
+                &mut app,
+                event(
+                    workspace_id,
+                    task_id,
+                    run_id,
+                    3,
+                    RunEventKind::RunFailed {
+                        code: "query.execution_failed".to_owned(),
+                        message: "raw transport body".to_owned(),
+                    },
+                ),
+            ),
+            TimelineEventOutcome::Gap
+        );
+
+        controller.apply_run_snapshot(
+            &mut app,
+            &RunSnapshot {
+                run_id,
+                task_id,
+                workflow: WorkflowKind::Query,
+                status: RunStatus::Failed,
+                attempt: 1,
+                retry_of_run_id: None,
+                version: 4,
+                workflow_state: json!({
+                    "phase": "verify",
+                    "failure": {
+                        "what_happened": "governed Query validation failed",
+                        "required_user_action": "review diagnostics and retry"
+                    }
+                }),
+                pending_wait_metadata: None,
+                primary_artifact_id: None,
+                last_completed_step_id: None,
+            },
+        );
+        assert_eq!(app.timeline_state.view().status, TimelineStatus::Failed);
+        let notice = app
+            .timeline_state
+            .view()
+            .notice
+            .expect("failed snapshot has recovery guidance");
+        assert_eq!(notice.reason, "governed Query validation failed");
+        assert_eq!(notice.next_action, "review diagnostics and retry");
+
+        assert_eq!(
+            controller.apply_service_event(
+                &mut app,
+                event(workspace_id, task_id, run_id, 2, RunEventKind::RunStarted),
+            ),
+            TimelineEventOutcome::Duplicate
+        );
+        assert_eq!(app.timeline_state.view().status, TimelineStatus::Failed);
+        assert_eq!(controller.event_sequence_cursor(), 3);
+        controller.reset_event_subscription();
+        assert_eq!(controller.event_sequence_cursor(), 3);
+    }
+
+    #[tokio::test]
+    async fn artifact_navigation_is_read_only_and_preserves_the_timeline() {
+        let workspace_id = WorkspaceId::new();
+        let service = Arc::new(CountingMissingArtifactService::default());
+        let principal = Principal::local_operator("artifact-navigation-test");
+        let mut controller = TuiController::new(service.clone(), workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.mouse_enabled = true;
+        let task_id = TaskId::new();
+        let run_id = RunId::new();
+        let primary_artifact_id = ArtifactId::new();
+        controller.focus_run(&mut app, task_id, run_id);
+        app.timeline_state.begin_query("Show governed orders");
+        app.timeline_state.apply_snapshot(&RunSnapshot {
+            run_id,
+            task_id,
+            workflow: WorkflowKind::Query,
+            status: RunStatus::Succeeded,
+            attempt: 1,
+            retry_of_run_id: None,
+            version: 1,
+            workflow_state: json!({}),
+            pending_wait_metadata: None,
+            primary_artifact_id: Some(primary_artifact_id),
+            last_completed_step_id: None,
+        });
+        app.timeline_state
+            .apply_persisted_query_artifact(&QueryArtifact {
+                question: "Show governed orders".to_owned(),
+                intent: QueryIntent::Metadata,
+                answer_summary: "Governed result available".to_owned(),
+                metric: None,
+                semantic_status: SemanticStatus::Observed,
+                source_id: SourceId::new("warehouse"),
+                source_relations: Vec::new(),
+                time_range: None,
+                executed_sql: None,
+                bound_parameters: Vec::new(),
+                result_schema: Default::default(),
+                result_artifact: None,
+                freshness: None,
+                verification: VerificationReport {
+                    checks: Vec::new(),
+                    hard_failures: Vec::new(),
+                    warnings: Vec::new(),
+                    evidence_refs: Vec::new(),
+                },
+                assumptions: Vec::new(),
+                warning_codes: Vec::new(),
+                sensitivity: Sensitivity::Internal,
+                retention_policy: RetentionPolicy::Session,
+                expires_at: None,
+                generated_at: Utc::now(),
+            });
+        app.timeline_state
+            .focus_result_card(HitRegion::new(1, 1, 40, 4));
+        app.primary_artifact_id = Some(primary_artifact_id);
+
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, &mut app))
+            .expect("render Timeline hit region");
+        assert!(
+            app.timeline_state.result_card_hit_region.is_some(),
+            "the rendered result card exposes a mouse hit region"
+        );
+
+        let mut opened_by_mouse = false;
+        'hit_test: for row in 0..28 {
+            for column in 0..100 {
+                crate::tui::event_loop::handle_terminal_event(
+                    &mut app,
+                    &mut controller,
+                    Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                )
+                .await
+                .expect("mouse input remains safe across the rendered viewport");
+                if app.navigation.current() == ContentRoute::Artifact {
+                    opened_by_mouse = true;
+                    break 'hit_test;
+                }
+            }
+        }
+        assert!(
+            opened_by_mouse,
+            "clicking the rendered result card opens Artifact"
+        );
+        for _ in 0..100 {
+            if controller.apply_ready_artifact(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(app.navigation.current(), ContentRoute::Artifact);
+        for (width, height) in [(150, 40), (100, 28), (60, 12)] {
+            let rendered = crate::tui::ui::render_to_string(&app, width, height);
+            assert!(rendered.contains("Artifact is missing"));
+            for tab in ["Summary", "Results", "SQL", "Schema", "Evidence"] {
+                assert!(rendered.contains(tab));
+            }
+            assert!(rendered.contains("/mode  /model  /exit  Esc back"));
+        }
+        for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Esc] {
+            crate::tui::event_loop::handle_terminal_event(
+                &mut app,
+                &mut controller,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            )
+            .await
+            .expect("Artifact navigation follows the public keyboard path");
+        }
+
+        assert_eq!(app.navigation.current(), ContentRoute::Timeline);
+        assert_eq!(
+            app.timeline_state.view().question,
+            Some("Show governed orders")
+        );
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("focused result card accepts Enter");
+        assert_eq!(app.navigation.current(), ContentRoute::Artifact);
+        for _ in 0..100 {
+            if controller.apply_ready_artifact(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("return after Enter navigation");
+
+        assert_eq!(service.artifact_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(service.query_or_tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.resume_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_model_switch_preserves_authoritative_header_and_selection() {
+        let workspace_id = WorkspaceId::new();
+        let service = Arc::new(CountingMissingArtifactService::default());
+        let principal = Principal::local_operator("model-switch-failure-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.apply_active_provider_view(Some(&ys_agent_core::ActiveProviderView {
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            activation_revision: 1,
+            provider: ProviderId::DeepSeek,
+            model: ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/before")
+                .expect("model"),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        }));
+        app.push_route(ContentRoute::ModelSelection);
+        let before = app.header_view().current_model.to_owned();
+        let before_state = app.model_selection_state.clone();
+        let key = ys_agent_core::ModelCandidateKey::new(
+            ProfileId::new(),
+            1,
+            Some(1),
+            ProviderId::Xai,
+            ys_agent_core::ProviderModelId::new(ProviderId::Xai, "xai/new").expect("model"),
+        )
+        .expect("candidate key");
+
+        controller
+            .request_model_switch(&app, key)
+            .expect("schedule switch");
+        for _ in 0..100 {
+            if controller.apply_ready_model_switch(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(app.header_view().current_model, before);
+        assert_eq!(app.model_selection_state, before_state);
+    }
+
+    #[tokio::test]
+    async fn repeated_enter_while_model_switch_is_running_keeps_the_tui_open() {
+        let workspace_id = WorkspaceId::new();
+        let profile_id = ProfileId::new();
+        let target = SelectionTarget::Provider(ProviderId::DeepSeek);
+        let model =
+            ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/repeated-enter")
+                .expect("model");
+        let key = ys_agent_core::ModelCandidateKey::new(
+            profile_id,
+            1,
+            None,
+            ProviderId::DeepSeek,
+            model.clone(),
+        )
+        .expect("candidate key");
+        let snapshot = ys_agent_core::ModelSelectionSnapshot::new(vec![
+            ys_agent_core::SelectionTargetView::new(
+                target.clone(),
+                "deepseek",
+                ys_agent_core::SelectionAvailability::Configured,
+                ys_agent_core::SelectionCurrentStatus::NotCurrent,
+            )
+            .expect("configured target"),
+        ])
+        .expect("snapshot");
+        let candidates = ys_agent_core::ModelCandidateBatch::new(
+            target,
+            vec![
+                ys_agent_core::ModelCandidateView::new(
+                    key,
+                    "deepseek",
+                    model.as_str(),
+                    ys_agent_core::ModelCandidateStatus::Ready,
+                    ys_agent_core::SelectionCurrentStatus::NotCurrent,
+                )
+                .expect("candidate"),
+            ],
+        )
+        .expect("candidate batch");
+        let service = Arc::new(CountingMissingArtifactService::default());
+        let principal = Principal::local_operator("repeated-enter-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.model_selection_state
+            .reduce(ModelSelectionAction::SnapshotLoaded(snapshot));
+        assert!(matches!(
+            app.model_selection_state
+                .reduce(ModelSelectionAction::Confirm),
+            ModelSelectionOutcome::LoadCandidates(_)
+        ));
+        app.model_selection_state
+            .reduce(ModelSelectionAction::CandidatesLoaded(candidates));
+        app.push_route(ContentRoute::ModelSelection);
+
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("first Enter starts model activation");
+        assert!(controller.model_switch_in_flight());
+
+        crate::tui::event_loop::handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("repeated Enter must not terminate the TUI");
+        assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
+        assert!(controller.model_switch_in_flight());
+    }
+
+    #[tokio::test]
+    async fn online_model_discovery_never_blocks_the_terminal_event_loop() {
+        let workspace_id = WorkspaceId::new();
+        let profile_id = ProfileId::new();
+        let target = SelectionTarget::Provider(ProviderId::DeepSeek);
+        let snapshot = ys_agent_core::ModelSelectionSnapshot::new(vec![
+            ys_agent_core::SelectionTargetView::new(
+                target.clone(),
+                "deepseek",
+                ys_agent_core::SelectionAvailability::Configured,
+                ys_agent_core::SelectionCurrentStatus::NotCurrent,
+            )
+            .expect("configured target"),
+        ])
+        .expect("selection snapshot");
+        let model =
+            ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/deepseek-v4-pro")
+                .expect("model");
+        let key = ys_agent_core::ModelCandidateKey::new(
+            profile_id,
+            1,
+            None,
+            ProviderId::DeepSeek,
+            model.clone(),
+        )
+        .expect("candidate key");
+        let candidates = ys_agent_core::ModelCandidateBatch::new(
+            target,
+            vec![
+                ys_agent_core::ModelCandidateView::new(
+                    key,
+                    "deepseek",
+                    model.as_str(),
+                    ys_agent_core::ModelCandidateStatus::NeedsValidation,
+                    ys_agent_core::SelectionCurrentStatus::NotCurrent,
+                )
+                .expect("candidate"),
+            ],
+        )
+        .expect("candidate batch");
+        let service = Arc::new(CountingMissingArtifactService {
+            candidate_delay_ms: AtomicUsize::new(250),
+            candidate_batch: Mutex::new(Some(candidates)),
+            ..Default::default()
+        });
+        let principal = Principal::local_operator("non-blocking-discovery-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.model_selection_state
+            .reduce(ModelSelectionAction::SnapshotLoaded(snapshot));
+        app.push_route(ContentRoute::ModelSelection);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            controller.apply_model_selection_action(&mut app, ModelSelectionAction::Confirm),
+        )
+        .await
+        .expect("online discovery must be scheduled without blocking input")
+        .expect("selection action");
+
+        assert!(matches!(outcome, ModelSelectionOutcome::LoadCandidates(_)));
+        assert_eq!(
+            app.model_selection_state.load_state(),
+            &super::super::model_selection::ModelSelectionLoadState::Loading
+        );
+
+        tokio::time::sleep(Duration::from_millis(275)).await;
+        assert!(controller.apply_ready_model_candidates(&mut app));
+        assert_eq!(
+            app.model_selection_state.load_state(),
+            &super::super::model_selection::ModelSelectionLoadState::Ready
+        );
+        assert_eq!(app.model_selection_state.visible_candidate_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn model_selection_opens_immediately_and_failed_snapshot_can_retry_in_place() {
+        let workspace_id = WorkspaceId::new();
+        let profile_id = ProfileId::new();
+        let model =
+            ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/online-model")
+                .expect("model");
+        let active = ActiveProviderView {
+            activation_revision: 1,
+            profile_id,
+            profile_revision: 1,
+            provider: ProviderId::DeepSeek,
+            model,
+            parameters: ys_agent_core::ProviderParameters::default(),
+        };
+        let snapshot = ys_agent_core::ModelSelectionSnapshot::new(vec![
+            ys_agent_core::SelectionTargetView::new(
+                SelectionTarget::Provider(ProviderId::DeepSeek),
+                "DeepSeek",
+                ys_agent_core::SelectionAvailability::Configured,
+                ys_agent_core::SelectionCurrentStatus::Current,
+            )
+            .expect("target"),
+        ])
+        .expect("snapshot");
+        let service = Arc::new(CountingMissingArtifactService {
+            snapshot_delay_ms: AtomicUsize::new(200),
+            snapshot_fail: AtomicBool::new(true),
+            model_readback: Mutex::new(Some((active, snapshot))),
+            ..Default::default()
+        });
+        let principal = Principal::local_operator("async-model-catalog-test");
+        let mut controller = TuiController::new(service.clone(), workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            controller.apply(&mut app, InputAction::Model),
+        )
+        .await
+        .expect("/model must not await Catalog I/O")
+        .expect("open model selection");
+        assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
+        assert_eq!(
+            app.model_selection_state.load_state(),
+            &super::super::model_selection::ModelSelectionLoadState::Loading
+        );
+
+        tokio::time::sleep(Duration::from_millis(225)).await;
+        assert!(controller.apply_ready_model_candidates(&mut app));
+        assert!(matches!(
+            app.model_selection_state.load_state(),
+            super::super::model_selection::ModelSelectionLoadState::Failed(_)
+        ));
+
+        service.snapshot_delay_ms.store(0, Ordering::SeqCst);
+        service.snapshot_fail.store(false, Ordering::SeqCst);
+        controller
+            .apply_model_selection_action(&mut app, ModelSelectionAction::Retry)
+            .await
+            .expect("retry remains on the same panel");
+        for _ in 0..100 {
+            if controller.apply_ready_model_candidates(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            app.model_selection_state.load_state(),
+            &super::super::model_selection::ModelSelectionLoadState::Ready
+        );
+        assert_eq!(app.navigation.current(), ContentRoute::ModelSelection);
+    }
+
+    #[tokio::test]
+    async fn successful_model_switch_commits_only_authoritative_readback() {
+        let workspace_id = WorkspaceId::new();
+        let profile_id = ProfileId::new();
+        let model = ys_agent_core::ProviderModelId::new(ProviderId::Xai, "xai/authoritative")
+            .expect("model");
+        let active = ActiveProviderView {
+            activation_revision: 2,
+            profile_id,
+            profile_revision: 3,
+            provider: ProviderId::Xai,
+            model: model.clone(),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        };
+        let snapshot = ys_agent_core::ModelSelectionSnapshot::new(vec![
+            ys_agent_core::SelectionTargetView::new(
+                SelectionTarget::Provider(ProviderId::Xai),
+                "xAI",
+                ys_agent_core::SelectionAvailability::Configured,
+                ys_agent_core::SelectionCurrentStatus::Current,
+            )
+            .expect("target"),
+        ])
+        .expect("snapshot");
+        let display_context: TuiDisplayContext = TuiDisplayContextInput::new(
+            "Authoritative Workspace",
+            DatasourceDisplayState::active("Governed Warehouse").expect("datasource"),
+            true,
+            QueryDisplayState::Ready,
+        )
+        .expect("Display Context")
+        .into();
+        let service = Arc::new(CountingMissingArtifactService {
+            model_readback: Mutex::new(Some((active, snapshot))),
+            display_context: Mutex::new(Some(display_context)),
+            ..Default::default()
+        });
+        let principal = Principal::local_operator("model-switch-success-test");
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+        app.push_route(ContentRoute::ModelSelection);
+        let key =
+            ys_agent_core::ModelCandidateKey::new(profile_id, 3, Some(1), ProviderId::Xai, model)
+                .expect("candidate key");
+
+        controller
+            .request_model_switch(&app, key)
+            .expect("schedule switch");
+        for _ in 0..100 {
+            if controller.apply_ready_model_switch(&mut app) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..100 {
+            let catalog_ready = controller.apply_ready_model_candidates(&mut app);
+            let display_ready = controller.apply_ready_display_context(&mut app);
+            let _ = controller.apply_ready_doctor_refresh(&mut app);
+            if catalog_ready && display_ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(app.header_view().current_model, "xai/authoritative");
+        assert_eq!(app.header_view().workspace, "Authoritative Workspace");
+        assert_eq!(app.model_selection_state.current_target_count(), 1);
+    }
+
+    #[test]
+    fn query_readiness_requires_doctor_and_an_authoritative_active_model() {
+        let mut app = TuiApp::for_principal(Principal::local_operator("readiness-test"));
+        app.doctor_report = Some(DoctorReport {
+            blocker_codes: Vec::new(),
+            warning_codes: Vec::new(),
+            ready_capabilities: vec![ys_agent_runtime::doctor::QueryCapability::AdHocRead],
+            repairs: Vec::new(),
+        });
+        assert!(!app.query_submission_enabled());
+
+        let active = ActiveProviderView {
+            activation_revision: 1,
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            provider: ProviderId::DeepSeek,
+            model: ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/ready")
+                .expect("model"),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        };
+        app.apply_active_provider_view(Some(&active));
+        assert!(app.query_submission_enabled());
+    }
+
+    #[test]
+    fn conversation_readiness_requires_only_an_authoritative_active_model() {
+        let mut app = TuiApp::for_principal(Principal::local_operator("chat-readiness-test"));
+        app.doctor_report = Some(DoctorReport {
+            blocker_codes: vec!["connector_unavailable".to_owned()],
+            warning_codes: Vec::new(),
+            ready_capabilities: Vec::new(),
+            repairs: vec!["Configure a datasource".to_owned()],
+        });
+        let active = ActiveProviderView {
+            activation_revision: 1,
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            provider: ProviderId::DeepSeek,
+            model: ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/ready")
+                .expect("model"),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        };
+
+        app.apply_active_provider_view(Some(&active));
+
+        assert!(!app.query_submission_enabled());
+        assert!(app.conversation_submission_enabled());
+    }
+
+    #[test]
+    fn ordinary_message_without_a_model_shows_one_actionable_setup_hint() {
+        let workspace_id = WorkspaceId::new();
+        let principal = Principal::local_operator("missing-model-hint-test");
+        let service = Arc::new(CountingMissingArtifactService::default());
+        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+
+        controller
+            .start_message_submission(&mut app, "你好".to_owned())
+            .expect("missing setup is handled inside the TUI");
+
+        assert_eq!(app.transient, None);
+        assert_eq!(app.transcript.len(), 1);
+        let TranscriptItem::Warning(message) = &app.transcript[0] else {
+            panic!("missing model should render one concise setup hint")
+        };
+        assert!(message.contains("No active LLM model configured"));
+        assert!(message.contains("/model"));
+        assert!(!message.contains("Blocker"));
+        assert!(!message.contains("readiness"));
     }
 }

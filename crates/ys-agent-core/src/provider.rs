@@ -6,12 +6,25 @@ use zeroize::Zeroize;
 
 use crate::{CoreError, CoreResult, ModelProvider, OperationId, ProfileId, RunId, ValidationId};
 
-/// The only product providers accepted by the Provider-management feature.
+/// Provider and subscription-plan identities exposed by the model picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
+    OpenAi,
+    Kimi,
+    Qwen,
+    Gemini,
+    Glm,
     ChatGptSubscription,
+    ClaudeSubscription,
     OpenCodeGo,
+    AlibabaCoding,
+    BigModelCoding,
+    ZaiCoding,
+    MiniMaxCoding,
+    KimiCoding,
+    // Retained for backwards-compatible deserialization of profiles created before the
+    // The current catalog replaced the original provider list. They are not selectable.
     OpenCodeZen,
     DeepSeek,
     Xai,
@@ -22,22 +35,80 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 9] = [
-        Self::ChatGptSubscription,
-        Self::OpenCodeGo,
-        Self::OpenCodeZen,
+    pub const PROVIDERS: [Self; 9] = [
+        Self::OpenAi,
         Self::DeepSeek,
-        Self::Xai,
-        Self::Zai,
-        Self::OpenRouter,
-        Self::MiniMax,
         Self::Anthropic,
+        Self::Kimi,
+        Self::Qwen,
+        Self::Gemini,
+        Self::MiniMax,
+        Self::Glm,
+        Self::OpenRouter,
     ];
+
+    pub const PLANS: [Self; 8] = [
+        Self::ChatGptSubscription,
+        Self::ClaudeSubscription,
+        Self::OpenCodeGo,
+        Self::AlibabaCoding,
+        Self::BigModelCoding,
+        Self::ZaiCoding,
+        Self::MiniMaxCoding,
+        Self::KimiCoding,
+    ];
+
+    pub const ALL: [Self; 17] = [
+        Self::OpenAi,
+        Self::DeepSeek,
+        Self::Anthropic,
+        Self::Kimi,
+        Self::Qwen,
+        Self::Gemini,
+        Self::MiniMax,
+        Self::Glm,
+        Self::OpenRouter,
+        Self::ChatGptSubscription,
+        Self::ClaudeSubscription,
+        Self::OpenCodeGo,
+        Self::AlibabaCoding,
+        Self::BigModelCoding,
+        Self::ZaiCoding,
+        Self::MiniMaxCoding,
+        Self::KimiCoding,
+    ];
+
+    pub const LEGACY: [Self; 3] = [Self::OpenCodeZen, Self::Xai, Self::Zai];
+
+    pub const fn is_plan(self) -> bool {
+        matches!(
+            self,
+            Self::ChatGptSubscription
+                | Self::ClaudeSubscription
+                | Self::OpenCodeGo
+                | Self::AlibabaCoding
+                | Self::BigModelCoding
+                | Self::ZaiCoding
+                | Self::MiniMaxCoding
+                | Self::KimiCoding
+        )
+    }
 
     pub const fn model_prefix(self) -> &'static str {
         match self {
+            Self::OpenAi => "openai/",
+            Self::Kimi => "moonshot/",
+            Self::Qwen => "dashscope/",
+            Self::Gemini => "gemini/",
+            Self::Glm => "zai/",
             Self::ChatGptSubscription => "chatgpt/",
+            Self::ClaudeSubscription => "anthropic/",
             Self::OpenCodeGo => "opencode-go/",
+            Self::AlibabaCoding
+            | Self::BigModelCoding
+            | Self::ZaiCoding
+            | Self::MiniMaxCoding
+            | Self::KimiCoding => "anthropic/",
             Self::OpenCodeZen => "opencode/",
             Self::DeepSeek => "deepseek/",
             Self::Xai => "xai/",
@@ -64,6 +135,8 @@ pub struct ProviderModelId {
 }
 
 impl ProviderModelId {
+    pub const SETUP_PENDING_SUFFIX: &'static str = "__setup_pending__";
+
     pub fn new(provider: ProviderId, value: impl Into<String>) -> CoreResult<Self> {
         let value = value.into();
         let expected_prefix = provider.model_prefix();
@@ -88,6 +161,20 @@ impl ProviderModelId {
 
     pub fn provider(&self) -> ProviderId {
         self.provider
+    }
+
+    pub fn setup_pending(provider: ProviderId) -> Self {
+        Self::new(
+            provider,
+            format!("{}{}", provider.model_prefix(), Self::SETUP_PENDING_SUFFIX),
+        )
+        .expect("the internal setup-pending model uses the provider prefix")
+    }
+
+    pub fn is_setup_pending(&self) -> bool {
+        self.value
+            .strip_prefix(self.provider.model_prefix())
+            .is_some_and(|value| value == Self::SETUP_PENDING_SUFFIX)
     }
 }
 
@@ -1312,7 +1399,7 @@ impl<'de> Deserialize<'de> for ProviderErrorCode {
 }
 
 /// The portable error surface of every Provider port. It excludes arbitrary strings so raw
-/// keyring, OAuth, and HTTP errors cannot leak through the core boundary.
+/// credential-store, OAuth, and HTTP errors cannot leak through the core boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderManagementError {
     code: ProviderErrorCode,
@@ -1393,6 +1480,369 @@ pub struct ProviderCatalogView {
     pub credential_kind: CredentialKind,
     pub support_status: ProviderSupportStatus,
     pub evidence_gaps: Vec<String>,
+}
+
+/// Stable identifier for a governed commercial or subscription plan. It is display-safe and
+/// carries no entitlement, credential, URL, or provider request data.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ProviderPlanId(String);
+
+impl ProviderPlanId {
+    pub fn new(value: impl Into<String>) -> CoreResult<Self> {
+        let value = value.into();
+        if value.trim().is_empty()
+            || value != value.trim()
+            || value.chars().any(char::is_whitespace)
+        {
+            return Err(CoreError::validation(
+                "invalid_provider_plan_id",
+                "provider plan id must be a non-empty token without whitespace",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Catalog-owned classification used by the two top-level model-selection tabs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SelectionTarget {
+    Provider(ProviderId),
+    Plan {
+        provider: ProviderId,
+        plan: ProviderPlanId,
+    },
+}
+
+impl SelectionTarget {
+    pub const fn provider(&self) -> ProviderId {
+        match self {
+            Self::Provider(provider) | Self::Plan { provider, .. } => *provider,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionAvailability {
+    Configured,
+    NeedsSetup,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionCurrentStatus {
+    Current,
+    NotCurrent,
+}
+
+impl SelectionCurrentStatus {
+    pub const fn is_current(self) -> bool {
+        matches!(self, Self::Current)
+    }
+}
+
+/// One safe Provider or Plan row returned by the governed selection Catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SelectionTargetView {
+    target: SelectionTarget,
+    display_name: String,
+    availability: SelectionAvailability,
+    current: SelectionCurrentStatus,
+}
+
+impl SelectionTargetView {
+    pub fn new(
+        target: SelectionTarget,
+        display_name: impl Into<String>,
+        availability: SelectionAvailability,
+        current: SelectionCurrentStatus,
+    ) -> CoreResult<Self> {
+        let display_name = display_name.into();
+        validate_selection_label(&display_name, "selection target display name")?;
+        Ok(Self {
+            target,
+            display_name,
+            availability,
+            current,
+        })
+    }
+
+    pub fn target(&self) -> &SelectionTarget {
+        &self.target
+    }
+
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub const fn availability(&self) -> SelectionAvailability {
+        self.availability
+    }
+
+    pub const fn current(&self) -> SelectionCurrentStatus {
+        self.current
+    }
+}
+
+/// A complete top-level snapshot. Construction enforces the single global Current marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelSelectionSnapshot {
+    targets: Vec<SelectionTargetView>,
+}
+
+impl ModelSelectionSnapshot {
+    pub fn new(targets: Vec<SelectionTargetView>) -> CoreResult<Self> {
+        ensure_unique_current(
+            targets
+                .iter()
+                .filter(|target| target.current().is_current())
+                .count(),
+            "model selection snapshot",
+        )?;
+        Ok(Self { targets })
+    }
+
+    pub fn targets(&self) -> &[SelectionTargetView] {
+        &self.targets
+    }
+}
+
+/// Stable candidate identity and optimistic-concurrency preconditions. All fields are private so
+/// callers cannot construct a partial key or pair a model with the wrong Provider.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct ModelCandidateKey {
+    profile_id: ProfileId,
+    expected_profile_revision: u64,
+    expected_activation_revision: Option<u64>,
+    provider: ProviderId,
+    model: ProviderModelId,
+}
+
+impl ModelCandidateKey {
+    pub fn new(
+        profile_id: ProfileId,
+        expected_profile_revision: u64,
+        expected_activation_revision: Option<u64>,
+        provider: ProviderId,
+        model: ProviderModelId,
+    ) -> CoreResult<Self> {
+        if expected_profile_revision == 0 {
+            return Err(CoreError::validation(
+                "invalid_model_candidate_profile_revision",
+                "model candidate profile revision starts at 1",
+            ));
+        }
+        if expected_activation_revision == Some(0) {
+            return Err(CoreError::validation(
+                "invalid_model_candidate_activation_revision",
+                "model candidate activation revision starts at 1",
+            ));
+        }
+        if model.provider() != provider {
+            return Err(CoreError::validation(
+                "model_candidate_provider_mismatch",
+                "model candidate Provider must own the model identifier",
+            ));
+        }
+        Ok(Self {
+            profile_id,
+            expected_profile_revision,
+            expected_activation_revision,
+            provider,
+            model,
+        })
+    }
+
+    pub const fn profile_id(&self) -> ProfileId {
+        self.profile_id
+    }
+
+    pub const fn expected_profile_revision(&self) -> u64 {
+        self.expected_profile_revision
+    }
+
+    pub const fn expected_activation_revision(&self) -> Option<u64> {
+        self.expected_activation_revision
+    }
+
+    pub const fn provider(&self) -> ProviderId {
+        self.provider
+    }
+
+    pub fn model(&self) -> &ProviderModelId {
+        &self.model
+    }
+
+    pub fn ensure_fresh(
+        &self,
+        current_profile_revision: u64,
+        current_activation_revision: Option<u64>,
+    ) -> ProviderResult<()> {
+        if self.expected_profile_revision != current_profile_revision
+            || self.expected_activation_revision != current_activation_revision
+        {
+            return Err(ProviderManagementError::new(
+                ProviderErrorCode::ActivationPreconditionFailed,
+                Some(ProviderField::Activation),
+                ProviderRemediation::Retry,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCandidateStatus {
+    Ready,
+    NeedsValidation,
+    ValidationExpired,
+    CapabilityInsufficient,
+    Unavailable,
+}
+
+/// Display-safe model candidate. It deliberately excludes Provider parameters, validation
+/// digests, credentials, endpoints, request contents, and transport identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelCandidateView {
+    key: ModelCandidateKey,
+    profile_display_name: String,
+    model_display_name: String,
+    status: ModelCandidateStatus,
+    current: SelectionCurrentStatus,
+}
+
+impl ModelCandidateView {
+    pub fn new(
+        key: ModelCandidateKey,
+        profile_display_name: impl Into<String>,
+        model_display_name: impl Into<String>,
+        status: ModelCandidateStatus,
+        current: SelectionCurrentStatus,
+    ) -> CoreResult<Self> {
+        let profile_display_name = profile_display_name.into();
+        let model_display_name = model_display_name.into();
+        validate_selection_label(&profile_display_name, "profile display name")?;
+        validate_selection_label(&model_display_name, "model display name")?;
+        Ok(Self {
+            key,
+            profile_display_name,
+            model_display_name,
+            status,
+            current,
+        })
+    }
+
+    pub fn key(&self) -> &ModelCandidateKey {
+        &self.key
+    }
+
+    pub fn profile_display_name(&self) -> &str {
+        &self.profile_display_name
+    }
+
+    pub fn model_display_name(&self) -> &str {
+        &self.model_display_name
+    }
+
+    pub const fn status(&self) -> ModelCandidateStatus {
+        self.status
+    }
+
+    pub const fn current(&self) -> SelectionCurrentStatus {
+        self.current
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelCandidateBatch {
+    target: SelectionTarget,
+    candidates: Vec<ModelCandidateView>,
+}
+
+impl ModelCandidateBatch {
+    pub fn new(target: SelectionTarget, candidates: Vec<ModelCandidateView>) -> CoreResult<Self> {
+        ensure_unique_current(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.current().is_current())
+                .count(),
+            "model candidate batch",
+        )?;
+        if candidates
+            .iter()
+            .any(|candidate| candidate.key().provider() != target.provider())
+        {
+            return Err(CoreError::validation(
+                "model_candidate_target_mismatch",
+                "every model candidate must belong to the selected target Provider",
+            ));
+        }
+        Ok(Self { target, candidates })
+    }
+
+    pub fn target(&self) -> &SelectionTarget {
+        &self.target
+    }
+
+    pub fn candidates(&self) -> &[ModelCandidateView] {
+        &self.candidates
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListModelCandidatesRequest {
+    pub target: SelectionTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchModelRequest {
+    operation_id: OperationId,
+    candidate: ModelCandidateKey,
+}
+
+impl SwitchModelRequest {
+    pub const fn new(operation_id: OperationId, candidate: ModelCandidateKey) -> Self {
+        Self {
+            operation_id,
+            candidate,
+        }
+    }
+
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub const fn candidate(&self) -> &ModelCandidateKey {
+        &self.candidate
+    }
+}
+
+fn validate_selection_label(value: &str, label: &str) -> CoreResult<()> {
+    if value.trim().is_empty() || value != value.trim() || value.chars().any(char::is_control) {
+        return Err(CoreError::validation(
+            "invalid_model_selection_label",
+            format!("{label} must be non-empty, trimmed, and contain no control characters"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_unique_current(count: usize, scope: &str) -> CoreResult<()> {
+    if count > 1 {
+        return Err(CoreError::validation(
+            "multiple_current_model_selections",
+            format!("{scope} may contain at most one Current marker"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1976,8 +2426,15 @@ pub struct ProviderCredentialReference {
 #[serde(rename_all = "snake_case")]
 pub enum CredentialProtectionStatus {
     ConfirmedNative,
+    ConfirmedLocal,
     Unavailable,
     Unconfirmed,
+}
+
+impl CredentialProtectionStatus {
+    pub fn is_confirmed(self) -> bool {
+        matches!(self, Self::ConfirmedNative | Self::ConfirmedLocal)
+    }
 }
 
 /// An owned write request whose secret cannot be rendered, cloned, or serialized.

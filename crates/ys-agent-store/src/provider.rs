@@ -682,6 +682,33 @@ impl SqliteProviderRepository {
         .await
     }
 
+    pub async fn next_credential_generation(
+        &self,
+        profile_id: ProfileId,
+        kind: CredentialKind,
+    ) -> ProviderResult<CredentialGeneration> {
+        self.with_connection(move |connection| {
+            let maximum: Option<i64> = connection
+                .query_row(
+                    "SELECT MAX(generation)
+                     FROM provider_credential_generations
+                     WHERE profile_id = ?1",
+                    [profile_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(provider_storage_error)?;
+            let next = maximum
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| internal_error())?
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(internal_error)?;
+            CredentialGeneration::new(profile_id, next, kind).map_err(|_| internal_error())
+        })
+        .await
+    }
+
     pub async fn record_credential_vault_write(
         &self,
         mutation_id: OperationId,
@@ -1137,6 +1164,14 @@ impl ValidationActivationRepository for SqliteProviderRepository {
 
 #[async_trait]
 impl CredentialMutationRepository for SqliteProviderRepository {
+    async fn next_credential_generation(
+        &self,
+        profile_id: ProfileId,
+        kind: CredentialKind,
+    ) -> ProviderResult<CredentialGeneration> {
+        SqliteProviderRepository::next_credential_generation(self, profile_id, kind).await
+    }
+
     async fn begin_credential_mutation(
         &self,
         intent: CredentialMutationIntent,
@@ -1398,7 +1433,7 @@ fn generation_is_newest(
 
 fn credential_locator(generation: CredentialGeneration) -> String {
     format!(
-        "io.ysda.provider://{}:{}",
+        "io.ysda.local-credential://{}:{}",
         generation.profile_id(),
         generation.number()
     )

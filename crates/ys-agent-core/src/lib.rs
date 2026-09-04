@@ -46,7 +46,7 @@ pub use ids::{
 pub use metric::{MetricDefinition, MetricStatus};
 pub use model::{
     AgentAction, AssistantToolCall, ModelCapabilities, ModelMessage, ModelRequest, ModelResponse,
-    ModelRole, ModelUsage,
+    ModelResponseFormat, ModelRole, ModelToolChoice, ModelUsage,
 };
 
 pub use ports::{
@@ -66,17 +66,20 @@ pub use provider::{
     CredentialMutationPhase, CredentialMutationRecord, CredentialMutationRequest,
     CredentialPointerCommit, CredentialProtectionStatus, CredentialViewStatus,
     DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
-    OAuthConnectionStatus, OAuthConnectionView, ParameterApplicability, ParameterValue,
-    PersistedCompatibilityEvidence, PersistedCredentialMutationRecord, PersistedProfileRevision,
-    ProfileDetail, ProfileHistory, ProfileName, ProfileRevision, ProfileState, ProfileSummary,
-    ProtectedCredentialWrite, ProviderCatalogView, ProviderClientBinding,
-    ProviderCredentialReference, ProviderDoctorView, ProviderErrorCategory, ProviderErrorCode,
-    ProviderField, ProviderFingerprint, ProviderId, ProviderManagementError, ProviderModelId,
-    ProviderParameterKey, ProviderParameters, ProviderProfile, ProviderProfileRevision,
-    ProviderRemediation, ProviderResult, ProviderRetryability, ProviderSupportStatus,
-    RemoteRevocationOutcome, ResolvedRunProvider, RevisionPrecondition, RunProviderBinding,
-    SaveProfileRequest, SaveProfileRevision, SecretValue, ValidateProfileRequest, ValidationCommit,
-    ValidationCommitPrecondition, ValidationDigest, ValidationInputs, ValidationVersions,
+    ListModelCandidatesRequest, ModelCandidateBatch, ModelCandidateKey, ModelCandidateStatus,
+    ModelCandidateView, ModelSelectionSnapshot, OAuthConnectionStatus, OAuthConnectionView,
+    ParameterApplicability, ParameterValue, PersistedCompatibilityEvidence,
+    PersistedCredentialMutationRecord, PersistedProfileRevision, ProfileDetail, ProfileHistory,
+    ProfileName, ProfileRevision, ProfileState, ProfileSummary, ProtectedCredentialWrite,
+    ProviderCatalogView, ProviderClientBinding, ProviderCredentialReference, ProviderDoctorView,
+    ProviderErrorCategory, ProviderErrorCode, ProviderField, ProviderFingerprint, ProviderId,
+    ProviderManagementError, ProviderModelId, ProviderParameterKey, ProviderParameters,
+    ProviderPlanId, ProviderProfile, ProviderProfileRevision, ProviderRemediation, ProviderResult,
+    ProviderRetryability, ProviderSupportStatus, RemoteRevocationOutcome, ResolvedRunProvider,
+    RevisionPrecondition, RunProviderBinding, SaveProfileRequest, SaveProfileRevision, SecretValue,
+    SelectionAvailability, SelectionCurrentStatus, SelectionTarget, SelectionTargetView,
+    SwitchModelRequest, ValidateProfileRequest, ValidationCommit, ValidationCommitPrecondition,
+    ValidationDigest, ValidationInputs, ValidationVersions,
 };
 
 pub use query::{

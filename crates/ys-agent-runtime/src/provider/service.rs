@@ -11,15 +11,15 @@ use std::{
 use ys_agent_core::{
     ActivateProfileRequest, ActivationConfirmation, ActiveProviderSnapshot, ActiveProviderView,
     CredentialGeneration, CredentialKind, CredentialMutation, CredentialMutationIntent,
-    CredentialMutationOperation, CredentialMutationRepository, CredentialMutationRequest,
-    CredentialPointerCommit, CredentialProtectionStatus, CredentialVault, CredentialViewStatus,
-    DeleteProfileRequest, DeviceAuthorizationView, OAuthConnectionService, OAuthConnectionStatus,
-    OAuthConnectionView, OperationId, ProfileDetail, ProfileId, ProfileName, ProfileRevision,
-    ProfileSummary, ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode,
-    ProviderField, ProviderId, ProviderManagementError, ProviderProfileRepository,
-    ProviderRemediation, ProviderResult, RemoteRevocationOutcome, RevisionPrecondition,
-    RunProviderBindingRepository, SaveProfileRequest, SaveProfileRevision, SecretValue,
-    ValidationCommit,
+    CredentialMutationOperation, CredentialMutationPhase, CredentialMutationRecord,
+    CredentialMutationRepository, CredentialMutationRequest, CredentialPointerCommit,
+    CredentialProtectionStatus, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
+    DeviceAuthorizationView, OAuthConnectionService, OAuthConnectionStatus, OAuthConnectionView,
+    OperationId, ProfileDetail, ProfileId, ProfileName, ProfileRevision, ProfileSummary,
+    ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode, ProviderField,
+    ProviderId, ProviderManagementError, ProviderProfileRepository, ProviderRemediation,
+    ProviderResult, RemoteRevocationOutcome, RevisionPrecondition, RunProviderBindingRepository,
+    SaveProfileRequest, SaveProfileRevision, SecretValue, ValidationCommit,
 };
 use zeroize::Zeroizing;
 
@@ -68,6 +68,56 @@ impl CredentialService {
         }
     }
 
+    /// Rolls back intents left before a protected write was acknowledged. A process restart has
+    /// no live owner for these records, so retaining them would permanently reject the next
+    /// credential or browser sign-in attempt as stale. The staged Vault locator is deleted first
+    /// to cover a crash immediately after the write but before its journal acknowledgement.
+    pub async fn recover_abandoned_intents(&self) -> ProviderResult<usize> {
+        let records = self.profiles.pending_credential_mutations().await?;
+        let mut recovered = 0;
+        for record in records
+            .into_iter()
+            .filter(|record| record.phase() == CredentialMutationPhase::IntentRecorded)
+        {
+            self.rollback_unacknowledged_intent(record).await?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    /// Cleans up the journal record owned by a cooperatively cancelled operation. Missing and
+    /// already-advanced records are safe no-ops: later phases crossed an irreversible boundary
+    /// and must remain available to the normal recovery path.
+    pub async fn rollback_cancelled_intent(&self, operation_id: OperationId) -> ProviderResult<()> {
+        let record = self
+            .profiles
+            .pending_credential_mutations()
+            .await?
+            .into_iter()
+            .find(|record| record.operation_id() == operation_id);
+        if let Some(record) = record
+            && record.phase() == CredentialMutationPhase::IntentRecorded
+        {
+            self.rollback_unacknowledged_intent(record).await?;
+        }
+        Ok(())
+    }
+
+    async fn rollback_unacknowledged_intent(
+        &self,
+        record: CredentialMutationRecord,
+    ) -> ProviderResult<()> {
+        if let Some(generation) = record.new_generation().or(record.rollback_generation()) {
+            self.vault
+                .delete_generation(credential_reference(generation))
+                .await?;
+        }
+        self.profiles
+            .rollback_credential_mutation(record.operation_id())
+            .await?;
+        Ok(())
+    }
+
     /// Creates, replaces, or deletes one API-key generation. Every successful operation appends
     /// an unvalidated Draft; it never moves the active pointer or exposes secret material.
     pub async fn mutate(
@@ -78,6 +128,12 @@ impl CredentialService {
             .profiles
             .load_current_revision(request.intent.profile_id())
             .await?;
+        validate_credential_request(&current, &request.intent, &request.mutation)?;
+        let allocated = self
+            .profiles
+            .next_credential_generation(current.profile_id(), CredentialKind::ApiKey)
+            .await?;
+        let request = rebase_credential_request(&current, request, allocated)?;
         let staged = validate_credential_request(&current, &request.intent, &request.mutation)?;
         let operation_id = request.intent.operation_id();
         let old_generation = request.intent.old_generation();
@@ -88,10 +144,12 @@ impl CredentialService {
             .begin_credential_mutation(request.intent.clone())
             .await?;
 
-        if !matches!(
-            self.vault.protection_status().await,
-            Ok(CredentialProtectionStatus::ConfirmedNative)
-        ) {
+        if !self
+            .vault
+            .protection_status()
+            .await
+            .is_ok_and(CredentialProtectionStatus::is_confirmed)
+        {
             return Err(self.block_after_uncertain_state(operation_id).await);
         }
 
@@ -331,6 +389,9 @@ impl ProviderManagementService {
         let current = self.profiles.load_current_revision(profile_id).await?;
         self.require_chatgpt(&current)?;
         let oauth = self.oauth_adapter()?;
+        if self.has_pending_oauth_operation(profile_id)? {
+            return oauth.view(profile_id).await;
+        }
         match current.credential_generation() {
             Some(generation) => oauth.restore(profile_id, generation).await,
             None => oauth.view(profile_id).await,
@@ -372,7 +433,10 @@ impl ProviderManagementService {
             let _ = self.oauth_connection(profile_id).await?;
         }
         self.insert_oauth_operation(operation_id, &current)?;
-        let result = self.oauth_adapter()?.reauthorize(profile_id, operation_id).await;
+        let result = self
+            .oauth_adapter()?
+            .reauthorize(profile_id, operation_id)
+            .await;
         if result.is_err() {
             self.remove_oauth_operation(operation_id)?;
         }
@@ -402,14 +466,24 @@ impl ProviderManagementService {
             ));
         }
         self.require_chatgpt(&current)?;
-        let next_generation = next_oauth_generation(&current)?;
+        let next_generation = self
+            .profiles
+            .next_credential_generation(profile_id, CredentialKind::OAuthConnection)
+            .await?;
         let intent = oauth_mutation_intent(operation_id, &current, next_generation)?;
         self.profiles.begin_credential_mutation(intent).await?;
 
-        let view = match self.oauth_adapter()?.complete(operation_id).await {
+        let view = match self
+            .oauth_adapter()?
+            .complete(operation_id, next_generation)
+            .await
+        {
             Ok(view)
                 if view.profile_id == profile_id
-                    && view.status == OAuthConnectionStatus::Connected => view,
+                    && view.status == OAuthConnectionStatus::Connected =>
+            {
+                view
+            }
             Ok(_) => {
                 return Err(self
                     .rollback_oauth_mutation(operation_id, profile_id, oauth_not_connected_error())
@@ -444,17 +518,23 @@ impl ProviderManagementService {
         ) {
             return Err(oauth_not_connected_error());
         }
-        let next_generation = next_oauth_generation(&current)?;
+        let next_generation = self
+            .profiles
+            .next_credential_generation(profile_id, CredentialKind::OAuthConnection)
+            .await?;
         let intent = oauth_mutation_intent(operation_id, &current, next_generation)?;
         self.profiles.begin_credential_mutation(intent).await?;
         let view = match self
             .oauth_adapter()?
-            .refresh(profile_id, operation_id)
+            .refresh(profile_id, operation_id, next_generation)
             .await
         {
             Ok(view)
                 if view.profile_id == profile_id
-                    && view.status == OAuthConnectionStatus::Connected => view,
+                    && view.status == OAuthConnectionStatus::Connected =>
+            {
+                view
+            }
             Ok(_) => {
                 return Err(self
                     .rollback_oauth_mutation(operation_id, profile_id, oauth_not_connected_error())
@@ -594,6 +674,7 @@ impl ProviderManagementService {
             .lock()
             .map_err(|_| internal_operation_error())?
             .insert(operation_id);
+        self.remove_oauth_operation(operation_id)?;
         Ok(())
     }
 
@@ -608,9 +689,7 @@ impl ProviderManagementService {
         let summary = self.profile_summary(profile_id).await?;
         let revision = self.profiles.load_current_revision(profile_id).await?;
         let mut detail = profile_detail(summary, revision.clone());
-        if revision.provider() == ProviderId::ChatGptSubscription
-            && self.oauth.is_some()
-        {
+        if revision.provider() == ProviderId::ChatGptSubscription && self.oauth.is_some() {
             // Browsing must remain available when a platform credential store is unavailable.
             // The only safe degraded view is non-Connected; never infer connectivity from a
             // SQLite pointer alone.
@@ -627,6 +706,7 @@ impl ProviderManagementService {
     /// Persists the caller's next Draft revision under the repository CAS precondition. A failed
     /// save returns before this service can alter the active snapshot or any prior revision.
     pub async fn save_profile(&self, request: SaveProfileRequest) -> ProviderResult<ProfileDetail> {
+        self.require_not_cancelled(request.operation_id)?;
         let profile_id = request.revision.revision.profile_id();
         self.validate_draft(&request.revision.name, &request.revision.revision)
             .await?;
@@ -755,27 +835,30 @@ impl ProviderManagementService {
         next_generation: CredentialGeneration,
     ) -> ProviderResult<()> {
         let profile_id = current.profile_id();
-        if let Err(error) = self.profiles.record_credential_vault_write(operation_id).await {
+        if let Err(error) = self
+            .profiles
+            .record_credential_vault_write(operation_id)
+            .await
+        {
             return Err(self
                 .rollback_oauth_mutation(operation_id, profile_id, error)
                 .await);
         }
         let replacement = ProfileRevision::draft(
             profile_id,
-            current.revision().checked_add(1).ok_or_else(internal_error)?,
+            current
+                .revision()
+                .checked_add(1)
+                .ok_or_else(internal_error)?,
             current.provider(),
             current.model().clone(),
             current.parameters().clone(),
             Some(next_generation),
         )
         .map_err(|_| internal_error())?;
-        let commit = CredentialPointerCommit::new(
-            operation_id,
-            profile_id,
-            current.revision(),
-            replacement,
-        )
-        .map_err(|_| internal_error())?;
+        let commit =
+            CredentialPointerCommit::new(operation_id, profile_id, current.revision(), replacement)
+                .map_err(|_| internal_error())?;
         if let Err(error) = self.profiles.commit_credential_pointer(commit).await {
             return Err(self
                 .rollback_oauth_mutation(operation_id, profile_id, error)
@@ -783,7 +866,9 @@ impl ProviderManagementService {
         }
         // The new revision deliberately remains Draft. Its existing model must pass a fresh
         // compatibility probe before the caller can explicitly activate it.
-        self.profiles.complete_credential_mutation(operation_id).await?;
+        self.profiles
+            .complete_credential_mutation(operation_id)
+            .await?;
         Ok(())
     }
 
@@ -829,9 +914,7 @@ impl ProviderManagementService {
     }
 
     fn oauth_adapter(&self) -> ProviderResult<&dyn OAuthConnectionService> {
-        self.oauth
-            .as_deref()
-            .ok_or_else(oauth_not_connected_error)
+        self.oauth.as_deref().ok_or_else(oauth_not_connected_error)
     }
 
     fn require_chatgpt(&self, revision: &ProfileRevision) -> ProviderResult<()> {
@@ -895,6 +978,15 @@ impl ProviderManagementService {
             })
     }
 
+    fn has_pending_oauth_operation(&self, profile_id: ProfileId) -> ProviderResult<bool> {
+        Ok(self
+            .oauth_operations
+            .lock()
+            .map_err(|_| internal_operation_error())?
+            .values()
+            .any(|operation| operation.profile_id == profile_id))
+    }
+
     fn remove_oauth_operation(&self, operation_id: OperationId) -> ProviderResult<()> {
         self.oauth_operations
             .lock()
@@ -903,7 +995,7 @@ impl ProviderManagementService {
         Ok(())
     }
 
-    fn require_not_cancelled(&self, operation_id: OperationId) -> ProviderResult<()> {
+    pub(super) fn require_not_cancelled(&self, operation_id: OperationId) -> ProviderResult<()> {
         let cancelled = self
             .cancelled_operations
             .lock()
@@ -957,21 +1049,6 @@ fn oauth_not_connected_error() -> ProviderManagementError {
     )
 }
 
-fn next_oauth_generation(current: &ProfileRevision) -> ProviderResult<CredentialGeneration> {
-    let next_number = current
-        .credential_generation()
-        .map(CredentialGeneration::number)
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(internal_error)?;
-    CredentialGeneration::new(
-        current.profile_id(),
-        next_number,
-        CredentialKind::OAuthConnection,
-    )
-    .map_err(|_| internal_error())
-}
-
 fn oauth_mutation_intent(
     operation_id: OperationId,
     current: &ProfileRevision,
@@ -997,6 +1074,45 @@ fn oauth_mutation_intent(
         )
         .map_err(|_| internal_error()),
     }
+}
+
+fn rebase_credential_request(
+    current: &ProfileRevision,
+    mut request: CredentialMutationRequest,
+    allocated: CredentialGeneration,
+) -> ProviderResult<CredentialMutationRequest> {
+    let operation_id = request.intent.operation_id();
+    request.intent = match &mut request.mutation {
+        CredentialMutation::Replace(write) => {
+            write.reference = credential_reference(allocated);
+            match current.credential_generation() {
+                Some(old_generation) => CredentialMutationIntent::replace(
+                    operation_id,
+                    current.profile_id(),
+                    current.revision(),
+                    old_generation,
+                    allocated,
+                ),
+                None => CredentialMutationIntent::create(
+                    operation_id,
+                    current.profile_id(),
+                    current.revision(),
+                    allocated,
+                ),
+            }
+        }
+        CredentialMutation::Delete => CredentialMutationIntent::delete(
+            operation_id,
+            current.profile_id(),
+            current.revision(),
+            current
+                .credential_generation()
+                .ok_or_else(credential_stale_error)?,
+            allocated,
+        ),
+    }
+    .map_err(|_| internal_error())?;
+    Ok(request)
 }
 
 fn internal_operation_error() -> ProviderManagementError {

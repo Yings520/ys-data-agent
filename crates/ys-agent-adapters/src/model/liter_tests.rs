@@ -1,7 +1,8 @@
 use std::time::Duration;
 
+use liter_llm::auth::Credential;
 use liter_llm::error::LiterLlmError;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use ys_agent_core::{
     CredentialGeneration, CredentialLease, ProfileId, ProviderClientBinding, ProviderClientFactory,
@@ -70,7 +71,7 @@ fn oauth_lease() -> CredentialLease {
 }
 
 #[test]
-fn all_nine_allowlisted_bindings_create_only_fixed_client_plans() {
+fn all_selectable_bindings_create_only_fixed_client_plans() {
     let factory = LiterProviderFactory::new();
 
     for provider in ProviderId::ALL {
@@ -99,6 +100,8 @@ fn all_nine_allowlisted_bindings_create_only_fixed_client_plans() {
                             FIXTURE_ACCOUNT_ID.to_owned()
                         ),
                         ("originator".to_owned(), "codex_cli_rs".to_owned()),
+                        ("user-agent".to_owned(), "codex_cli_rs/0.152.1".to_owned()),
+                        ("accept".to_owned(), "text/event-stream".to_owned()),
                     ]
                 );
                 assert!(!config.load_env);
@@ -111,12 +114,41 @@ fn all_nine_allowlisted_bindings_create_only_fixed_client_plans() {
                     model_hint, config, ..
                 },
             ) => {
+                let expected_base_url = match expected {
+                    ProviderId::OpenAi => "https://api.openai.com/v1",
+                    ProviderId::DeepSeek => "https://api.deepseek.com",
+                    ProviderId::Anthropic | ProviderId::ClaudeSubscription => {
+                        "https://api.anthropic.com/v1"
+                    }
+                    ProviderId::Kimi => "https://api.moonshot.cn/v1",
+                    ProviderId::Qwen => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    ProviderId::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
+                    ProviderId::MiniMax => "https://api.minimaxi.com/v1",
+                    ProviderId::Glm => "https://open.bigmodel.cn/api/paas/v4",
+                    ProviderId::OpenRouter => "https://openrouter.ai/api/v1",
+                    ProviderId::OpenCodeGo => "https://opencode.ai/zen/go/v1",
+                    ProviderId::AlibabaCoding => {
+                        "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1"
+                    }
+                    ProviderId::BigModelCoding => "https://open.bigmodel.cn/api/anthropic/v1",
+                    ProviderId::ZaiCoding => "https://api.z.ai/api/anthropic/v1",
+                    ProviderId::MiniMaxCoding => "https://api.minimaxi.com/anthropic/v1",
+                    ProviderId::KimiCoding => "https://api.kimi.com/coding/v1",
+                    ProviderId::ChatGptSubscription
+                    | ProviderId::OpenCodeZen
+                    | ProviderId::Xai
+                    | ProviderId::Zai => unreachable!("not a selectable Chat binding"),
+                };
                 assert_eq!(
                     model_hint,
                     format!("{}fixture-model", expected.model_prefix())
                 );
-                assert_eq!(config.base_url, None);
-                assert!(config.headers().is_empty());
+                assert_eq!(config.base_url.as_deref(), Some(expected_base_url));
+                if expected == ProviderId::ClaudeSubscription {
+                    assert!(!config.headers().is_empty());
+                } else {
+                    assert!(config.headers().is_empty());
+                }
                 assert_eq!(config.timeout, Duration::from_secs(30));
                 assert_eq!(config.max_retries, 0);
                 assert!(!config.load_env);
@@ -124,6 +156,62 @@ fn all_nine_allowlisted_bindings_create_only_fixed_client_plans() {
             _ => panic!("factory selected the wrong protocol for {provider:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn claude_subscription_uses_setup_token_bearer_auth_and_required_headers() {
+    let factory = LiterProviderFactory::new();
+    let plan = factory
+        .build_plan(
+            binding(
+                ProviderId::ClaudeSubscription,
+                ProviderParameters::default(),
+            ),
+            CredentialLease::new(SecretValue::from_utf8(
+                "sk-ant-oat01-fixture-setup-token".to_owned(),
+            )),
+        )
+        .expect("Claude subscription setup token builds a client plan");
+
+    let ClientPlan::Chat { config, .. } = plan else {
+        panic!("Claude subscription uses the Anthropic Messages protocol")
+    };
+    assert!(
+        config.api_key.expose_secret().is_empty(),
+        "a setup token must never be configured as Anthropic x-api-key auth"
+    );
+    let credential = config
+        .credential_provider
+        .as_ref()
+        .expect("Claude subscription must resolve a Bearer credential")
+        .resolve()
+        .await
+        .expect("static setup token resolves");
+    let Credential::BearerToken(token) = credential else {
+        panic!("Claude setup token must resolve as Bearer auth")
+    };
+    assert_eq!(
+        token.expose_secret(),
+        SecretString::from("sk-ant-oat01-fixture-setup-token".to_owned()).expose_secret()
+    );
+    for (name, value) in [
+        (
+            "anthropic-beta",
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,web-fetch-2025-09-10",
+        ),
+        ("user-agent", "claude-cli/2.1.75 (external, cli)"),
+        ("x-app", "cli"),
+        ("anthropic-dangerous-direct-browser-access", "true"),
+    ] {
+        assert!(
+            config
+                .headers()
+                .iter()
+                .any(|(header, actual)| header == name && actual == value),
+            "missing Claude subscription header {name}"
+        );
+    }
+    assert!(!config.load_env);
 }
 
 #[tokio::test]

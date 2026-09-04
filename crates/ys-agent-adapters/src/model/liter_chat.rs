@@ -9,16 +9,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use liter_llm::types::{
     AssistantContent, AssistantMessage, ChatCompletionRequest, ChatCompletionResponse,
-    ChatCompletionTool, FinishReason, FunctionCall, FunctionDefinition, Message, SystemMessage,
-    ToolCall as LiterToolCall, ToolChoice, ToolChoiceMode, ToolMessage, ToolType, UserContent,
-    UserMessage,
+    ChatCompletionTool, FinishReason, FunctionCall, FunctionDefinition, Message, ResponseFormat,
+    SystemMessage, ToolCall as LiterToolCall, ToolChoice, ToolChoiceMode, ToolMessage, ToolType,
+    UserContent, UserMessage,
 };
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 use ys_agent_core::{
-    AgentAction, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelUsage,
-    ParameterApplicability, ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError,
-    ProviderParameterKey, ProviderRemediation, ProviderResult, ToolCall, ToolCallId, ToolSpec,
+    AgentAction, ModelMessage, ModelRequest, ModelResponse, ModelResponseFormat, ModelRole,
+    ModelToolChoice, ModelUsage, ParameterApplicability, ProviderErrorCode, ProviderField,
+    ProviderId, ProviderManagementError, ProviderParameterKey, ProviderRemediation, ProviderResult,
+    ToolCall, ToolCallId, ToolSpec,
 };
 
 /// Version input for compatibility evidence. Bump whenever the encoded contract changes.
@@ -64,7 +65,7 @@ impl LiterChatCodec {
     }
 
     pub fn encode_request(&self, request: &ModelRequest) -> ProviderResult<ChatCompletionRequest> {
-        self.validate_model(&request.model)?;
+        let model = self.validate_model(&request.model)?;
         self.validate_temperature(request.temperature)?;
         if request.messages.is_empty() {
             return Err(protocol_incompatible());
@@ -73,16 +74,34 @@ impl LiterChatCodec {
         let tools = convert_tools(&request.tools)?;
         let messages = self.convert_messages(&request.messages, &request.tools)?.0;
         let has_tools = !tools.is_empty();
+        let tool_choice = match request.tool_choice {
+            ModelToolChoice::Auto => has_tools.then_some(ToolChoiceMode::Auto),
+            ModelToolChoice::Required if has_tools => Some(ToolChoiceMode::Required),
+            ModelToolChoice::Required => return Err(protocol_incompatible()),
+            ModelToolChoice::None => has_tools.then_some(ToolChoiceMode::None),
+        }
+        .map(ToolChoice::Mode);
+        let response_format = match request.response_format {
+            ModelResponseFormat::Text => None,
+            ModelResponseFormat::JsonObject => Some(ResponseFormat::JsonObject),
+        };
+        // DeepSeek V4 requires reasoning_content replay for thinking-mode tool continuations.
+        // Core intentionally retains only the governed action/tool ledger, so pin this adapter to
+        // non-thinking mode instead of emitting a continuation the provider will reject.
+        let extra_body = (self.provider == ProviderId::DeepSeek)
+            .then(|| json!({"thinking": {"type": "disabled"}}));
 
         Ok(ChatCompletionRequest {
-            model: request.model.clone(),
+            model: model.to_owned(),
             messages,
             temperature: request.temperature.map(f64::from),
             tools: has_tools.then_some(tools),
-            tool_choice: has_tools.then_some(ToolChoice::Mode(ToolChoiceMode::Auto)),
+            tool_choice,
             // Core accepts one action per turn. Asking providers not to emit parallel calls makes
             // that constraint explicit; decode still rejects a provider that ignores it.
             parallel_tool_calls: has_tools.then_some(false),
+            response_format,
+            extra_body,
             ..ChatCompletionRequest::default()
         })
     }
@@ -184,19 +203,23 @@ impl LiterChatCodec {
         })
     }
 
-    fn validate_model(&self, model: &str) -> ProviderResult<()> {
+    fn validate_model<'a>(&self, model: &'a str) -> ProviderResult<&'a str> {
         let prefix = self.provider.model_prefix();
-        if !model.starts_with(prefix)
-            || model.len() == prefix.len()
-            || model.chars().any(char::is_whitespace)
-        {
+        let Some(model) = model.strip_prefix(prefix) else {
+            return Err(error(
+                ProviderErrorCode::InvalidModelPrefix,
+                Some(ProviderField::Model),
+                ProviderRemediation::ReturnToEdit,
+            ));
+        };
+        if model.is_empty() || model.chars().any(char::is_whitespace) {
             return Err(error(
                 ProviderErrorCode::InvalidModelPrefix,
                 Some(ProviderField::Model),
                 ProviderRemediation::ReturnToEdit,
             ));
         }
-        Ok(())
+        Ok(model)
     }
 
     fn validate_temperature(&self, temperature: Option<f32>) -> ProviderResult<()> {

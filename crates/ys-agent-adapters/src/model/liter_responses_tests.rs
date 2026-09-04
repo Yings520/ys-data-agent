@@ -3,11 +3,14 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use ys_agent_core::{
     AgentAction, AssistantToolCall, ContextManifest, CredentialLease, ModelMessage, ModelRequest,
-    ModelRole, ParameterApplicability, ProviderErrorCode, ProviderField, ProviderParameterKey,
-    SecretValue, Sensitivity, SideEffect, ToolRisk, ToolSpec,
+    ModelResponseFormat, ModelRole, ModelToolChoice, ParameterApplicability, ProviderErrorCode,
+    ProviderField, ProviderParameterKey, SecretValue, Sensitivity, SideEffect, ToolRisk, ToolSpec,
 };
 
-use super::{CHATGPT_RESPONSES_BACKEND, CHATGPT_RESPONSES_ORIGINATOR, ChatGptResponsesCodec};
+use super::{
+    CHATGPT_RESPONSES_ACCEPT, CHATGPT_RESPONSES_BACKEND, CHATGPT_RESPONSES_ORIGINATOR,
+    ChatGptResponsesCodec,
+};
 
 const FIXTURE_ACCESS_TOKEN: &str = "fixture-access-token";
 const FIXTURE_ACCOUNT_ID: &str = "fixture-account";
@@ -55,6 +58,8 @@ fn request() -> ModelRequest {
         tools: vec![tool_spec()],
         context_manifest: ContextManifest::empty(8_000),
         temperature: Some(0.2),
+        tool_choice: ModelToolChoice::Auto,
+        response_format: ModelResponseFormat::JsonObject,
     }
 }
 
@@ -142,6 +147,8 @@ fn fixed_responses_config_uses_connected_oauth_and_redacts_values() {
                 "originator".to_owned(),
                 CHATGPT_RESPONSES_ORIGINATOR.to_owned()
             ),
+            ("user-agent".to_owned(), "codex_cli_rs/0.152.1".to_owned()),
+            ("accept".to_owned(), CHATGPT_RESPONSES_ACCEPT.to_owned()),
         ]
     );
     let debug = format!("{config:?}");
@@ -193,7 +200,10 @@ fn request_and_multi_turn_tool_result_preserve_the_provider_call_id() {
     assert_eq!(value["input"][3]["type"], "function_call_output");
     assert_eq!(value["input"][3]["call_id"], "call_fixture_123");
     assert_eq!(value["tools"][0]["type"], "function");
-    assert!(value.get("extra_body").is_none());
+    assert_eq!(value["extra_body"]["tool_choice"], "auto");
+    assert_eq!(value["extra_body"]["parallel_tool_calls"], false);
+    assert_eq!(value["extra_body"]["store"], false);
+    assert_eq!(value["extra_body"]["text"]["format"]["type"], "json_object");
 }
 
 #[test]
@@ -217,6 +227,36 @@ fn text_action_and_usage_decode_without_retaining_raw_payload() {
         AgentAction::RequestClarification { ref question } if question == "Continue?"
     ));
     assert_eq!(decoded.usage.expect("usage").total_tokens, 14);
+    assert_eq!(decoded.raw_content, None);
+}
+
+#[test]
+fn reasoning_before_a_single_tool_call_is_not_treated_as_a_protocol_failure() {
+    let decoded = codec()
+        .decode_response(
+            &request(),
+            response(json!([
+                {
+                    "type": "reasoning",
+                    "id": "rsn_fixture",
+                    "summary": [],
+                    "content": []
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_reasoned_123",
+                    "name": "inspect_schema",
+                    "arguments": "{\"source\":\"fixture\"}"
+                }
+            ])),
+        )
+        .expect("reasoning plus one tool call is a valid Responses result");
+
+    assert!(matches!(
+        decoded.action,
+        AgentAction::CallTool { ref call }
+            if call.provider_call_id.as_deref() == Some("call_reasoned_123")
+    ));
     assert_eq!(decoded.raw_content, None);
 }
 

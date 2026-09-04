@@ -8,10 +8,12 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use liter_llm::{
-    LlmClient, ResponseClient,
+    LlmClient,
+    auth::StaticTokenProvider,
     client::{ClientConfig, ClientConfigBuilder, DefaultClient},
     error::LiterLlmError,
 };
+use secrecy::SecretString;
 use ys_agent_core::{
     CoreError, CoreResult, CredentialLease, ModelCapabilities, ModelProvider, ModelRequest,
     ModelResponse, ParameterApplicability, ProviderClientBinding, ProviderClientFactory,
@@ -20,11 +22,14 @@ use ys_agent_core::{
 };
 
 use super::{
-    liter_chat::LiterChatCodec, liter_responses::ChatGptResponsesCodec, required_capabilities,
+    liter_chat::LiterChatCodec,
+    liter_responses::{ChatGptResponsesCodec, ChatGptResponsesTransport},
+    required_capabilities,
 };
 
 const MAX_BOUND_RETRIES: u32 = 2;
 const CANDIDATE_CONTEXT_LIMIT: u64 = 128_000;
+const CLAUDE_SUBSCRIPTION_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,web-fetch-2025-09-10";
 
 /// The only production client factory for the nine governed Provider paths.
 #[derive(Debug, Default, Clone, Copy)]
@@ -41,7 +46,6 @@ enum ClientPlan {
         codec: LiterChatCodec,
     },
     Responses {
-        model_hint: String,
         model: String,
         temperature: Option<f32>,
         config: ClientConfig,
@@ -71,7 +75,6 @@ impl LiterProviderFactory {
             config.timeout = timeout;
             config.max_retries = retry_count;
             return Ok(ClientPlan::Responses {
-                model_hint: model.clone(),
                 model,
                 temperature: binding.parameters.temperature(),
                 config,
@@ -85,11 +88,29 @@ impl LiterProviderFactory {
                 if api_key.trim().is_empty() || api_key.trim() != api_key {
                     return Err(authentication_invalid());
                 }
-                Ok(ClientConfigBuilder::new(api_key)
+                let mut builder = ClientConfigBuilder::new(api_key)
                     .load_env(false)
                     .timeout(timeout)
-                    .max_retries(retry_count)
-                    .build())
+                    .max_retries(retry_count);
+                if provider == ProviderId::ClaudeSubscription {
+                    builder = ClientConfigBuilder::new("")
+                        .load_env(false)
+                        .timeout(timeout)
+                        .max_retries(retry_count)
+                        .credential_provider(Arc::new(StaticTokenProvider::new(
+                            SecretString::from(api_key.to_owned()),
+                        )))
+                        .header("anthropic-beta", CLAUDE_SUBSCRIPTION_BETAS)
+                        .map_err(map_client_construction_error)?
+                        .header("user-agent", "claude-cli/2.1.75 (external, cli)")
+                        .map_err(map_client_construction_error)?
+                        .header("x-app", "cli")
+                        .map_err(map_client_construction_error)?
+                        .header("anthropic-dangerous-direct-browser-access", "true")
+                        .map_err(map_client_construction_error)?;
+                }
+                builder = builder.base_url(provider_base_url(provider)?);
+                Ok(builder.build())
             })
         })?;
         Ok(ClientPlan::Chat {
@@ -99,6 +120,39 @@ impl LiterProviderFactory {
             config,
             codec,
         })
+    }
+}
+
+pub(super) fn provider_base_url(provider: ProviderId) -> ProviderResult<&'static str> {
+    match provider {
+        ProviderId::OpenAi => Ok("https://api.openai.com/v1"),
+        ProviderId::DeepSeek => Ok("https://api.deepseek.com"),
+        ProviderId::Anthropic | ProviderId::ClaudeSubscription => {
+            Ok("https://api.anthropic.com/v1")
+        }
+        ProviderId::Kimi => Ok("https://api.moonshot.cn/v1"),
+        ProviderId::Qwen => Ok("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        // `liter-llm` uses Google's OpenAI-compatible transport for the stable Chat codec.
+        ProviderId::Gemini => Ok("https://generativelanguage.googleapis.com/v1beta/openai"),
+        ProviderId::MiniMax => Ok("https://api.minimaxi.com/v1"),
+        ProviderId::Glm => Ok("https://open.bigmodel.cn/api/paas/v4"),
+        ProviderId::OpenRouter => Ok("https://openrouter.ai/api/v1"),
+        ProviderId::OpenCodeGo => Ok("https://opencode.ai/zen/go/v1"),
+        ProviderId::AlibabaCoding => {
+            Ok("https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1")
+        }
+        ProviderId::BigModelCoding => Ok("https://open.bigmodel.cn/api/anthropic/v1"),
+        ProviderId::ZaiCoding => Ok("https://api.z.ai/api/anthropic/v1"),
+        ProviderId::MiniMaxCoding => Ok("https://api.minimaxi.com/anthropic/v1"),
+        ProviderId::KimiCoding => Ok("https://api.kimi.com/coding/v1"),
+        ProviderId::ChatGptSubscription
+        | ProviderId::OpenCodeZen
+        | ProviderId::Xai
+        | ProviderId::Zai => Err(ProviderManagementError::new(
+            ProviderErrorCode::ProtocolIncompatible,
+            Some(ProviderField::Provider),
+            ProviderRemediation::ReturnToEdit,
+        )),
     }
 }
 
@@ -126,11 +180,11 @@ pub struct LiterModelProvider {
 #[derive(Clone)]
 enum BoundClient {
     Chat {
-        client: DefaultClient,
+        client: Box<DefaultClient>,
         codec: LiterChatCodec,
     },
     Responses {
-        client: DefaultClient,
+        transport: ChatGptResponsesTransport,
         codec: ChatGptResponsesCodec,
     },
 }
@@ -150,22 +204,23 @@ impl LiterModelProvider {
                 Ok(Self {
                     model,
                     temperature,
-                    client: BoundClient::Chat { client, codec },
+                    client: BoundClient::Chat {
+                        client: Box::new(client),
+                        codec,
+                    },
                 })
             }
             ClientPlan::Responses {
-                model_hint,
                 model,
                 temperature,
                 config,
                 codec,
             } => {
-                let client = DefaultClient::new(config, Some(&model_hint))
-                    .map_err(map_client_construction_error)?;
+                let transport = ChatGptResponsesTransport::from_config(config)?;
                 Ok(Self {
                     model,
                     temperature,
-                    client: BoundClient::Responses { client, codec },
+                    client: BoundClient::Responses { transport, codec },
                 })
             }
         }
@@ -207,12 +262,12 @@ impl ModelProvider for LiterModelProvider {
                     .decode_response(&request, wire_response)
                     .map_err(provider_to_core)
             }
-            BoundClient::Responses { client, codec } => {
+            BoundClient::Responses { transport, codec } => {
                 let wire_request = codec.encode_request(&request).map_err(provider_to_core)?;
-                let wire_response = client
+                let wire_response = transport
                     .create_response(wire_request)
                     .await
-                    .map_err(liter_to_core)?;
+                    .map_err(provider_to_core)?;
                 codec
                     .decode_response(&request, wire_response)
                     .map_err(provider_to_core)

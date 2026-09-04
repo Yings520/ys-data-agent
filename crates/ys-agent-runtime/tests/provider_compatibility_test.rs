@@ -5,9 +5,9 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use ys_agent_core::{
     AgentAction, CoreError, CoreResult, CredentialGeneration, CredentialViewStatus,
-    ModelCapabilities, ModelProvider, ModelRequest, ModelResponse, ModelRole,
-    OAuthConnectionStatus, ProfileId, ProfileName, ProfileRevision, ProviderId, ProviderModelId,
-    ProviderParameters, ToolCall, ToolCallId, ValidationVersions,
+    ModelCapabilities, ModelProvider, ModelRequest, ModelResponse, ModelResponseFormat, ModelRole,
+    ModelToolChoice, OAuthConnectionStatus, ProfileId, ProfileName, ProfileRevision, ProviderId,
+    ProviderModelId, ProviderParameters, ToolCall, ToolCallId, ValidationVersions,
 };
 use ys_agent_runtime::provider::{
     catalog::GovernedProviderCatalog,
@@ -19,6 +19,7 @@ use ys_agent_runtime::provider::{
 };
 
 const PROVIDER_CALL_ID: &str = "compatibility-provider-call-id";
+const PROBE_SENTINEL: &str = "ysda-v2";
 
 struct RecordingProvider {
     capabilities: ModelCapabilities,
@@ -126,7 +127,7 @@ fn tool_call_response(id: &str) -> ModelResponse {
                 id: ToolCallId::new(),
                 provider_call_id: Some(id.to_owned()),
                 name: "ysda_compatibility_probe".to_owned(),
-                arguments: json!({}),
+                arguments: json!({"probe": PROBE_SENTINEL}),
                 version: "v1".to_owned(),
             },
         },
@@ -181,38 +182,69 @@ async fn model_probe_uses_only_fixed_synthetic_tool_round_trip_and_model_context
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].model, fixture.revision.model().as_str());
     assert_eq!(requests[0].temperature, None);
+    assert_eq!(requests[0].tool_choice, ModelToolChoice::Required);
+    assert_eq!(requests[0].response_format, ModelResponseFormat::Text);
     assert!(requests[0].context_manifest.included.is_empty());
     assert!(requests[0].context_manifest.summaries.is_empty());
     assert_eq!(
         requests[0].messages[0].content,
-        "Perform the fixed compatibility probe tool call only."
+        concat!(
+            "Run a deterministic compatibility check. On the first turn, call ",
+            "ysda_compatibility_probe exactly once with {\"probe\":\"ysda-v2\"}. ",
+            "After its tool result, do not call any tool; return exactly this JSON object: ",
+            "{\"type\":\"respond\",\"message\":\"probe complete\"} with no Markdown or other text."
+        )
     );
     assert_eq!(
         requests[0].messages[1].content,
-        "Call ysda_compatibility_probe with an empty object."
+        "Begin the compatibility check."
     );
     assert_eq!(requests[0].tools.len(), 1);
     assert_eq!(requests[0].tools[0].name, "ysda_compatibility_probe");
-    assert_eq!(requests[1].messages.len(), 3);
-    assert_eq!(requests[1].messages[1].role, ModelRole::Assistant);
+    assert_eq!(requests[1].messages.len(), 4);
+    assert_eq!(requests[1].tool_choice, ModelToolChoice::None);
+    assert_eq!(requests[1].response_format, ModelResponseFormat::JsonObject);
+    assert_eq!(requests[1].messages[1].role, ModelRole::User);
     assert_eq!(
-        requests[1].messages[1]
+        requests[1].messages[1].content,
+        requests[0].messages[1].content
+    );
+    assert_eq!(requests[1].messages[2].role, ModelRole::Assistant);
+    assert_eq!(
+        requests[1].messages[2]
             .assistant_tool_call
             .as_ref()
             .expect("assistant call")
             .provider_call_id,
         PROVIDER_CALL_ID
     );
-    assert_eq!(requests[1].messages[2].role, ModelRole::Tool);
     assert_eq!(
-        requests[1].messages[2].tool_call_id.as_deref(),
+        requests[1].messages[2]
+            .assistant_tool_call
+            .as_ref()
+            .expect("assistant call")
+            .arguments,
+        json!({"probe": PROBE_SENTINEL})
+    );
+    assert_eq!(requests[1].messages[3].role, ModelRole::Tool);
+    assert_eq!(
+        requests[1].messages[3].tool_call_id.as_deref(),
         Some(PROVIDER_CALL_ID)
     );
     assert_eq!(
-        requests[1].messages[2].name.as_deref(),
+        requests[1].messages[3].name.as_deref(),
         Some("ysda_compatibility_probe")
     );
-    assert_eq!(requests[1].messages[2].content, r#"{"status":"ok"}"#);
+    assert_eq!(requests[1].messages[3].content, r#"{"status":"ok"}"#);
+    assert_eq!(
+        requests[0].tools[0].input_schema,
+        json!({
+            "type": "object",
+            "properties": {"probe": {"const": PROBE_SENTINEL}},
+            "required": ["probe"],
+            "additionalProperties": false
+        })
+    );
     assert!(
         !evidence
             .compatibility()
@@ -223,6 +255,39 @@ async fn model_probe_uses_only_fixed_synthetic_tool_round_trip_and_model_context
                 "codec-v2",
             ),))
     );
+}
+
+#[tokio::test]
+async fn chatgpt_subscription_probe_uses_codex_safe_controls() {
+    let fixture = fixture(ProviderId::ChatGptSubscription);
+    let client = Arc::new(RecordingProvider::new(
+        capabilities(),
+        vec![
+            Ok(tool_call_response(PROVIDER_CALL_ID)),
+            Ok(continuation_response()),
+        ],
+    ));
+
+    CompatibilityValidator::new(fixture.catalog)
+        .probe_model(
+            CompatibilityProbeRequest {
+                revision: &fixture.revision,
+                local_validation: &fixture.local,
+                oauth_status: Some(OAuthConnectionStatus::Connected),
+                observed_context_limit: Some(ModelContextLimit::from_directory(64)),
+                codec_version: "chatgpt-codex-sse-v2",
+            },
+            client.as_ref(),
+        )
+        .await
+        .expect("ChatGPT Subscription probe passes through the fixed Codex controls");
+
+    let requests = client.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].tool_choice, ModelToolChoice::Auto);
+    assert_eq!(requests[0].response_format, ModelResponseFormat::Text);
+    assert_eq!(requests[1].tool_choice, ModelToolChoice::Auto);
+    assert_eq!(requests[1].response_format, ModelResponseFormat::Text);
 }
 
 #[tokio::test]

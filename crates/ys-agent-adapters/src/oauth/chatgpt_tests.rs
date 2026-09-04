@@ -1,12 +1,12 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
 use wiremock::matchers::{body_json, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use ys_agent_core::{
-    CredentialVault, OAuthConnectionService, OAuthConnectionStatus, OperationId, ProfileId,
-    RemoteRevocationOutcome,
+    CredentialGeneration, CredentialKind, CredentialVault, OAuthConnectionService,
+    OAuthConnectionStatus, OperationId, ProfileId, RemoteRevocationOutcome,
 };
 
 use super::{
@@ -15,9 +15,14 @@ use super::{
     CHATGPT_TOKEN_ENDPOINT, CHATGPT_VERIFICATION_URI, ChatGptOAuthManager, OAuthEndpoints,
     base64_url_encode, decode_token_bundle, pkce_challenge,
 };
-use crate::credential::keyring::InMemoryCredentialVault;
+use crate::credential::memory::InMemoryCredentialVault;
 
 const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
+
+fn oauth_generation(profile_id: ProfileId, number: u64) -> CredentialGeneration {
+    CredentialGeneration::new(profile_id, number, CredentialKind::OAuthConnection)
+        .expect("valid OAuth generation")
+}
 
 #[derive(Default)]
 struct RecordingBrowser {
@@ -30,6 +35,31 @@ impl BrowserLauncher for RecordingBrowser {
             .lock()
             .expect("browser recorder lock")
             .push(uri.to_owned());
+    }
+}
+
+#[derive(Default)]
+struct BlockingBrowser {
+    released: Mutex<bool>,
+    release_signal: Condvar,
+}
+
+impl BlockingBrowser {
+    fn release(&self) {
+        *self.released.lock().expect("browser release lock") = true;
+        self.release_signal.notify_all();
+    }
+}
+
+impl BrowserLauncher for BlockingBrowser {
+    fn open(&self, _uri: &str) {
+        let mut released = self.released.lock().expect("browser release lock");
+        while !*released {
+            released = self
+                .release_signal
+                .wait(released)
+                .expect("browser release wait");
+        }
     }
 }
 
@@ -137,7 +167,7 @@ async fn connect(manager: &ChatGptOAuthManager, server: &MockServer, profile_id:
         .await
         .expect("start device authorization");
     let view = manager
-        .complete(operation_id)
+        .complete(operation_id, oauth_generation(profile_id, 1))
         .await
         .expect("complete device authorization");
     assert_eq!(view.status, OAuthConnectionStatus::Connected);
@@ -195,7 +225,7 @@ async fn device_flow_opens_fixed_verification_and_writes_one_masked_bundle() {
     assert_eq!(authorization.expires_in_seconds, 900);
 
     let connected = manager
-        .complete(operation_id)
+        .complete(operation_id, oauth_generation(profile_id, 1))
         .await
         .expect("complete device authorization");
     assert_eq!(connected.status, OAuthConnectionStatus::Connected);
@@ -262,6 +292,35 @@ async fn device_flow_opens_fixed_verification_and_writes_one_masked_bundle() {
 }
 
 #[tokio::test]
+async fn device_code_returns_before_a_blocked_browser_launcher_finishes() {
+    let server = MockServer::start().await;
+    let vault = Arc::new(InMemoryCredentialVault::new());
+    let browser = Arc::new(BlockingBrowser::default());
+    let manager = ChatGptOAuthManager::with_endpoints_for_test(
+        vault,
+        OAuthEndpoints::for_test(&server.uri()),
+        browser.clone(),
+    )
+    .expect("fixture manager");
+    mount_device_start(&server, 1).await;
+
+    let authorization = tokio::time::timeout(
+        Duration::from_millis(500),
+        manager.start(ProfileId::new(), OperationId::new()),
+    )
+    .await
+    .expect("the TUI must receive the code without waiting for browser startup")
+    .expect("start device authorization");
+    browser.release();
+
+    assert_eq!(authorization.user_code, "ABCD-1234");
+    assert_eq!(
+        authorization.verification_uri,
+        format!("{}/codex/device", server.uri())
+    );
+}
+
+#[tokio::test]
 async fn refresh_rotates_generation_and_invalid_refresh_fails_closed_without_echo() {
     let server = MockServer::start().await;
     let (manager, vault, _) = fixture_manager(&server);
@@ -287,7 +346,11 @@ async fn refresh_rotates_generation_and_invalid_refresh_fails_closed_without_ech
         .await;
 
     manager
-        .refresh(profile_id, OperationId::new())
+        .refresh(
+            profile_id,
+            OperationId::new(),
+            oauth_generation(profile_id, 2),
+        )
         .await
         .expect("refresh rotates token bundle");
     let rotated = manager
@@ -318,7 +381,11 @@ async fn refresh_rotates_generation_and_invalid_refresh_fails_closed_without_ech
         .mount(&server)
         .await;
     let error = manager
-        .refresh(profile_id, OperationId::new())
+        .refresh(
+            profile_id,
+            OperationId::new(),
+            oauth_generation(profile_id, 3),
+        )
         .await
         .expect_err("invalidated refresh token fails closed");
     assert_eq!(error.code(), "provider.oauth.not_connected");
@@ -343,7 +410,11 @@ async fn late_device_completion_cannot_overwrite_reauthorization() {
         .await
         .expect("start first operation");
     let late_manager = manager.clone();
-    let late = tokio::spawn(async move { late_manager.complete(first).await });
+    let late = tokio::spawn(async move {
+        late_manager
+            .complete(first, oauth_generation(profile_id, 1))
+            .await
+    });
     tokio::time::sleep(Duration::from_millis(20)).await;
     let second = OperationId::new();
     manager

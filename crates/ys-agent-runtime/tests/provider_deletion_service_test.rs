@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use ys_agent_adapters::credential::keyring::{InMemoryCredentialVault, InMemoryVaultOperation};
+use ys_agent_adapters::credential::memory::{InMemoryCredentialVault, InMemoryVaultOperation};
 use ys_agent_core::{
     ActiveRevisionPrecondition, CommandId, CommandReceipt, CommandResultKind, CreateRunCommand,
     CredentialVault, DeleteProfileRequest, EventActor, OperationId, PendingRunEvent,

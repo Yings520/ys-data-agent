@@ -10,15 +10,16 @@ use crate::{
     CredentialLease, CredentialMutationIntent, CredentialMutationRecord, CredentialMutationRequest,
     CredentialPointerCommit, CredentialProtectionStatus, CredentialViewStatus,
     DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
-    EventEnvelope, FreshnessObservation, MetricDefinition, ModelCapabilities, ModelRequest,
-    ModelResponse, OAuthConnectionView, ObservedSchema, OperationId, PendingRunEvent, Principal,
-    ProfileDetail, ProfileId, ProfileRevision, ProfileSummary, ProtectedCredentialWrite,
-    ProviderCatalogView, ProviderClientBinding, ProviderCredentialReference, ProviderDoctorView,
-    ProviderErrorCode, ProviderResult, PutArtifact, QueryBudget, QueryPreflight, QueryRequest,
-    QueryResult, RemoteRevocationOutcome, ResolvedRunProvider, RunId, RunProviderBinding,
-    RunSnapshot, SaveProfileRequest, SaveProfileRevision, Session, SessionId, SourceId, Task,
-    TaskId, ToolCallId, ToolOutcome, ToolSpec, ValidateProfileRequest, ValidationCommit,
-    WorkspaceId,
+    EventEnvelope, FreshnessObservation, ListModelCandidatesRequest, MetricDefinition,
+    ModelCandidateBatch, ModelCapabilities, ModelRequest, ModelResponse, ModelSelectionSnapshot,
+    OAuthConnectionView, ObservedSchema, OperationId, PendingRunEvent, Principal, ProfileDetail,
+    ProfileId, ProfileRevision, ProfileSummary, ProtectedCredentialWrite, ProviderCatalogView,
+    ProviderClientBinding, ProviderCredentialReference, ProviderDoctorView, ProviderErrorCode,
+    ProviderManagementError, ProviderRemediation, ProviderResult, PutArtifact, QueryBudget,
+    QueryPreflight, QueryRequest, QueryResult, RemoteRevocationOutcome, ResolvedRunProvider, RunId,
+    RunProviderBinding, RunSnapshot, SaveProfileRequest, SaveProfileRevision, Session, SessionId,
+    SourceId, SwitchModelRequest, Task, TaskId, ToolCallId, ToolOutcome, ToolSpec,
+    ValidateProfileRequest, ValidationCommit, WorkspaceId,
 };
 
 /// A production Run is only created from this complete, immutable Provider snapshot. The Store
@@ -262,6 +263,15 @@ pub trait ValidationActivationRepository: ProfileRevisionRepository {
 /// acquiring validation, activation, or Profile-deletion authority.
 #[async_trait]
 pub trait CredentialMutationRepository: ProfileRevisionRepository {
+    /// Returns the next immutable generation after every generation ever recorded for this
+    /// Profile, including terminal rollback tombstones. The subsequent journal begin remains the
+    /// atomic reservation point and may reject a concurrent caller as stale.
+    async fn next_credential_generation(
+        &self,
+        profile_id: ProfileId,
+        kind: crate::CredentialKind,
+    ) -> ProviderResult<crate::CredentialGeneration>;
+
     async fn begin_credential_mutation(
         &self,
         intent: CredentialMutationIntent,
@@ -338,7 +348,7 @@ pub trait RunProviderBindingRepository: Send + Sync {
     ) -> ProviderResult<bool>;
 }
 
-/// OS-backed credential boundary. The only data that reaches a caller is a short-lived opaque
+/// Protected credential boundary. The only data that reaches a caller is a short-lived opaque
 /// lease; locator and secret text never enter Profile, TUI, Doctor, or runtime view types.
 #[async_trait]
 pub trait CredentialVault: Send + Sync {
@@ -407,12 +417,17 @@ pub trait OAuthConnectionService: Send + Sync {
         operation_id: OperationId,
     ) -> ProviderResult<DeviceAuthorizationView>;
 
-    async fn complete(&self, operation_id: OperationId) -> ProviderResult<OAuthConnectionView>;
+    async fn complete(
+        &self,
+        operation_id: OperationId,
+        generation: crate::CredentialGeneration,
+    ) -> ProviderResult<OAuthConnectionView>;
 
     async fn refresh(
         &self,
         profile_id: ProfileId,
         operation_id: OperationId,
+        generation: crate::CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView>;
 
     async fn reauthorize(
@@ -432,6 +447,28 @@ pub trait OAuthConnectionService: Send + Sync {
 /// types only; they never receive a repository, Vault, OAuth transport, or HTTP client.
 #[async_trait]
 pub trait ProviderManagementApi: Send + Sync {
+    /// Implementors that have not adopted the model-selection capability fail closed instead of
+    /// silently deriving candidates from profiles or accepting an unchecked activation request.
+    async fn model_selection_snapshot(&self) -> ProviderResult<ModelSelectionSnapshot> {
+        Err(model_selection_capability_unavailable())
+    }
+
+    async fn list_model_candidates(
+        &self,
+        request: ListModelCandidatesRequest,
+    ) -> ProviderResult<ModelCandidateBatch> {
+        let _ = request;
+        Err(model_selection_capability_unavailable())
+    }
+
+    async fn switch_model(
+        &self,
+        request: SwitchModelRequest,
+    ) -> ProviderResult<ActiveProviderView> {
+        let _ = request;
+        Err(model_selection_capability_unavailable())
+    }
+
     async fn catalog(&self) -> ProviderResult<Vec<ProviderCatalogView>>;
 
     async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>>;
@@ -439,6 +476,13 @@ pub trait ProviderManagementApi: Send + Sync {
     /// The committed active revision used for offline TUI browsing. `None` is the explicit
     /// no-active management state; it never asks the caller to infer an active Profile.
     async fn active_provider(&self) -> ProviderResult<Option<ActiveProviderView>>;
+
+    /// Returns the active revision only when its current authentication is usable for a new Run.
+    /// The default preserves compatibility for Providers whose saved Credential status is the
+    /// complete readiness signal; OAuth-aware implementations additionally verify live state.
+    async fn usable_active_provider(&self) -> ProviderResult<Option<ActiveProviderView>> {
+        self.active_provider().await
+    }
 
     async fn load_profile(&self, profile_id: ProfileId) -> ProviderResult<ProfileDetail>;
 
@@ -523,4 +567,12 @@ pub trait ProviderManagementApi: Send + Sync {
         profile_id: ProfileId,
         operation_id: OperationId,
     ) -> ProviderResult<RemoteRevocationOutcome>;
+}
+
+fn model_selection_capability_unavailable() -> ProviderManagementError {
+    ProviderManagementError::new(
+        ProviderErrorCode::ProtocolIncompatible,
+        None,
+        ProviderRemediation::ContactSupport,
+    )
 }

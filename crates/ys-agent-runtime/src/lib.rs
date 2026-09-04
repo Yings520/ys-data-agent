@@ -23,13 +23,17 @@ pub use harness::{Harness, HarnessConfig, HarnessDependencies};
 pub use loop_driver::{
     HarnessStep, LoopBudget, LoopDriver, LoopResult, LoopUsage, StepAccounting, StepOutcome,
 };
-pub use provider::resolver::{FixedRunModelProviderResolver, RunBoundProviderResolver};
+pub use provider::resolver::{
+    ActiveProfileModelProvider, FixedRunModelProviderResolver, RunBoundProviderResolver,
+};
 pub use recovery::{RecoveryDecision, RecoveryManager, RecoveryRequest};
 pub use service::{
     ActiveRunProviderBindingSource, AgentServiceApi, ArtifactView, CreateTaskRequest,
-    EventSubscription, InProcessAgentService, NoopRunScheduler, RunScheduler, SendMessageRequest,
-    ServiceEvent, ServiceEventPublisher, ServiceReply, StaticRunProviderBindingSource,
-    UnavailableRunProviderBindingSource,
+    DatasourceDisplayState, DatasourceUnavailableReason, EventSubscription, InProcessAgentService,
+    NoopRunScheduler, QueryDisplayState, QueryNonSuccessReason, QueryResultPreviewView,
+    RunScheduler, SendMessageRequest, ServiceEvent, ServiceEventPublisher, ServiceReply,
+    StaticRunProviderBindingSource, TuiDisplayContext, TuiDisplayContextInput,
+    TuiDisplayContextSource, UnavailableRunProviderBindingSource,
 };
 pub use workflow::query::{
     ClarificationNeed, FreshnessState, MetricReference, ParameterKind, QUERY_SYSTEM_PROMPT_VERSION,

@@ -6,20 +6,23 @@ use std::sync::{
 use async_trait::async_trait;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
-use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
+use ys_agent_adapters::credential::memory::InMemoryCredentialVault;
 use ys_agent_core::{
     AgentAction, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactKind, ArtifactMetadata,
-    ArtifactStore, CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult,
-    CredentialVault, EventActor, ModelResponse, PendingRunEvent, Principal,
-    ProtectedCredentialWrite, ProviderCredentialReference, ProviderResult, PutArtifact,
-    RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
-    RunProviderBindingSource, RunStatus, RuntimeCommandBatch, RuntimeStore, SecretValue,
-    Sensitivity, StepId, TaskId, TaskStatus, WorkspaceId,
+    ArtifactStore, CellValue, CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult,
+    CredentialVault, EventActor, ModelCandidateKey, ModelResponse, OperationId, PendingRunEvent,
+    Principal, ProfileId, ProtectedCredentialWrite, ProviderCredentialReference, ProviderId,
+    ProviderModelId, ProviderResult, PutArtifact, QueryResult, RunEventKind, RunId,
+    RunProviderBinding, RunProviderBindingRepository, RunProviderBindingSource, RunStatus,
+    RuntimeCommandBatch, RuntimeStore, SecretValue, Sensitivity, StepId, SwitchModelRequest,
+    TaskId, TaskStatus, WorkspaceId,
 };
 use ys_agent_runtime::{
     ActiveRunProviderBindingSource, AgentServiceApi, CoordinationDecision, Coordinator,
-    CreateTaskRequest, InProcessAgentService, RuleBasedCoordinator, RunScheduler,
-    SendMessageRequest, ServiceReply, StaticRunProviderBindingSource,
+    CreateTaskRequest, DatasourceDisplayState, InProcessAgentService, QueryDisplayState,
+    QueryNonSuccessReason, QueryResultPreviewView, RuleBasedCoordinator, RunScheduler,
+    SendMessageRequest, ServiceReply, StaticRunProviderBindingSource, TuiDisplayContext,
+    TuiDisplayContextInput, TuiDisplayContextSource,
 };
 use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
@@ -74,6 +77,24 @@ struct SwitchActiveAfterFirstBinding {
     switched: AtomicBool,
 }
 
+struct FakeTuiDisplayContextSource {
+    input: TuiDisplayContextInput,
+    calls: AtomicUsize,
+    _dsn_canary: String,
+    _credential_canary: String,
+    _internal_id_canary: String,
+    _event_payload_canary: String,
+    _business_row_canary: String,
+}
+
+#[async_trait]
+impl TuiDisplayContextSource for FakeTuiDisplayContextSource {
+    async fn load(&self) -> CoreResult<TuiDisplayContextInput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.input.clone())
+    }
+}
+
 #[async_trait]
 impl RunProviderBindingSource for SwitchActiveAfterFirstBinding {
     async fn bind_new_run(&self, run_id: RunId) -> ProviderResult<RunProviderBinding> {
@@ -107,18 +128,33 @@ struct ServiceFixture {
 
 impl ServiceFixture {
     async fn new() -> Self {
-        Self::build(None, true).await
+        Self::build(None, true, None).await
     }
 
     async fn with_conversation_model(model: Arc<dyn ys_agent_core::ModelProvider>) -> Self {
-        Self::build(Some(model), true).await
+        Self::build(Some(model), true, None).await
+    }
+
+    async fn with_conversation_model_and_disabled_queries(
+        model: Arc<dyn ys_agent_core::ModelProvider>,
+    ) -> Self {
+        Self::build(
+            Some(model),
+            true,
+            Some("Connect a read-only datasource before asking data questions."),
+        )
+        .await
     }
 
     async fn without_provider_binding() -> Self {
-        Self::build(None, false).await
+        Self::build(None, false, None).await
     }
 
-    async fn build(model: Option<Arc<dyn ys_agent_core::ModelProvider>>, bind_runs: bool) -> Self {
+    async fn build(
+        model: Option<Arc<dyn ys_agent_core::ModelProvider>>,
+        bind_runs: bool,
+        disabled_query_message: Option<&str>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = Arc::new(
             SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -153,6 +189,9 @@ impl ServiceFixture {
         }
         if let Some(model) = model {
             service = service.with_conversation_model(model, "test-model");
+        }
+        if let Some(message) = disabled_query_message {
+            service = service.with_query_submission_disabled(message);
         }
         let service = Arc::new(service);
         let principal = Principal::local_operator("Data Engineer");
@@ -249,6 +288,155 @@ async fn provider_management_is_available_only_through_the_service_boundary() {
         .expect_err("an uncomposed service must not expose a repository or Vault fallback");
 
     assert_eq!(error.code(), "provider.internal");
+
+    let error = fixture
+        .service
+        .provider_model_selection_snapshot()
+        .await
+        .expect_err("an uncomposed service must fail closed for model selection too");
+    assert_eq!(error.code(), "provider.internal");
+
+    let profile_id = ProfileId::new();
+    let candidate = ModelCandidateKey::new(
+        profile_id,
+        1,
+        None,
+        ProviderId::DeepSeek,
+        ProviderModelId::new(ProviderId::DeepSeek, "deepseek/service-boundary")
+            .expect("governed model"),
+    )
+    .expect("valid candidate key");
+    let error = fixture
+        .service
+        .provider_switch_model(SwitchModelRequest::new(OperationId::new(), candidate))
+        .await
+        .expect_err("an uncomposed service must not invent a switch path");
+    assert_eq!(error.code(), "provider.internal");
+}
+
+#[tokio::test]
+async fn tui_display_context_is_composed_from_a_safe_authoritative_snapshot() {
+    let fixture = ServiceFixture::new().await;
+    let source = Arc::new(FakeTuiDisplayContextSource {
+        input: TuiDisplayContextInput::new(
+            "analytics",
+            DatasourceDisplayState::active("warehouse").expect("safe display name"),
+            true,
+            QueryDisplayState::WaitingForInput,
+        )
+        .expect("valid display context input"),
+        calls: AtomicUsize::new(0),
+        _dsn_canary: "postgres://admin:dsn-canary@production".to_owned(),
+        _credential_canary: "credential-canary".to_owned(),
+        _internal_id_canary: "internal-id-canary".to_owned(),
+        _event_payload_canary: "event-payload-canary".to_owned(),
+        _business_row_canary: "business-row-canary".to_owned(),
+    });
+    let service = InProcessAgentService::new(
+        fixture.workspace_id,
+        fixture.store.clone(),
+        fixture.artifacts.clone(),
+        fixture.scheduler.clone(),
+    )
+    .with_tui_display_context_source(source.clone());
+
+    let view: TuiDisplayContext = service
+        .tui_display_context()
+        .await
+        .expect("read safe display context");
+
+    assert_eq!(view.workspace_display_name(), "analytics");
+    assert_eq!(
+        view.datasource(),
+        &DatasourceDisplayState::active("warehouse").expect("safe display name")
+    );
+    assert!(view.read_only());
+    assert_eq!(view.query_state(), QueryDisplayState::WaitingForInput);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+
+    let rendered = serde_json::to_string(&view).expect("display context serializes");
+    for forbidden in [
+        "dsn-canary",
+        "credential-canary",
+        "internal-id-canary",
+        "event-payload-canary",
+        "business-row-canary",
+        "workspace_id",
+        "source_id",
+        "phase",
+        "acl",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "leaked display field: {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tui_display_context_fails_closed_without_an_authoritative_source() {
+    let fixture = ServiceFixture::new().await;
+
+    let error = fixture
+        .service
+        .tui_display_context()
+        .await
+        .expect_err("service must not infer display state from local configuration");
+
+    assert_eq!(error.code(), "tui_display_context_unavailable");
+}
+
+#[test]
+fn query_display_state_maps_runtime_terminal_states_without_false_success() {
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Queued),
+        QueryDisplayState::Ready
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Running),
+        QueryDisplayState::Running
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::WaitingForInput),
+        QueryDisplayState::WaitingForInput
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Succeeded),
+        QueryDisplayState::Completed
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Failed),
+        QueryDisplayState::NonSuccess {
+            reason: QueryNonSuccessReason::Failed,
+        }
+    );
+    assert_eq!(
+        QueryDisplayState::from(RunStatus::Cancelled),
+        QueryDisplayState::NonSuccess {
+            reason: QueryNonSuccessReason::Cancelled,
+        }
+    );
+
+    let states = [
+        DatasourceDisplayState::NotConfigured,
+        DatasourceDisplayState::Unavailable {
+            reason: ys_agent_runtime::DatasourceUnavailableReason::StatusUnavailable,
+        },
+    ];
+    let rendered = serde_json::to_string(&states).expect("stable datasource states serialize");
+    assert!(rendered.contains("not_configured"));
+    assert!(rendered.contains("status_unavailable"));
+    assert!(
+        TuiDisplayContextInput::new(
+            "workspace\nspoofed",
+            DatasourceDisplayState::NotConfigured,
+            true,
+            QueryDisplayState::NonSuccess {
+                reason: QueryNonSuccessReason::Rejected,
+            },
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -449,6 +637,152 @@ async fn tui_preview_reads_complete_internal_query_artifacts_only() {
     assert_eq!(result_view.preview.len(), 4_096);
 }
 
+#[tokio::test]
+async fn query_result_preview_is_policy_first_bounded_and_query_truncation_independent() {
+    let fixture = ServiceFixture::new().await;
+    let rows = (0..150)
+        .map(|index| vec![CellValue::Integer(index), CellValue::Text("x".repeat(300))])
+        .collect::<Vec<_>>();
+    let result = QueryResult {
+        columns: vec!["id".to_owned(), "payload".to_owned()],
+        rows,
+        truncated: false,
+        remote_query_id: Some("must-not-leak".to_owned()),
+        row_count: 150,
+        serialized_bytes: 100_000,
+        warning_codes: vec!["query_warning_must_remain_in_artifact".to_owned()],
+        model_preview: "must-not-be-reused".to_owned(),
+    };
+    let metadata = fixture
+        .persist_internal_artifact(
+            ArtifactKind::QueryResult,
+            serde_json::to_vec(&serde_json::json!({ "result": result }))
+                .expect("serialize persisted result envelope"),
+        )
+        .await;
+    let access = ArtifactAccessContext {
+        workspace_id: fixture.workspace_id,
+        principal_id: fixture.principal.id,
+        purpose: ArtifactAccessPurpose::TuiPreview,
+        max_sensitivity: Sensitivity::Internal,
+    };
+
+    let preview: QueryResultPreviewView = fixture
+        .service
+        .query_result_preview(&metadata.id, access.clone())
+        .await
+        .expect("build bounded preview");
+
+    assert_eq!(preview.persisted_row_count(), 150);
+    assert_eq!(preview.returned_row_count(), 100);
+    assert!(preview.truncated());
+    assert_eq!(
+        preview.rows()[0][1]
+            .as_str()
+            .expect("text cell")
+            .chars()
+            .count(),
+        256
+    );
+    assert!(
+        serde_json::to_vec(&preview)
+            .expect("serialize preview")
+            .len()
+            <= 64 * 1024
+    );
+    let rendered = serde_json::to_string(&preview).expect("serialize safe preview");
+    for forbidden in [
+        "must-not-leak",
+        "query_warning_must_remain_in_artifact",
+        "must-not-be-reused",
+    ] {
+        assert!(!rendered.contains(forbidden));
+    }
+
+    let query_truncated_only = QueryResult {
+        columns: vec!["value".to_owned()],
+        rows: vec![vec![CellValue::Integer(1)]],
+        truncated: true,
+        remote_query_id: None,
+        row_count: 1,
+        serialized_bytes: 1,
+        warning_codes: vec!["max_rows_exceeded".to_owned()],
+        model_preview: String::new(),
+    };
+    let metadata = fixture
+        .persist_internal_artifact(
+            ArtifactKind::QueryResult,
+            serde_json::to_vec(&serde_json::json!({ "result": query_truncated_only }))
+                .expect("serialize query-truncated result"),
+        )
+        .await;
+    let preview = fixture
+        .service
+        .query_result_preview(&metadata.id, access)
+        .await
+        .expect("preview query-truncated result");
+    assert!(
+        !preview.truncated(),
+        "query truncation is not UI truncation"
+    );
+}
+
+#[tokio::test]
+async fn query_result_preview_reports_policy_missing_and_malformed_failures_without_parsing_early()
+{
+    let fixture = ServiceFixture::new().await;
+    let malformed = fixture
+        .persist_internal_artifact(
+            ArtifactKind::QueryResult,
+            b"not-json-secret-canary".to_vec(),
+        )
+        .await;
+    let denied = fixture
+        .service
+        .query_result_preview(
+            &malformed.id,
+            ArtifactAccessContext {
+                workspace_id: fixture.workspace_id,
+                principal_id: fixture.principal.id,
+                purpose: ArtifactAccessPurpose::TuiPreview,
+                max_sensitivity: Sensitivity::Public,
+            },
+        )
+        .await
+        .expect_err("Policy must reject before malformed content is parsed");
+    assert_eq!(denied.code(), "artifact_access_denied");
+
+    let malformed_error = fixture
+        .service
+        .query_result_preview(
+            &malformed.id,
+            ArtifactAccessContext {
+                workspace_id: fixture.workspace_id,
+                principal_id: fixture.principal.id,
+                purpose: ArtifactAccessPurpose::TuiPreview,
+                max_sensitivity: Sensitivity::Internal,
+            },
+        )
+        .await
+        .expect_err("authorized malformed content must stay an explicit failure");
+    assert_eq!(malformed_error.code(), "malformed_query_result_artifact");
+
+    let missing = fixture
+        .service
+        .query_result_preview(
+            &ys_agent_core::ArtifactId::new(),
+            ArtifactAccessContext {
+                workspace_id: fixture.workspace_id,
+                principal_id: fixture.principal.id,
+                purpose: ArtifactAccessPurpose::TuiPreview,
+                max_sensitivity: Sensitivity::Internal,
+            },
+        )
+        .await
+        .expect_err("missing metadata must remain an explicit failure");
+    assert_eq!(missing.code(), "not_found");
+}
+
 fn front_door_model(
     calls: Arc<AtomicUsize>,
     action: AgentAction,
@@ -564,6 +898,31 @@ async fn data_request_start_query_creates_exactly_one_run() {
     assert_eq!(first.run_id(), replay.run_id());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.created_run_count().await, 1);
+}
+
+#[tokio::test]
+async fn data_request_without_a_query_runtime_returns_guidance_without_a_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = front_door_model(calls.clone(), AgentAction::StartQuery);
+    let fixture = ServiceFixture::with_conversation_model_and_disabled_queries(model).await;
+
+    let reply = fixture
+        .service
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            fixture.session_id(),
+            "What was yesterday's GMV?",
+        ))
+        .await
+        .expect("datasource guidance reply");
+
+    assert!(matches!(
+        reply,
+        ServiceReply::Conversation { ref message }
+            if message == "Connect a read-only datasource before asking data questions."
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.created_run_count().await, 0);
 }
 
 #[tokio::test]

@@ -8,10 +8,11 @@ use serde_json::json;
 use ys_agent_core::{
     AgentAction, AssistantToolCall, CompatibilityEvidence, ContextManifest, CoreError,
     CredentialGeneration, CredentialViewStatus, ModelMessage, ModelProvider, ModelRequest,
-    ModelRole, OAuthConnectionStatus, ParameterApplicability, ProfileId, ProfileName,
-    ProfileRevision, ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError,
-    ProviderModelId, ProviderParameterKey, ProviderParameters, ProviderRemediation, ProviderResult,
-    Sensitivity, SideEffect, ToolRisk, ToolSpec, ValidationVersions,
+    ModelResponseFormat, ModelRole, ModelToolChoice, OAuthConnectionStatus, ParameterApplicability,
+    ProfileId, ProfileName, ProfileRevision, ProviderErrorCode, ProviderField, ProviderId,
+    ProviderManagementError, ProviderModelId, ProviderParameterKey, ProviderParameters,
+    ProviderRemediation, ProviderResult, Sensitivity, SideEffect, ToolRisk, ToolSpec,
+    ValidationVersions,
 };
 
 use super::catalog::{GovernedProviderCatalog, ProviderCatalogEntry};
@@ -24,9 +25,10 @@ const MAX_TEMPERATURE: f32 = 2.0;
 
 /// The fixed protocol revision for the synthetic compatibility probe. Changing it invalidates
 /// persisted evidence through `ValidationVersions`.
-pub const COMPATIBILITY_PROBE_SCHEMA_VERSION: &str = "provider-compatibility-probe-v1";
+pub const COMPATIBILITY_PROBE_SCHEMA_VERSION: &str = "provider-compatibility-probe-v2";
 const COMPATIBILITY_PROBE_TOOL: &str = "ysda_compatibility_probe";
 const COMPATIBILITY_PROBE_TOOL_VERSION: &str = "v1";
+const COMPATIBILITY_PROBE_SENTINEL: &str = "ysda-v2";
 const COMPATIBILITY_CONTEXT_TOKEN_BUDGET: u32 = 128;
 
 /// Local, non-secret inputs which a service assembles before any Vault access or probe.
@@ -470,20 +472,25 @@ impl Default for CompatibilityValidator {
 }
 
 fn initial_probe_request(revision: &ProfileRevision) -> ModelRequest {
+    let (tool_choice, response_format) = probe_controls(revision, false);
     ModelRequest {
         model: revision.model().as_str().to_owned(),
         messages: vec![synthetic_system_message(), synthetic_user_message()],
         tools: vec![synthetic_probe_tool()],
         context_manifest: synthetic_context_manifest(),
         temperature: None,
+        tool_choice,
+        response_format,
     }
 }
 
 fn continuation_probe_request(revision: &ProfileRevision, provider_call_id: &str) -> ModelRequest {
+    let (tool_choice, response_format) = probe_controls(revision, true);
     ModelRequest {
         model: revision.model().as_str().to_owned(),
         messages: vec![
             synthetic_system_message(),
+            synthetic_user_message(),
             ModelMessage {
                 role: ModelRole::Assistant,
                 content: String::new(),
@@ -492,7 +499,7 @@ fn continuation_probe_request(revision: &ProfileRevision, provider_call_id: &str
                 assistant_tool_call: Some(AssistantToolCall {
                     provider_call_id: provider_call_id.to_owned(),
                     name: COMPATIBILITY_PROBE_TOOL.to_owned(),
-                    arguments: json!({}),
+                    arguments: probe_arguments(),
                 }),
             },
             ModelMessage {
@@ -506,13 +513,40 @@ fn continuation_probe_request(revision: &ProfileRevision, provider_call_id: &str
         tools: vec![synthetic_probe_tool()],
         context_manifest: synthetic_context_manifest(),
         temperature: None,
+        tool_choice,
+        response_format,
+    }
+}
+
+/// Codex Subscription's Responses endpoint accepts the same `auto` tool-selection control as
+/// the Codex client. The probe instructions and response validation still enforce the two-turn
+/// contract; sending `required` or `none` causes that endpoint to reject an otherwise valid
+/// activation probe.
+fn probe_controls(
+    revision: &ProfileRevision,
+    continuation: bool,
+) -> (ModelToolChoice, ModelResponseFormat) {
+    if revision.provider() == ProviderId::ChatGptSubscription {
+        return (ModelToolChoice::Auto, ModelResponseFormat::Text);
+    }
+
+    if continuation {
+        (ModelToolChoice::None, ModelResponseFormat::JsonObject)
+    } else {
+        (ModelToolChoice::Required, ModelResponseFormat::Text)
     }
 }
 
 fn synthetic_system_message() -> ModelMessage {
     ModelMessage {
         role: ModelRole::System,
-        content: "Perform the fixed compatibility probe tool call only.".to_owned(),
+        content: concat!(
+            "Run a deterministic compatibility check. On the first turn, call ",
+            "ysda_compatibility_probe exactly once with {\"probe\":\"ysda-v2\"}. ",
+            "After its tool result, do not call any tool; return exactly this JSON object: ",
+            "{\"type\":\"respond\",\"message\":\"probe complete\"} with no Markdown or other text."
+        )
+        .to_owned(),
         tool_call_id: None,
         name: None,
         assistant_tool_call: None,
@@ -522,7 +556,7 @@ fn synthetic_system_message() -> ModelMessage {
 fn synthetic_user_message() -> ModelMessage {
     ModelMessage {
         role: ModelRole::User,
-        content: "Call ysda_compatibility_probe with an empty object.".to_owned(),
+        content: "Begin the compatibility check.".to_owned(),
         tool_call_id: None,
         name: None,
         assistant_tool_call: None,
@@ -532,8 +566,17 @@ fn synthetic_user_message() -> ModelMessage {
 fn synthetic_probe_tool() -> ToolSpec {
     ToolSpec {
         name: COMPATIBILITY_PROBE_TOOL.to_owned(),
-        description: "Fixed provider compatibility probe; returns a static result.".to_owned(),
-        input_schema: json!({"type": "object", "additionalProperties": false}),
+        description: concat!(
+            "Fixed provider compatibility probe. Call exactly once with probe set to ysda-v2; ",
+            "it returns a static result."
+        )
+        .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"probe": {"const": COMPATIBILITY_PROBE_SENTINEL}},
+            "required": ["probe"],
+            "additionalProperties": false
+        }),
         output_schema: json!({
             "type": "object",
             "properties": {"status": {"const": "ok"}},
@@ -552,6 +595,10 @@ fn synthetic_probe_tool() -> ToolSpec {
     }
 }
 
+fn probe_arguments() -> serde_json::Value {
+    json!({"probe": COMPATIBILITY_PROBE_SENTINEL})
+}
+
 fn synthetic_context_manifest() -> ContextManifest {
     let mut manifest = ContextManifest::empty(COMPATIBILITY_CONTEXT_TOKEN_BUDGET);
     manifest.tool_view_version = COMPATIBILITY_PROBE_SCHEMA_VERSION.to_owned();
@@ -568,7 +615,7 @@ fn required_probe_call_id(action: AgentAction) -> ProviderResult<String> {
     };
     if call.name != COMPATIBILITY_PROBE_TOOL
         || call.version != COMPATIBILITY_PROBE_TOOL_VERSION
-        || call.arguments != json!({})
+        || call.arguments != probe_arguments()
     {
         return Err(provider_error(
             ProviderErrorCode::ProtocolInvalidResponse,

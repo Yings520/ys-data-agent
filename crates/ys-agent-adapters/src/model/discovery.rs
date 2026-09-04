@@ -8,13 +8,54 @@ use std::{collections::BTreeSet, fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use liter_llm::{ClientBuilder, LlmClient, error::LiterLlmError, types::ModelsListResponse};
+use reqwest::{Client, StatusCode};
+use serde::Deserialize;
 use ys_agent_core::{
-    CredentialKind, CredentialLease, DiscoverModelsRequest, DiscoveredModel, ModelDiscovery,
-    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementError, ProviderModelId,
-    ProviderRemediation, ProviderResult,
+    CredentialLease, DiscoverModelsRequest, DiscoveredModel, ModelDiscovery, ProviderErrorCode,
+    ProviderField, ProviderId, ProviderManagementError, ProviderModelId, ProviderRemediation,
+    ProviderResult,
+};
+
+use crate::oauth::chatgpt::with_connected_chatgpt_responses_auth;
+
+use super::{
+    liter::provider_base_url,
+    liter_responses::{
+        CHATGPT_CODEX_PROTOCOL_VERSION, CHATGPT_CODEX_USER_AGENT, CHATGPT_RESPONSES_BACKEND,
+        CHATGPT_RESPONSES_ORIGINATOR,
+    },
 };
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const CHATGPT_MODELS_RESPONSE_MAX_BYTES: usize = 512 * 1024;
+const CHATGPT_ACCOUNT_HEADER: &str = "ChatGPT-Account-ID";
+const OPENCODE_GO_MODELS: [&str; 10] = [
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "kimi-k2.7-code",
+    "kimi-k3",
+    "kimi-k2.6",
+    "glm-5.2",
+    "glm-5.1",
+    "grok-4.5",
+    "mimo-v2.5-pro",
+    "mimo-v2.5",
+];
+
+fn chatgpt_codex_client_version() -> &'static str {
+    CHATGPT_CODEX_PROTOCOL_VERSION
+}
+
+fn chatgpt_codex_directory_url() -> String {
+    format!(
+        "{CHATGPT_RESPONSES_BACKEND}/models?client_version={}",
+        chatgpt_codex_client_version()
+    )
+}
+
+fn chatgpt_codex_user_agent() -> String {
+    CHATGPT_CODEX_USER_AGENT.to_owned()
+}
 
 /// Production model discovery. Its only configurable dependency is private and test-only; callers
 /// cannot provide a base URL or extend the Provider allowlist.
@@ -59,6 +100,20 @@ impl ModelDiscovery for LiterModelDiscovery {
         credential: CredentialLease,
     ) -> ProviderResult<Vec<DiscoveredModel>> {
         validate_request(&request)?;
+        if request.provider == ProviderId::ChatGptSubscription {
+            let models = self
+                .transport
+                .list_chatgpt_models(credential)
+                .await
+                .map_err(map_transport_failure)?;
+            return normalize_chatgpt_models(models);
+        }
+        if let Some(models) = fixed_plan_models(request.provider) {
+            return Ok(models
+                .iter()
+                .map(|model| discovered_model(request.provider, model))
+                .collect());
+        }
         let response = self
             .transport
             .list_models(request.provider, credential)
@@ -85,6 +140,14 @@ trait DiscoveryTransport: Send + Sync {
         provider: ProviderId,
         credential: CredentialLease,
     ) -> Result<ModelsListResponse, TransportFailure>;
+
+    /// ChatGPT Subscription exposes an account-scoped Codex directory instead of an
+    /// OpenAI-compatible `list_models` endpoint. Keep this transport inside the adapter so its
+    /// OAuth lease never crosses into the runtime or TUI layers.
+    async fn list_chatgpt_models(
+        &self,
+        credential: CredentialLease,
+    ) -> Result<Vec<ChatGptDirectoryModel>, TransportFailure>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,12 +162,15 @@ impl DiscoveryTransport for LiterDiscoveryTransport {
     ) -> Result<ModelsListResponse, TransportFailure> {
         let provider_hint =
             fixed_provider_hint(provider).map_err(|_| TransportFailure::InvalidResponse)?;
+        let base_url =
+            provider_base_url(provider).map_err(|_| TransportFailure::InvalidResponse)?;
         let client = credential
             .with_secret(|secret| {
                 secret.with_exposed(|api_key| {
                     ClientBuilder::new()
                         .api_key(api_key.to_owned())
                         .provider(provider_hint)
+                        .base_url(base_url)
                         .load_env(false)
                         .timeout(DISCOVERY_TIMEOUT)
                         .max_retries(0)
@@ -115,15 +181,109 @@ impl DiscoveryTransport for LiterDiscoveryTransport {
 
         client.list_models().await.map_err(classify_liter_error)
     }
+
+    async fn list_chatgpt_models(
+        &self,
+        credential: CredentialLease,
+    ) -> Result<Vec<ChatGptDirectoryModel>, TransportFailure> {
+        let client = Client::builder()
+            .timeout(DISCOVERY_TIMEOUT)
+            .https_only(true)
+            .no_proxy()
+            .build()
+            .map_err(|_| TransportFailure::Network)?;
+        let request =
+            with_connected_chatgpt_responses_auth(&credential, |access_token, account_id| {
+                Ok(client
+                    .get(chatgpt_codex_directory_url())
+                    .bearer_auth(access_token)
+                    .header(CHATGPT_ACCOUNT_HEADER, account_id)
+                    .header("originator", CHATGPT_RESPONSES_ORIGINATOR)
+                    .header("user-agent", chatgpt_codex_user_agent()))
+            })
+            .map_err(|_| TransportFailure::Authentication)?;
+        let response = request.send().await.map_err(classify_reqwest_error)?;
+        match response.status() {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                return Err(TransportFailure::Authentication);
+            }
+            StatusCode::TOO_MANY_REQUESTS => return Err(TransportFailure::RateLimited),
+            status if status.is_server_error() => return Err(TransportFailure::Server),
+            status if !status.is_success() => return Err(TransportFailure::InvalidResponse),
+            _ => {}
+        }
+        let response = response.bytes().await.map_err(classify_reqwest_error)?;
+        if response.len() > CHATGPT_MODELS_RESPONSE_MAX_BYTES {
+            return Err(TransportFailure::InvalidResponse);
+        }
+        let directory = serde_json::from_slice::<ChatGptDirectoryResponse>(&response)
+            .map_err(|_| TransportFailure::InvalidResponse)?;
+        Ok(directory.models)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatGptDirectoryResponse {
+    models: Vec<ChatGptDirectoryModel>,
+}
+
+/// The subset of the official account-scoped Codex directory needed by the governed picker.
+/// Unknown directory fields are deliberately ignored so a backend metadata expansion cannot
+/// become a credential or protocol failure.
+#[derive(Debug, Clone, Deserialize)]
+struct ChatGptDirectoryModel {
+    slug: String,
+    #[serde(default)]
+    visibility: String,
+    #[serde(default)]
+    context_window: Option<i64>,
+    #[serde(default)]
+    max_context_window: Option<i64>,
+    #[serde(default)]
+    priority: i64,
+}
+
+#[cfg(test)]
+impl ChatGptDirectoryModel {
+    fn listed(slug: &str, context_window: i64, priority: i64) -> Self {
+        Self {
+            slug: slug.to_owned(),
+            visibility: "list".to_owned(),
+            context_window: Some(context_window),
+            max_context_window: None,
+            priority,
+        }
+    }
+
+    fn hidden(slug: &str, context_window: i64, priority: i64) -> Self {
+        Self {
+            slug: slug.to_owned(),
+            visibility: "hide".to_owned(),
+            context_window: Some(context_window),
+            max_context_window: None,
+            priority,
+        }
+    }
 }
 
 fn fixed_provider_hint(provider: ProviderId) -> ProviderResult<&'static str> {
     match provider {
+        ProviderId::OpenAi => Ok("openai/"),
+        ProviderId::Kimi => Ok("moonshot/"),
+        ProviderId::Qwen => Ok("dashscope/"),
+        ProviderId::Gemini => Ok("gemini/"),
+        ProviderId::Glm => Ok("zai/"),
         ProviderId::ChatGptSubscription => Err(error(
             ProviderErrorCode::ProtocolIncompatible,
             Some(ProviderField::Provider),
             ProviderRemediation::ReturnToEdit,
         )),
+        ProviderId::ClaudeSubscription
+        | ProviderId::AlibabaCoding
+        | ProviderId::BigModelCoding
+        | ProviderId::ZaiCoding
+        | ProviderId::MiniMaxCoding
+        | ProviderId::KimiCoding => Ok("anthropic/"),
         ProviderId::OpenCodeGo => Ok("opencode-go/"),
         ProviderId::OpenCodeZen => Ok("opencode/"),
         ProviderId::DeepSeek => Ok("deepseek/"),
@@ -136,7 +296,11 @@ fn fixed_provider_hint(provider: ProviderId) -> ProviderResult<&'static str> {
 }
 
 fn validate_request(request: &DiscoverModelsRequest) -> ProviderResult<()> {
-    fixed_provider_hint(request.provider)?;
+    if request.provider != ProviderId::ChatGptSubscription
+        && fixed_plan_models(request.provider).is_none()
+    {
+        fixed_provider_hint(request.provider)?;
+    }
     if request.profile_revision == 0 {
         return Err(error(
             ProviderErrorCode::DiscoveryFailed,
@@ -145,8 +309,7 @@ fn validate_request(request: &DiscoverModelsRequest) -> ProviderResult<()> {
         ));
     }
     if request.credential_generation.profile_id() != request.profile_id
-        || request.credential_generation.kind() != CredentialKind::ApiKey
-        || request.provider.required_credential_kind() != CredentialKind::ApiKey
+        || request.credential_generation.kind() != request.provider.required_credential_kind()
     {
         return Err(error(
             ProviderErrorCode::AuthenticationInvalid,
@@ -175,6 +338,7 @@ fn normalize_models(
         } else if !provider_allows_namespaced_model_ids(provider)
             && ProviderId::ALL
                 .into_iter()
+                .chain(ProviderId::LEGACY)
                 .filter(|other| *other != provider)
                 .any(|other| id.starts_with(other.model_prefix()))
         {
@@ -187,6 +351,31 @@ fn normalize_models(
         }
     }
 
+    let models = if provider == ProviderId::OpenCodeGo {
+        OPENCODE_GO_MODELS
+            .into_iter()
+            .map(|model| format!("{prefix}{model}"))
+            .filter(|model| models.contains(model))
+            .collect::<Vec<_>>()
+    } else {
+        models.into_iter().collect::<Vec<_>>()
+    };
+
+    let models = models
+        .into_iter()
+        .filter_map(|model| match online_model_evidence(provider, &model) {
+            OnlineModelEvidence::Chat { context_limit } => Some(DiscoveredModel {
+                model,
+                context_limit: Some(context_limit),
+            }),
+            OnlineModelEvidence::Unknown => Some(DiscoveredModel {
+                model,
+                context_limit: None,
+            }),
+            OnlineModelEvidence::Unsupported => None,
+        })
+        .collect::<Vec<_>>();
+
     if models.is_empty() {
         return Err(error(
             ProviderErrorCode::DiscoveryFailed,
@@ -195,15 +384,152 @@ fn normalize_models(
         ));
     }
 
-    Ok(models
+    Ok(models)
+}
+
+fn normalize_chatgpt_models(
+    directory: Vec<ChatGptDirectoryModel>,
+) -> ProviderResult<Vec<DiscoveredModel>> {
+    let mut candidates = directory
         .into_iter()
-        .map(|model| DiscoveredModel {
-            model,
-            // The list-models protocol has no trustworthy portable context-limit field.
-            // Compatibility probing owns that evidence instead of guessing here.
-            context_limit: None,
+        .filter(|model| model.visibility == "list")
+        .filter_map(|model| {
+            let slug = model.slug;
+            if slug.is_empty()
+                || slug.trim() != slug
+                || slug.len() > 512
+                || slug.chars().any(char::is_whitespace)
+            {
+                return None;
+            }
+            let context_limit = model
+                .context_window
+                .or(model.max_context_window)
+                .filter(|limit| *limit > 0)
+                .and_then(|limit| u32::try_from(limit).ok())?;
+            let model_id = format!("chatgpt/{slug}");
+            ProviderModelId::new(ProviderId::ChatGptSubscription, model_id.clone()).ok()?;
+            Some((model.priority, model_id, context_limit))
         })
-        .collect())
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut seen = BTreeSet::new();
+    let models = candidates
+        .into_iter()
+        .filter(|(_, model, _)| seen.insert(model.clone()))
+        .map(|(_, model, context_limit)| DiscoveredModel {
+            model,
+            context_limit: Some(context_limit),
+        })
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err(error(
+            ProviderErrorCode::DiscoveryFailed,
+            Some(ProviderField::Model),
+            ProviderRemediation::ReturnToEdit,
+        ));
+    }
+    Ok(models)
+}
+
+fn fixed_plan_models(provider: ProviderId) -> Option<&'static [&'static str]> {
+    match provider {
+        ProviderId::ClaudeSubscription => Some(&[
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        ]),
+        ProviderId::AlibabaCoding => Some(&[
+            "qwen3-coder-plus",
+            "qwen3.5-plus",
+            "glm-5",
+            "kimi-k2.5",
+            "MiniMax-M2.5",
+        ]),
+        ProviderId::BigModelCoding | ProviderId::ZaiCoding => Some(&["glm-5.1", "glm-5"]),
+        ProviderId::MiniMaxCoding => Some(&["MiniMax-M2.7"]),
+        ProviderId::KimiCoding => Some(&["kimi-for-coding"]),
+        _ => None,
+    }
+}
+
+fn discovered_model(provider: ProviderId, model: &str) -> DiscoveredModel {
+    let model = format!("{}{model}", provider.model_prefix());
+    let context_limit = known_context_limit(&model);
+    DiscoveredModel {
+        model,
+        context_limit,
+    }
+}
+
+fn known_context_limit(model: &str) -> Option<u32> {
+    let bare_model = model.rsplit('/').next().unwrap_or(model);
+    governed_context_limit(bare_model).or_else(|| catalog_context_limit(model))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnlineModelEvidence {
+    Chat { context_limit: u32 },
+    Unknown,
+    Unsupported,
+}
+
+fn online_model_evidence(provider: ProviderId, model: &str) -> OnlineModelEvidence {
+    if provider == ProviderId::OpenCodeGo {
+        // The product catalog explicitly curates the Go plan's Chat-compatible subset.
+        return known_context_limit(model)
+            .map_or(OnlineModelEvidence::Unsupported, |context_limit| {
+                OnlineModelEvidence::Chat { context_limit }
+            });
+    }
+    let bare_model = model.rsplit('/').next().unwrap_or(model);
+    if let Some(limit) = governed_context_limit(bare_model) {
+        return OnlineModelEvidence::Chat {
+            context_limit: limit,
+        };
+    }
+    let Some(info) = liter_llm::cost::model_info(model) else {
+        return OnlineModelEvidence::Unknown;
+    };
+    if info.mode.as_deref() != Some("chat") || info.supports_function_calling != Some(true) {
+        return OnlineModelEvidence::Unsupported;
+    }
+    info.max_tokens
+        .and_then(|limit| u32::try_from(limit).ok())
+        .map_or(OnlineModelEvidence::Unknown, |context_limit| {
+            OnlineModelEvidence::Chat { context_limit }
+        })
+}
+
+fn catalog_context_limit(model: &str) -> Option<u32> {
+    liter_llm::cost::model_info(model)
+        .and_then(|info| info.max_tokens)
+        .and_then(|limit| u32::try_from(limit).ok())
+}
+
+fn governed_context_limit(model: &str) -> Option<u32> {
+    match model {
+        "gpt-5.5" | "gpt-5.4" => Some(1_050_000),
+        "gpt-5.4-mini" | "gpt-5.4-nano" => Some(400_000),
+        "o3" | "o3-pro" | "o4-mini" => Some(200_000),
+        "deepseek-v4-pro" | "deepseek-v4-flash" => Some(1_048_576),
+        "kimi-k2.6" | "kimi-k2.5" | "kimi-k2-thinking" | "kimi-for-coding" => Some(256_000),
+        "qwen3.6-plus" | "qwen3.6-flash" | "qwen3.5-plus" | "qwen3-coder-plus" => Some(1_000_000),
+        "qwen3-coder-next" => Some(262_144),
+        "glm-5.1" | "glm-5-turbo" => Some(202_752),
+        "glm-5" | "glm-4.7" => Some(200_000),
+        "glm-4.5-air" | "glm-4.5-flash" => Some(128_000),
+        "MiniMax-M2.5" | "MiniMax-M2.7" => Some(204_800),
+        "claude-opus-4-7" | "claude-opus-4-6" | "claude-sonnet-4-6" => Some(1_000_000),
+        "claude-haiku-4-5" => Some(200_000),
+        "gemini-3.1-pro-preview"
+        | "gemini-3.1-flash-lite-preview"
+        | "gemini-2.5-pro"
+        | "gemini-2.5-flash" => Some(1_048_576),
+        _ => None,
+    }
 }
 
 const fn provider_allows_namespaced_model_ids(provider: ProviderId) -> bool {
@@ -223,6 +549,14 @@ fn classify_liter_error(error: LiterLlmError) -> TransportFailure {
             TransportFailure::Server
         }
         _ => TransportFailure::InvalidResponse,
+    }
+}
+
+fn classify_reqwest_error(error: reqwest::Error) -> TransportFailure {
+    if error.is_timeout() {
+        TransportFailure::Timeout
+    } else {
+        TransportFailure::Network
     }
 }
 

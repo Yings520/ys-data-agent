@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
+use ys_agent_adapters::credential::memory::InMemoryCredentialVault;
 use ys_agent_core::{
     CredentialGeneration, CredentialKind, CredentialMutation, CredentialMutationIntent,
     CredentialMutationRequest, CredentialVault, CredentialViewStatus, OperationId, ProfileId,
@@ -167,6 +167,69 @@ async fn api_key_creation_records_the_journal_writes_the_vault_then_appends_a_dr
 }
 
 #[tokio::test]
+async fn cancelling_an_unacknowledged_intent_removes_its_journal_and_staged_vault_entry() {
+    let directory = TempDir::new().expect("temporary database directory");
+    let store = SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+        .await
+        .expect("open database");
+    let repository = store.provider_repository();
+    let vault = Arc::new(InMemoryCredentialVault::new());
+    let profile_id = ProfileId::new();
+    seed_draft(&repository, profile_id, "Interrupted credential").await;
+    let service = CredentialService::new(
+        Arc::new(repository.clone()),
+        Arc::new(store.run_binding_repository()),
+        vault.clone(),
+    );
+    let operation_id = OperationId::new();
+    let generation = CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey)
+        .expect("first API-key generation");
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::create(operation_id, profile_id, 1, generation)
+                .expect("valid creation intent"),
+        )
+        .await
+        .expect("record intent");
+    vault
+        .write_generation(api_key_write(
+            profile_id,
+            generation,
+            "unacknowledged-write-canary",
+        ))
+        .await
+        .expect("simulate a write immediately before interruption");
+
+    service
+        .rollback_cancelled_intent(operation_id)
+        .await
+        .expect("cancelled operation cleanup");
+
+    assert!(
+        repository
+            .pending_credential_mutations()
+            .await
+            .expect("journal state")
+            .is_empty()
+    );
+    assert_eq!(
+        vault
+            .credential_status(credential_reference(profile_id, generation))
+            .await
+            .expect("staged Vault status"),
+        CredentialViewStatus::Missing
+    );
+    assert_eq!(
+        repository
+            .load_current_revision(profile_id)
+            .await
+            .expect("unchanged profile")
+            .credential_generation(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn replace_and_delete_are_profile_scoped_and_clean_unreferenced_generations() {
     let directory = TempDir::new().expect("temporary database directory");
     let store = SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -320,7 +383,7 @@ async fn failed_vault_write_rolls_back_the_journal_and_leaves_the_prior_draft_vi
             .expect("complete the native protection probe before fault injection"),
         ys_agent_core::CredentialProtectionStatus::ConfirmedNative
     );
-    vault.fail_next(ys_agent_adapters::credential::keyring::InMemoryVaultOperation::Write);
+    vault.fail_next(ys_agent_adapters::credential::memory::InMemoryVaultOperation::Write);
 
     let error = service
         .mutate(CredentialMutationRequest {
@@ -354,6 +417,77 @@ async fn failed_vault_write_rolls_back_the_journal_and_leaves_the_prior_draft_vi
             .await
             .expect("rolled-back journal is terminal")
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn api_key_retry_after_rolled_back_write_rebases_to_the_next_historical_generation() {
+    let directory = TempDir::new().expect("temporary database directory");
+    let store = SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+        .await
+        .expect("open database");
+    let repository = store.provider_repository();
+    let vault = Arc::new(InMemoryCredentialVault::new());
+    let profile_id = ProfileId::new();
+    seed_draft(&repository, profile_id, "Retry after rollback").await;
+    let service = CredentialService::new(
+        Arc::new(repository.clone()),
+        Arc::new(store.run_binding_repository()),
+        vault.clone(),
+    );
+    let caller_generation =
+        CredentialGeneration::new(profile_id, 1, CredentialKind::ApiKey).expect("first generation");
+    assert_eq!(
+        vault
+            .protection_status()
+            .await
+            .expect("complete native protection probe"),
+        ys_agent_core::CredentialProtectionStatus::ConfirmedNative
+    );
+    vault.fail_next(ys_agent_adapters::credential::memory::InMemoryVaultOperation::Write);
+
+    service
+        .mutate(CredentialMutationRequest {
+            intent: CredentialMutationIntent::create(
+                OperationId::new(),
+                profile_id,
+                1,
+                caller_generation,
+            )
+            .expect("first create intent"),
+            mutation: CredentialMutation::Replace(api_key_write(
+                profile_id,
+                caller_generation,
+                "first-write-fails",
+            )),
+        })
+        .await
+        .expect_err("first Vault write is fault injected");
+
+    let detail = service
+        .mutate(CredentialMutationRequest {
+            intent: CredentialMutationIntent::create(
+                OperationId::new(),
+                profile_id,
+                1,
+                caller_generation,
+            )
+            .expect("the masked caller still only knows generation one"),
+            mutation: CredentialMutation::Replace(api_key_write(
+                profile_id,
+                caller_generation,
+                "retry-succeeds",
+            )),
+        })
+        .await
+        .expect("service allocates past the rolled-back tombstone");
+
+    assert_eq!(
+        detail
+            .credential_generation
+            .expect("saved API-key generation")
+            .number(),
+        2
     );
 }
 
@@ -617,7 +751,7 @@ async fn failed_old_generation_cleanup_leaves_a_durable_fail_closed_profile_stat
         .expect("create first generation");
     let replacement = CredentialGeneration::new(profile_id, 2, CredentialKind::ApiKey)
         .expect("replacement generation");
-    vault.fail_next(ys_agent_adapters::credential::keyring::InMemoryVaultOperation::Delete);
+    vault.fail_next(ys_agent_adapters::credential::memory::InMemoryVaultOperation::Delete);
 
     let error = service
         .mutate(CredentialMutationRequest {

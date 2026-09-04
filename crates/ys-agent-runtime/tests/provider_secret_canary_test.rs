@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use tempfile::TempDir;
-use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
+use ys_agent_adapters::credential::memory::InMemoryCredentialVault;
 use ys_agent_core::{
     ArtifactKind, ArtifactStore, CredentialGeneration, CredentialKind, CredentialMutation,
     CredentialMutationIntent, CredentialMutationRequest, CredentialProtectionStatus, OperationId,

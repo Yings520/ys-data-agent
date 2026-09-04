@@ -6,11 +6,11 @@ use std::{
 use tempfile::TempDir;
 use ys_agent_core::{
     ActivateProfileRequest, ActivationPrecondition, CompatibilityEvidence, CredentialGeneration,
-    DeviceAuthorizationView, OAuthConnectionService, OAuthConnectionStatus, OAuthConnectionView,
-    OperationId, ProfileId, ProfileName, ProfileRevision, ProfileState, ProviderErrorCode,
-    ProviderId, ProviderManagementError, ProviderRemediation, ProviderResult,
-    RemoteRevocationOutcome, RevisionPrecondition, SaveProfileRevision, ValidationCommit,
-    ValidationCommitPrecondition, ValidationVersions,
+    CredentialKind, CredentialMutationIntent, DeviceAuthorizationView, OAuthConnectionService,
+    OAuthConnectionStatus, OAuthConnectionView, OperationId, ProfileId, ProfileName,
+    ProfileRevision, ProfileState, ProviderErrorCode, ProviderId, ProviderManagementError,
+    ProviderRemediation, ProviderResult, RemoteRevocationOutcome, RevisionPrecondition,
+    SaveProfileRevision, ValidationCommit, ValidationCommitPrecondition, ValidationVersions,
 };
 use ys_agent_runtime::provider::service::ProviderManagementService;
 use ys_agent_store::SqliteRuntimeStore;
@@ -19,6 +19,7 @@ use ys_agent_store::SqliteRuntimeStore;
 struct FakeOAuth {
     operations: Mutex<HashMap<OperationId, ProfileId>>,
     statuses: Mutex<HashMap<ProfileId, OAuthConnectionStatus>>,
+    generations: Mutex<HashMap<ProfileId, CredentialGeneration>>,
     residual_risk: Mutex<bool>,
 }
 
@@ -56,6 +57,12 @@ impl OAuthConnectionService for FakeOAuth {
         profile_id: ProfileId,
         _generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
+        // Match the production adapter: restoring a persisted generation replaces the
+        // in-memory connection state, including any active browser authorization.
+        self.operations
+            .lock()
+            .expect("fake OAuth state")
+            .retain(|_, pending_profile_id| *pending_profile_id != profile_id);
         Ok(self.view_for(profile_id))
     }
 
@@ -76,13 +83,21 @@ impl OAuthConnectionService for FakeOAuth {
         })
     }
 
-    async fn complete(&self, operation_id: OperationId) -> ProviderResult<OAuthConnectionView> {
+    async fn complete(
+        &self,
+        operation_id: OperationId,
+        generation: CredentialGeneration,
+    ) -> ProviderResult<OAuthConnectionView> {
         let profile_id = self
             .operations
             .lock()
             .expect("fake OAuth state")
             .remove(&operation_id)
             .ok_or_else(oauth_error)?;
+        self.generations
+            .lock()
+            .expect("fake OAuth state")
+            .insert(profile_id, generation);
         self.status(profile_id, OAuthConnectionStatus::Connected);
         Ok(self.view_for(profile_id))
     }
@@ -91,7 +106,12 @@ impl OAuthConnectionService for FakeOAuth {
         &self,
         profile_id: ProfileId,
         _operation_id: OperationId,
+        generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
+        self.generations
+            .lock()
+            .expect("fake OAuth state")
+            .insert(profile_id, generation);
         self.status(profile_id, OAuthConnectionStatus::Connected);
         Ok(self.view_for(profile_id))
     }
@@ -248,6 +268,10 @@ async fn oauth_completion_reauthorization_and_refresh_rotate_generations_without
         .await
         .expect("reauthorization starts another safe device flow");
     service
+        .load_profile(profile_id)
+        .await
+        .expect("TUI readback must preserve the pending browser authorization");
+    service
         .complete_oauth(reauthorize)
         .await
         .expect("reauthorization rotates into a newer Draft");
@@ -318,6 +342,23 @@ async fn oauth_cancellation_and_disconnected_status_fail_closed_for_activation_a
         ProviderErrorCode::OperationCancelled.as_str()
     );
 
+    let abandoned = OperationId::new();
+    service
+        .start_oauth(profile_id, abandoned)
+        .await
+        .expect("start browser authorization");
+    service
+        .cancel_operation(abandoned)
+        .expect("cancel browser authorization");
+    let abandoned_error = service
+        .complete_oauth(abandoned)
+        .await
+        .expect_err("a cancelled browser authorization cannot commit later");
+    assert!(matches!(
+        abandoned_error.code(),
+        "provider.operation.cancelled" | "provider.operation.stale"
+    ));
+
     let connect = OperationId::new();
     service
         .start_oauth(profile_id, connect)
@@ -380,4 +421,51 @@ async fn oauth_cancellation_and_disconnected_status_fail_closed_for_activation_a
             remediation: ProviderRemediation::ContactSupport
         })
     ));
+}
+
+#[tokio::test]
+async fn oauth_retry_after_rolled_back_first_generation_uses_the_next_historical_generation() {
+    let (service, repository, profile_id, _oauth) = service_with_chatgpt_draft().await;
+    let abandoned_operation = OperationId::new();
+    let abandoned_generation =
+        CredentialGeneration::new(profile_id, 1, CredentialKind::OAuthConnection)
+            .expect("first OAuth generation");
+    repository
+        .begin_credential_mutation(
+            CredentialMutationIntent::create(
+                abandoned_operation,
+                profile_id,
+                1,
+                abandoned_generation,
+            )
+            .expect("abandoned OAuth intent"),
+        )
+        .await
+        .expect("record abandoned OAuth intent");
+    repository
+        .rollback_credential_mutation(abandoned_operation)
+        .await
+        .expect("recover abandoned OAuth intent");
+
+    let retry_operation = OperationId::new();
+    service
+        .start_oauth(profile_id, retry_operation)
+        .await
+        .expect("start a fresh browser authorization");
+    service
+        .complete_oauth(retry_operation)
+        .await
+        .expect("rolled-back generation must not poison the retry");
+
+    assert_eq!(
+        service
+            .load_profile(profile_id)
+            .await
+            .expect("load connected Profile")
+            .credential_generation
+            .expect("connected OAuth generation")
+            .number(),
+        2,
+        "credential generations remain monotonic across rollback"
+    );
 }

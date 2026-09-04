@@ -38,6 +38,29 @@ pub struct ModelRequest {
     pub tools: Vec<ToolSpec>,
     pub context_manifest: ContextManifest,
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub tool_choice: ModelToolChoice,
+    #[serde(default)]
+    pub response_format: ModelResponseFormat,
+}
+
+/// Provider-neutral control over whether a model may emit a tool call on this turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelToolChoice {
+    #[default]
+    Auto,
+    Required,
+    None,
+}
+
+/// Provider-neutral response envelope requested for non-tool output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelResponseFormat {
+    #[default]
+    Text,
+    JsonObject,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
