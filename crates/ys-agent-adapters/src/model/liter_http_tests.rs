@@ -76,6 +76,8 @@ fn request(model: String) -> ModelRequest {
         // checks this canary is absent from the real wire body.
         context_manifest: ContextManifest::empty(8_000).omit(CONTEXT_CANARY, "fixture"),
         temperature: Some(0.2),
+        tool_choice: ys_agent_core::ModelToolChoice::Auto,
+        response_format: ys_agent_core::ModelResponseFormat::JsonObject,
     }
 }
 
@@ -103,7 +105,6 @@ fn chat_client(provider: ProviderId, server: &MockServer, retries: u32) -> Liter
 fn responses_client(server: &MockServer, retries: u32) -> LiterModelProvider {
     let model = "chatgpt/fixture-model".to_owned();
     LiterModelProvider::from_plan(ClientPlan::Responses {
-        model_hint: model.clone(),
         model,
         temperature: Some(0.2),
         config: ClientConfigBuilder::new("fixture-transport-credential")
@@ -114,6 +115,8 @@ fn responses_client(server: &MockServer, retries: u32) -> LiterModelProvider {
             .expect("fixture account header")
             .header("originator", "codex_cli_rs")
             .expect("fixture originator header")
+            .header("accept", "text/event-stream")
+            .expect("fixture stream accept header")
             .build(),
         codec: ChatGptResponsesCodec::new(ParameterApplicability::Supported),
     })
@@ -189,41 +192,52 @@ fn anthropic_response(follow_up: bool) -> ResponseTemplate {
     }))
 }
 
-fn responses_response(follow_up: bool) -> ResponseTemplate {
-    let output = if follow_up {
-        json!([{
+fn responses_stream_response(follow_up: bool) -> ResponseTemplate {
+    let item = if follow_up {
+        json!({
             "type": "message",
             "role": "assistant",
             "content": [{
                 "type": "output_text",
                 "text": "{\"type\":\"request_clarification\",\"question\":\"fixture complete?\"}"
             }]
-        }])
+        })
     } else {
-        json!([{
+        json!({
             "type": "function_call",
             "call_id": FIXTURE_CALL_ID,
             "name": "inspect_schema",
             "arguments": "{\"source\":\"fixture\"}"
-        }])
+        })
     };
-    ResponseTemplate::new(200).set_body_json(json!({
-        "id": "fixture-responses-response",
-        "object": "response",
-        "created_at": 1,
-        "model": "fixture-model",
-        "status": "completed",
-        "output": output,
-        "usage": { "input_tokens": 10, "output_tokens": 4, "total_tokens": 14 },
-        "error": null
-    }))
+    let output_item_done = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": item,
+    });
+    // Codex's terminal event intentionally carries only turn metadata. Its completed response
+    // items arrive earlier as `response.output_item.done` events, unlike the public JSON
+    // Responses endpoint that returns a full response object here.
+    let completed = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "fixture-responses-response",
+            "usage": { "input_tokens": 10, "output_tokens": 4, "total_tokens": 14 },
+        }
+    });
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(format!(
+            "event: response.output_item.done\ndata: {output_item_done}\n\n\
+             event: response.completed\ndata: {completed}\n\n"
+        ))
 }
 
 async fn mount_success_fixture(server: &MockServer) {
     Mock::given(method("POST"))
         .respond_with(|request: &Request| match request.url.path() {
             "/messages" => anthropic_response(is_follow_up(request)),
-            "/responses" => responses_response(is_follow_up(request)),
+            "/responses" => responses_stream_response(is_follow_up(request)),
             "/chat/completions" => chat_response(is_follow_up(request)),
             _ => ResponseTemplate::new(404),
         })
@@ -328,6 +342,60 @@ async fn nine_governed_provider_fixtures_drive_real_liter_clients() {
             && !body.contains(CONTEXT_CANARY)
             && !body.contains(RAW_BODY_CANARY)
     }));
+    let responses_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/responses")
+        .collect();
+    assert_eq!(responses_requests.len(), 2);
+    assert!(responses_requests.iter().all(|request| {
+        let body = String::from_utf8_lossy(&request.body);
+        body.contains("\"stream\":true")
+            && request
+                .headers
+                .get("accept")
+                .is_some_and(|value| value == "text/event-stream")
+            && request
+                .headers
+                .get("user-agent")
+                .is_some_and(|value| value == "codex_cli_rs/0.152.1")
+            && request
+                .headers
+                .get("originator")
+                .is_some_and(|value| value == "codex_cli_rs")
+            && request
+                .headers
+                .get("chatgpt-account-id")
+                .is_some_and(|value| value == "fixture-account")
+    }));
+}
+
+#[tokio::test]
+async fn codex_sse_terminal_failure_is_sanitized() {
+    let server = MockServer::start().await;
+    let failed = json!({
+        "type": "response.failed",
+        "response": { "id": "fixture-failed-response" },
+        "error": { "message": RAW_BODY_CANARY },
+    });
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("event: response.failed\\ndata: {failed}\\n\\n")),
+        )
+        .mount(&server)
+        .await;
+
+    let error = responses_client(&server, 0)
+        .complete(request("chatgpt/fixture-model".to_owned()))
+        .await
+        .expect_err("Codex terminal failure must not be decoded as a successful response");
+    assert_eq!(
+        error.code(),
+        ProviderErrorCode::ProtocolInvalidResponse.as_str()
+    );
+    assert!(!error.to_string().contains(RAW_BODY_CANARY));
+    assert!(!format!("{error:?}").contains(RAW_BODY_CANARY));
 }
 
 #[tokio::test]

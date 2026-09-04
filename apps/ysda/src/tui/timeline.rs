@@ -79,7 +79,7 @@ impl TimelineStatus {
         )
     }
 
-    const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Idle => "Ready",
             Self::Scheduled => "Scheduled",
@@ -213,12 +213,10 @@ impl TimelineState {
 
     pub fn apply_service_reply(&mut self, reply: &ServiceReply) {
         match reply {
-            ServiceReply::Conversation { message } => self.set_notice(
-                "Conversation response received",
-                message,
-                TimelineTone::Neutral,
-                SERVICE_REPLY_RANK,
-            ),
+            // A plain conversation has no governed workflow, tool execution, or verification
+            // evidence to explain. The TUI renders its answer as a compact chat card instead of
+            // inventing a timeline entry such as "Conversation response received".
+            ServiceReply::Conversation { .. } => {}
             ServiceReply::RunScheduled { .. } => {
                 self.set_status(TimelineStatus::Scheduled, SERVICE_REPLY_RANK);
                 self.set_status(TimelineStatus::Running, SERVICE_REPLY_RANK);

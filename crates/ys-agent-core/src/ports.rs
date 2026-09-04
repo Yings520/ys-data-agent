@@ -263,6 +263,15 @@ pub trait ValidationActivationRepository: ProfileRevisionRepository {
 /// acquiring validation, activation, or Profile-deletion authority.
 #[async_trait]
 pub trait CredentialMutationRepository: ProfileRevisionRepository {
+    /// Returns the next immutable generation after every generation ever recorded for this
+    /// Profile, including terminal rollback tombstones. The subsequent journal begin remains the
+    /// atomic reservation point and may reject a concurrent caller as stale.
+    async fn next_credential_generation(
+        &self,
+        profile_id: ProfileId,
+        kind: crate::CredentialKind,
+    ) -> ProviderResult<crate::CredentialGeneration>;
+
     async fn begin_credential_mutation(
         &self,
         intent: CredentialMutationIntent,
@@ -339,7 +348,7 @@ pub trait RunProviderBindingRepository: Send + Sync {
     ) -> ProviderResult<bool>;
 }
 
-/// OS-backed credential boundary. The only data that reaches a caller is a short-lived opaque
+/// Protected credential boundary. The only data that reaches a caller is a short-lived opaque
 /// lease; locator and secret text never enter Profile, TUI, Doctor, or runtime view types.
 #[async_trait]
 pub trait CredentialVault: Send + Sync {
@@ -408,12 +417,17 @@ pub trait OAuthConnectionService: Send + Sync {
         operation_id: OperationId,
     ) -> ProviderResult<DeviceAuthorizationView>;
 
-    async fn complete(&self, operation_id: OperationId) -> ProviderResult<OAuthConnectionView>;
+    async fn complete(
+        &self,
+        operation_id: OperationId,
+        generation: crate::CredentialGeneration,
+    ) -> ProviderResult<OAuthConnectionView>;
 
     async fn refresh(
         &self,
         profile_id: ProfileId,
         operation_id: OperationId,
+        generation: crate::CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView>;
 
     async fn reauthorize(

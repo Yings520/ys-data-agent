@@ -1,9 +1,9 @@
 use liter_llm::types::ChatCompletionResponse;
 use serde_json::{Value, json};
 use ys_agent_core::{
-    AgentAction, AssistantToolCall, ContextManifest, ModelMessage, ModelRequest, ModelRole,
-    ParameterApplicability, ProviderErrorCode, ProviderField, ProviderId, ProviderParameterKey,
-    Sensitivity, SideEffect, ToolRisk, ToolSpec,
+    AgentAction, AssistantToolCall, ContextManifest, ModelMessage, ModelRequest,
+    ModelResponseFormat, ModelRole, ModelToolChoice, ParameterApplicability, ProviderErrorCode,
+    ProviderField, ProviderId, ProviderParameterKey, Sensitivity, SideEffect, ToolRisk, ToolSpec,
 };
 
 use super::LiterChatCodec;
@@ -62,6 +62,8 @@ fn request(provider: ProviderId) -> ModelRequest {
         tools: vec![tool_spec()],
         context_manifest: ContextManifest::empty(8_000),
         temperature: Some(0.2),
+        tool_choice: ModelToolChoice::Auto,
+        response_format: ModelResponseFormat::JsonObject,
     }
 }
 
@@ -122,9 +124,36 @@ fn eight_chat_paths_encode_the_same_closed_liter_fixture() {
         assert_eq!(value["temperature"].as_f64(), Some(f64::from(0.2_f32)));
         assert_eq!(value["tools"][0]["function"]["name"], "inspect_schema");
         assert_eq!(value["tool_choice"], "auto");
+        assert_eq!(value["response_format"]["type"], "json_object");
         assert_eq!(value["parallel_tool_calls"], false);
-        assert!(value.get("extra_body").is_none());
+        if provider == ProviderId::DeepSeek {
+            assert_eq!(value["extra_body"]["thinking"]["type"], "disabled");
+        } else {
+            assert!(value.get("extra_body").is_none());
+        }
     }
+}
+
+#[test]
+fn explicit_tool_policy_is_preserved_on_the_chat_wire() {
+    let mut core_request = request(ProviderId::DeepSeek);
+    core_request.tool_choice = ModelToolChoice::Required;
+    let required = serde_json::to_value(
+        codec(ProviderId::DeepSeek)
+            .encode_request(&core_request)
+            .expect("required tool policy"),
+    )
+    .expect("serialize required request");
+    assert_eq!(required["tool_choice"], "required");
+
+    core_request.tool_choice = ModelToolChoice::None;
+    let none = serde_json::to_value(
+        codec(ProviderId::DeepSeek)
+            .encode_request(&core_request)
+            .expect("disabled tool policy"),
+    )
+    .expect("serialize disabled request");
+    assert_eq!(none["tool_choice"], "none");
 }
 
 #[test]

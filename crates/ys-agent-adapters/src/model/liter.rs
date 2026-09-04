@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use liter_llm::{
-    LlmClient, ResponseClient,
+    LlmClient,
     auth::StaticTokenProvider,
     client::{ClientConfig, ClientConfigBuilder, DefaultClient},
     error::LiterLlmError,
@@ -22,7 +22,9 @@ use ys_agent_core::{
 };
 
 use super::{
-    liter_chat::LiterChatCodec, liter_responses::ChatGptResponsesCodec, required_capabilities,
+    liter_chat::LiterChatCodec,
+    liter_responses::{ChatGptResponsesCodec, ChatGptResponsesTransport},
+    required_capabilities,
 };
 
 const MAX_BOUND_RETRIES: u32 = 2;
@@ -44,7 +46,6 @@ enum ClientPlan {
         codec: LiterChatCodec,
     },
     Responses {
-        model_hint: String,
         model: String,
         temperature: Option<f32>,
         config: ClientConfig,
@@ -74,7 +75,6 @@ impl LiterProviderFactory {
             config.timeout = timeout;
             config.max_retries = retry_count;
             return Ok(ClientPlan::Responses {
-                model_hint: model.clone(),
                 model,
                 temperature: binding.parameters.temperature(),
                 config,
@@ -180,11 +180,11 @@ pub struct LiterModelProvider {
 #[derive(Clone)]
 enum BoundClient {
     Chat {
-        client: DefaultClient,
+        client: Box<DefaultClient>,
         codec: LiterChatCodec,
     },
     Responses {
-        client: DefaultClient,
+        transport: ChatGptResponsesTransport,
         codec: ChatGptResponsesCodec,
     },
 }
@@ -204,22 +204,23 @@ impl LiterModelProvider {
                 Ok(Self {
                     model,
                     temperature,
-                    client: BoundClient::Chat { client, codec },
+                    client: BoundClient::Chat {
+                        client: Box::new(client),
+                        codec,
+                    },
                 })
             }
             ClientPlan::Responses {
-                model_hint,
                 model,
                 temperature,
                 config,
                 codec,
             } => {
-                let client = DefaultClient::new(config, Some(&model_hint))
-                    .map_err(map_client_construction_error)?;
+                let transport = ChatGptResponsesTransport::from_config(config)?;
                 Ok(Self {
                     model,
                     temperature,
-                    client: BoundClient::Responses { client, codec },
+                    client: BoundClient::Responses { transport, codec },
                 })
             }
         }
@@ -261,12 +262,12 @@ impl ModelProvider for LiterModelProvider {
                     .decode_response(&request, wire_response)
                     .map_err(provider_to_core)
             }
-            BoundClient::Responses { client, codec } => {
+            BoundClient::Responses { transport, codec } => {
                 let wire_request = codec.encode_request(&request).map_err(provider_to_core)?;
-                let wire_response = client
+                let wire_response = transport
                     .create_response(wire_request)
                     .await
-                    .map_err(liter_to_core)?;
+                    .map_err(provider_to_core)?;
                 codec
                     .decode_response(&request, wire_response)
                     .map_err(provider_to_core)

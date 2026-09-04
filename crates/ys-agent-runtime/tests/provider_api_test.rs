@@ -8,7 +8,7 @@ use std::{
 };
 
 use ys_agent_adapters::{
-    credential::keyring::InMemoryCredentialVault, model::liter::LiterProviderFactory,
+    credential::memory::InMemoryCredentialVault, model::liter::LiterProviderFactory,
 };
 use ys_agent_core::{
     AgentAction, CoreError, CoreResult, CredentialLease, CredentialVault, CredentialViewStatus,
@@ -114,7 +114,7 @@ fn successful_probe_responses() -> VecDeque<CoreResult<ModelResponse>> {
                     id: ToolCallId::new(),
                     provider_call_id: Some("switch-model-probe".to_owned()),
                     name: "ysda_compatibility_probe".to_owned(),
-                    arguments: serde_json::json!({}),
+                    arguments: serde_json::json!({"probe": "ysda-v2"}),
                     version: "v1".to_owned(),
                 },
             },

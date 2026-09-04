@@ -128,6 +128,12 @@ impl CredentialService {
             .profiles
             .load_current_revision(request.intent.profile_id())
             .await?;
+        validate_credential_request(&current, &request.intent, &request.mutation)?;
+        let allocated = self
+            .profiles
+            .next_credential_generation(current.profile_id(), CredentialKind::ApiKey)
+            .await?;
+        let request = rebase_credential_request(&current, request, allocated)?;
         let staged = validate_credential_request(&current, &request.intent, &request.mutation)?;
         let operation_id = request.intent.operation_id();
         let old_generation = request.intent.old_generation();
@@ -138,10 +144,12 @@ impl CredentialService {
             .begin_credential_mutation(request.intent.clone())
             .await?;
 
-        if !matches!(
-            self.vault.protection_status().await,
-            Ok(CredentialProtectionStatus::ConfirmedNative)
-        ) {
+        if !self
+            .vault
+            .protection_status()
+            .await
+            .is_ok_and(CredentialProtectionStatus::is_confirmed)
+        {
             return Err(self.block_after_uncertain_state(operation_id).await);
         }
 
@@ -458,11 +466,18 @@ impl ProviderManagementService {
             ));
         }
         self.require_chatgpt(&current)?;
-        let next_generation = next_oauth_generation(&current)?;
+        let next_generation = self
+            .profiles
+            .next_credential_generation(profile_id, CredentialKind::OAuthConnection)
+            .await?;
         let intent = oauth_mutation_intent(operation_id, &current, next_generation)?;
         self.profiles.begin_credential_mutation(intent).await?;
 
-        let view = match self.oauth_adapter()?.complete(operation_id).await {
+        let view = match self
+            .oauth_adapter()?
+            .complete(operation_id, next_generation)
+            .await
+        {
             Ok(view)
                 if view.profile_id == profile_id
                     && view.status == OAuthConnectionStatus::Connected =>
@@ -503,12 +518,15 @@ impl ProviderManagementService {
         ) {
             return Err(oauth_not_connected_error());
         }
-        let next_generation = next_oauth_generation(&current)?;
+        let next_generation = self
+            .profiles
+            .next_credential_generation(profile_id, CredentialKind::OAuthConnection)
+            .await?;
         let intent = oauth_mutation_intent(operation_id, &current, next_generation)?;
         self.profiles.begin_credential_mutation(intent).await?;
         let view = match self
             .oauth_adapter()?
-            .refresh(profile_id, operation_id)
+            .refresh(profile_id, operation_id, next_generation)
             .await
         {
             Ok(view)
@@ -1031,21 +1049,6 @@ fn oauth_not_connected_error() -> ProviderManagementError {
     )
 }
 
-fn next_oauth_generation(current: &ProfileRevision) -> ProviderResult<CredentialGeneration> {
-    let next_number = current
-        .credential_generation()
-        .map(CredentialGeneration::number)
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(internal_error)?;
-    CredentialGeneration::new(
-        current.profile_id(),
-        next_number,
-        CredentialKind::OAuthConnection,
-    )
-    .map_err(|_| internal_error())
-}
-
 fn oauth_mutation_intent(
     operation_id: OperationId,
     current: &ProfileRevision,
@@ -1071,6 +1074,45 @@ fn oauth_mutation_intent(
         )
         .map_err(|_| internal_error()),
     }
+}
+
+fn rebase_credential_request(
+    current: &ProfileRevision,
+    mut request: CredentialMutationRequest,
+    allocated: CredentialGeneration,
+) -> ProviderResult<CredentialMutationRequest> {
+    let operation_id = request.intent.operation_id();
+    request.intent = match &mut request.mutation {
+        CredentialMutation::Replace(write) => {
+            write.reference = credential_reference(allocated);
+            match current.credential_generation() {
+                Some(old_generation) => CredentialMutationIntent::replace(
+                    operation_id,
+                    current.profile_id(),
+                    current.revision(),
+                    old_generation,
+                    allocated,
+                ),
+                None => CredentialMutationIntent::create(
+                    operation_id,
+                    current.profile_id(),
+                    current.revision(),
+                    allocated,
+                ),
+            }
+        }
+        CredentialMutation::Delete => CredentialMutationIntent::delete(
+            operation_id,
+            current.profile_id(),
+            current.revision(),
+            current
+                .credential_generation()
+                .ok_or_else(credential_stale_error)?,
+            allocated,
+        ),
+    }
+    .map_err(|_| internal_error())?;
+    Ok(request)
 }
 
 fn internal_operation_error() -> ProviderManagementError {

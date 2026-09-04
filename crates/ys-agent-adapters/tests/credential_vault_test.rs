@@ -1,5 +1,6 @@
-use ys_agent_adapters::credential::keyring::{
-    InMemoryCredentialVault, InMemoryVaultOperation, KEYRING_SERVICE, KeyringCredentialVault,
+use ys_agent_adapters::credential::{
+    local::LocalEncryptedCredentialVault,
+    memory::{InMemoryCredentialVault, InMemoryVaultOperation},
 };
 use ys_agent_core::{
     CredentialGeneration, CredentialKind, CredentialProtectionStatus, CredentialVault,
@@ -35,20 +36,18 @@ async fn exposed(vault: &impl CredentialVault, reference: ProviderCredentialRefe
 }
 
 #[tokio::test]
-async fn protection_probe_is_create_read_delete_and_unconfirmed_never_falls_back() {
-    assert_eq!(KEYRING_SERVICE, "io.ysda.provider");
-
+async fn unconfirmed_test_vault_never_falls_back_to_writing_a_secret() {
     let confirmed = InMemoryCredentialVault::new();
     assert_eq!(
         confirmed
             .protection_status()
             .await
-            .expect("probe completes"),
+            .expect("status is available"),
         CredentialProtectionStatus::ConfirmedNative
     );
     assert!(
         confirmed.stored_accounts().is_empty(),
-        "the protection probe must clean its temporary credential"
+        "creating a test vault must not write a credential"
     );
 
     let unconfirmed =
@@ -64,7 +63,8 @@ async fn protection_probe_is_create_read_delete_and_unconfirmed_never_falls_back
 }
 
 #[tokio::test]
-async fn every_protection_probe_phase_must_succeed_before_native_is_confirmed() {
+async fn injected_test_vault_faults_fail_closed() {
+    let reference = reference(ProfileId::new(), 1, CredentialKind::ApiKey);
     for operation in [
         InMemoryVaultOperation::Write,
         InMemoryVaultOperation::Read,
@@ -72,12 +72,20 @@ async fn every_protection_probe_phase_must_succeed_before_native_is_confirmed() 
     ] {
         let vault = InMemoryCredentialVault::new();
         vault.fail_next(operation);
-
-        assert_ne!(
-            vault.protection_status().await.expect("probe completes"),
-            CredentialProtectionStatus::ConfirmedNative,
-            "{operation:?} failure must fail the protection probe closed"
-        );
+        match operation {
+            InMemoryVaultOperation::Write => assert!(
+                vault
+                    .write_generation(write(reference.clone(), "fault"))
+                    .await
+                    .is_err()
+            ),
+            InMemoryVaultOperation::Read => {
+                assert!(vault.read_generation(reference.clone()).await.is_err())
+            }
+            InMemoryVaultOperation::Delete => {
+                assert!(vault.delete_generation(reference.clone()).await.is_err())
+            }
+        }
     }
 }
 
@@ -229,12 +237,12 @@ async fn malformed_ownership_fails_closed_and_debug_is_redacted() {
 }
 
 #[test]
-fn production_type_is_os_keyring_only_and_its_debug_surface_is_non_sensitive() {
-    let vault = KeyringCredentialVault::new();
+fn production_type_is_local_and_its_debug_surface_is_non_sensitive() {
+    let directory = tempfile::tempdir().expect("temporary local vault directory");
+    let vault = LocalEncryptedCredentialVault::new(directory.path());
     let _: &dyn CredentialVault = &vault;
     let rendered = format!("{vault:?}");
 
-    assert!(rendered.contains("KeyringCredentialVault"));
-    assert!(rendered.contains(KEYRING_SERVICE));
+    assert!(rendered.contains("LocalEncryptedCredentialVault"));
     assert!(!rendered.contains("credential_value"));
 }

@@ -14,22 +14,21 @@ use ys_agent_adapters::{
     PostgresConnector, PostgresConnectorConfig, QueryDataTool, ReadFreshnessTool,
     ResolveMetricTool, ResultPolicy, RuntimeArtifactLookup, SqlReadOnlyPolicy, SqliteConnector,
     SqliteConnectorConfig, SupportedDialect,
-    credential::keyring::KeyringCredentialVault,
+    credential::local::LocalEncryptedCredentialVault,
     model::{ReplayModelProvider, discovery::LiterModelDiscovery, liter::LiterProviderFactory},
     oauth::chatgpt::ChatGptOAuthManager,
 };
 use ys_agent_core::{
     AgentAction, ArtifactId, ArtifactStore, CoreError, CoreResult, CredentialMutationRepository,
-    CredentialProtectionStatus, CredentialReference, CredentialVault, MetricDefinition,
-    MetricProvider, ModelCapabilities, ModelProvider, ModelRequest, ModelResponse,
-    ProfileRevisionRepository, ProviderClientFactory, ProviderErrorCode, ProviderField,
-    ProviderManagementApi, ProviderManagementError, ProviderProfileRepository, ProviderRemediation,
-    ProviderResult, QueryBudget, QueryContextProvider, QueryExecutionPlan, RunId,
-    RunModelProviderResolver, RunProviderBindingRepository, RunProviderBindingSource, RuntimeStore,
-    SourceId, WorkspaceId,
+    CredentialReference, CredentialVault, MetricDefinition, MetricProvider, ModelCapabilities,
+    ModelProvider, ModelRequest, ModelResponse, ProfileRevisionRepository, ProviderClientFactory,
+    ProviderErrorCode, ProviderField, ProviderManagementApi, ProviderManagementError,
+    ProviderProfileRepository, ProviderRemediation, ProviderResult, QueryBudget,
+    QueryContextProvider, QueryExecutionPlan, RunId, RunModelProviderResolver,
+    RunProviderBindingRepository, RunProviderBindingSource, RuntimeStore, SourceId, WorkspaceId,
 };
 use ys_agent_runtime::{
-    ActiveRunProviderBindingSource, AgentServiceApi, ContextAssembler,
+    ActiveProfileModelProvider, ActiveRunProviderBindingSource, AgentServiceApi, ContextAssembler,
     FixedRunModelProviderResolver, Harness, HarnessConfig, HarnessDependencies,
     InMemoryQueryContextProvider, InProcessAgentService, LoopDriver, PromptBuilder,
     RunBoundProviderResolver, RunScheduler, ServiceEventPublisher, StaticRunProviderBindingSource,
@@ -899,6 +898,7 @@ struct ProviderRuntimeComposition {
     management: Arc<dyn ProviderManagementApi>,
     bindings: Arc<dyn RunProviderBindingSource>,
     resolver: Arc<dyn RunModelProviderResolver>,
+    conversation_model: Arc<dyn ModelProvider>,
     journal: Arc<dyn CredentialMutationRepository>,
     vault: Arc<dyn CredentialVault>,
 }
@@ -926,7 +926,7 @@ async fn compose_provider_runtime(
     ));
     // No asynchronous operation survives a process restart. Intents that never acknowledged a
     // protected write are therefore abandoned and safe to roll back. Recovery remains best
-    // effort so an unavailable native credential store still permits offline Provider browsing;
+    // effort so an unavailable local credential vault still permits offline Provider browsing;
     // the existing startup gate continues to reject Queries if cleanup could not be completed.
     let _ = credentials.recover_abandoned_intents().await;
     let catalog = GovernedProviderCatalog::default();
@@ -937,6 +937,11 @@ async fn compose_provider_runtime(
         GOVERNED_LITER_LLM_VERSION,
     ));
     let factory: Arc<dyn ProviderClientFactory> = Arc::new(LiterProviderFactory::new());
+    let conversation_model: Arc<dyn ModelProvider> = Arc::new(ActiveProfileModelProvider::new(
+        revisions.clone(),
+        vault.clone(),
+        factory.clone(),
+    ));
     let management: Arc<dyn ProviderManagementApi> = Arc::new(InProcessProviderManagementApi::new(
         catalog.clone(),
         evidence.catalog_views(&catalog),
@@ -949,9 +954,8 @@ async fn compose_provider_runtime(
         factory.clone(),
     ));
 
-    // This forces the native-vault probe and reads the journal during startup.  A failed or
-    // incomplete result keeps Provider browsing available, while the binding gate below rejects
-    // every new Query until the same check becomes healthy.
+    // Startup checks only local directory protection and journal state. It never reads a saved
+    // credential or invokes an OS credential-store prompt.
     let _ = verify_provider_startup_state(vault.as_ref(), journal.as_ref()).await;
     let bindings: Arc<dyn RunProviderBindingSource> =
         Arc::new(JournalCheckedRunProviderBindingSource {
@@ -972,6 +976,7 @@ async fn compose_provider_runtime(
         management,
         bindings,
         resolver,
+        conversation_model,
         journal,
         vault,
     })
@@ -979,15 +984,20 @@ async fn compose_provider_runtime(
 
 async fn compose_production_provider_runtime(
     runtime_store: Arc<ys_agent_store::SqliteRuntimeStore>,
+    workspace_root: &Path,
 ) -> CoreResult<ProviderRuntimeComposition> {
-    compose_provider_runtime(runtime_store, Arc::new(KeyringCredentialVault::new())).await
+    compose_provider_runtime(
+        runtime_store,
+        Arc::new(LocalEncryptedCredentialVault::new(workspace_root)),
+    )
+    .await
 }
 
 async fn verify_provider_startup_state(
     vault: &dyn CredentialVault,
     journal: &dyn CredentialMutationRepository,
 ) -> ProviderResult<()> {
-    if vault.protection_status().await? != CredentialProtectionStatus::ConfirmedNative {
+    if !vault.protection_status().await?.is_confirmed() {
         return Err(provider_protection_unavailable());
     }
     if journal
@@ -1530,7 +1540,8 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
     };
     let runtime_store =
         Arc::new(ys_agent_store::SqliteRuntimeStore::open(".ysda/runtime.db").await?);
-    let provider_runtime = compose_production_provider_runtime(runtime_store.clone()).await?;
+    let provider_runtime =
+        compose_production_provider_runtime(runtime_store.clone(), Path::new(".ysda")).await?;
     let artifact_store = Arc::new(ys_agent_store::LocalArtifactStore::new(
         &config.artifact_root,
     )?);
@@ -1555,6 +1566,7 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
             (scheduler, safe_readiness_inputs(&config), None)
         }
     };
+    let query_runtime_unavailable = background.is_none();
     let workspace_doctor: Arc<dyn DoctorRunner> =
         Arc::new(WorkspaceDoctor::new(Arc::new(RuntimeDoctorProbe {
             config: config.clone(),
@@ -1582,8 +1594,16 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
         exporter,
         config.artifact_retention_days,
     )
+    .with_front_door_agent(provider_runtime.conversation_model, "active-profile")
     .with_run_provider_binding_source(provider_runtime.bindings)
     .with_provider_management_api(provider_runtime.management);
+    let service = if query_runtime_unavailable {
+        service.with_query_submission_disabled(
+            "Data querying is not configured. You can still chat; connect a read-only datasource to ask data questions.",
+        )
+    } else {
+        service
+    };
     let service = Arc::new(service);
     if let Some(background) = background {
         background.set_publisher(service.event_publisher());
@@ -1614,15 +1634,15 @@ mod tests {
 
     use super::{
         BackgroundScheduler, acquire_workspace_id_lock, artifact_retention_days_from_lookup,
-        compose_provider_runtime, create_private_directory, query_budget_from_lookup,
-        required_config_keys, resolve_workspace_id,
+        compose_production_provider_runtime, compose_provider_runtime, create_private_directory,
+        query_budget_from_lookup, required_config_keys, resolve_workspace_id,
     };
-    use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
+    use ys_agent_adapters::credential::memory::InMemoryCredentialVault;
     use ys_agent_core::{
         CoreError, CoreResult, CredentialGeneration, CredentialKind, CredentialMutationIntent,
-        ProfileId, ProfileName, ProfileRevision, ProviderId, ProviderModelId, ProviderParameters,
-        RevisionPrecondition, RunId, RunSnapshot, RunStatus, SaveProfileRevision, TaskId,
-        WorkflowKind, WorkspaceId,
+        CredentialProtectionStatus, ProfileId, ProfileName, ProfileRevision, ProviderId,
+        ProviderModelId, ProviderParameters, RevisionPrecondition, RunId, RunSnapshot, RunStatus,
+        SaveProfileRevision, TaskId, WorkflowKind, WorkspaceId,
     };
     use ys_agent_runtime::{HarnessStep, LoopDriver, RunScheduler, StepAccounting, StepOutcome};
 
@@ -1730,6 +1750,30 @@ mod tests {
         assert!(!required.contains(&"YSDA_LLM_BASE_URL"));
         assert!(!required.contains(&"YSDA_LLM_API_KEY"));
         assert!(!required.contains(&"YSDA_LLM_MODEL"));
+    }
+
+    #[tokio::test]
+    async fn production_provider_runtime_uses_a_workspace_local_vault() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let runtime = Arc::new(
+            ys_agent_store::SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("open runtime store"),
+        );
+
+        let provider_runtime = compose_production_provider_runtime(runtime, directory.path())
+            .await
+            .expect("compose production Provider runtime");
+
+        assert_eq!(
+            provider_runtime
+                .vault
+                .protection_status()
+                .await
+                .expect("local vault status"),
+            CredentialProtectionStatus::ConfirmedLocal
+        );
+        assert!(!directory.path().join("provider-credentials.key").exists());
     }
 
     #[tokio::test]

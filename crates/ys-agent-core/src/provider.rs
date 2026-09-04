@@ -1399,7 +1399,7 @@ impl<'de> Deserialize<'de> for ProviderErrorCode {
 }
 
 /// The portable error surface of every Provider port. It excludes arbitrary strings so raw
-/// keyring, OAuth, and HTTP errors cannot leak through the core boundary.
+/// credential-store, OAuth, and HTTP errors cannot leak through the core boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderManagementError {
     code: ProviderErrorCode,
@@ -2426,8 +2426,15 @@ pub struct ProviderCredentialReference {
 #[serde(rename_all = "snake_case")]
 pub enum CredentialProtectionStatus {
     ConfirmedNative,
+    ConfirmedLocal,
     Unavailable,
     Unconfirmed,
+}
+
+impl CredentialProtectionStatus {
+    pub fn is_confirmed(self) -> bool {
+        matches!(self, Self::ConfirmedNative | Self::ConfirmedLocal)
+    }
 }
 
 /// An owned write request whose secret cannot be rendered, cloned, or serialized.

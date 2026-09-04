@@ -469,6 +469,8 @@ impl PromptBuilder {
             tools: tool_view.tools().to_vec(),
             context_manifest: manifest.clone(),
             temperature: Some(0.0),
+            tool_choice: ys_agent_core::ModelToolChoice::Auto,
+            response_format: ys_agent_core::ModelResponseFormat::JsonObject,
         })
     }
 }

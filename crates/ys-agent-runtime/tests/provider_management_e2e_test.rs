@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
+use ys_agent_adapters::credential::memory::InMemoryCredentialVault;
 use ys_agent_core::{
     ActivateProfileRequest, ActivationPrecondition, ActiveRevisionPrecondition,
     CompatibilityEvidence, CredentialGeneration, CredentialKind, CredentialMutation,

@@ -1,7 +1,7 @@
 # YS Data Agent 项目设计与演进总纲（PRD）
 
 **日期：** 2026-08-06  
-**更新：** 2026-09-01  
+**更新：** 2026-09-03  
 **状态：** Approved，作为整个项目的产品、架构与演进 Source of Truth  
 **替代范围：** 本文扩展并修正 2026-08-02 v0.1 设计中的长期架构；v0.1 文档继续作为已实现 Demo 的历史记录
 
@@ -90,7 +90,7 @@ v0.2 的直接用户是 Data Engineer 和能够理解 SQL、数据口径与权�
 
 适合 v0.2 Pilot 的 Workspace 需要满足：
 
-- 已有可查询的 SQLite 或 Postgres 数据源；
+- 已有可查询的 SQLite、Postgres 或 DuckDB 数据源；
 - 有可验证的最小权限只读身份；
 - 有人负责确认时区、新鲜度规则、敏感数据策略和查询预算；
 - 指标查询已有 Active Metric Contract；
@@ -581,7 +581,7 @@ Runtime 只自动重试相同参数的安全瞬时故障。修改参数后的重
 只读不是单一布尔标记。v0.2 必须同时执行以下防线：
 
 1. SqlReadOnlyPolicy 只接受单条、受支持方言的 `Statement::Query`；拒绝多语句、控制语句和策略禁止的函数。
-2. Connector 使用数据库侧最小权限身份，并为每次 Postgres 查询开启 read-only transaction。
+2. Connector 使用数据库侧最小权限身份；每次 Postgres 查询开启 read-only transaction，SQLite 与 DuckDB 以只读方式打开目标文件，并禁止当前 Policy 未明确允许的扩展加载、外部访问和文件写出能力。
 3. Workspace Policy 可以限制 Source、Schema、Relation、Column 和敏感级别；模型不能扩大 allowlist。
 4. QueryBudget 明确 max_sql_bytes、statement_timeout、acquire_timeout、max_rows、max_result_bytes、max_concurrency，以及可用时的 max_estimated_cost 或 max_scanned_bytes。
 5. 支持的 Connector 应在执行前使用 EXPLAIN、Dry Run 或平台等价能力做成本预检；不支持预检时必须采用更保守的静态和运行时限制。
@@ -920,6 +920,14 @@ Domain Module 使用删除测试判断是否值得存在：删除后，如果复
 
 Adapter 只实现真实支持的能力，并公开 CapabilityDescriptor。Workflow 在规划前即可知道环境支持什么。外部 I/O 由 Tool Handler 通过 Port 发起；Domain Module 不依赖具体 Adapter 类型。
 
+本地数据源连接管理采用“Profile 配置 → Connector 注册元数据 → 连接 Manager → capability-based Ports”的边界。Datasource Profile 是用户命名的逻辑连接配置，Database Context 是该连接下实际使用的 catalog/database/schema；两者不得混成一个名称或缓存维度。Adapter 拥有自身配置字段元数据、校验和 CapabilityDescriptor，产品入口从真实注册元数据生成可选类型与配置输入，不以静态 UI 清单或数据库名称分支声明支持。
+
+连接 Manager 负责按需解析 CredentialReference、创建 Connector、验证连接、复用与关闭资源，以及配置变化后的失效。缓存必须绑定 Profile revision 或脱敏配置指纹；同名 Profile 编辑、凭证轮换、删除或验证失效时必须关闭并淘汰旧 Connector。v0.2 只注册已经纳入发布契约的 SQLite、Postgres 与 DuckDB Adapter，不在运行中的产品进程自动下载或安装数据库驱动。
+
+长期 Connector 生态使用独立的 Connector Adapter Repository 维护 Adapter 源码、版本化发布物和机器可读 Catalog。YS Data Agent 可以自动刷新受信 Catalog 并搜索与当前平台、Core Contract 和用户需求兼容的 Adapter；发现只读取和缓存元数据，不等于安装、加载或执行代码。Catalog 至少必须提供 Adapter 身份与版本、Core Contract 兼容范围、平台约束、配置字段与 Secret 标记、CapabilityDescriptor、支持等级、发布物摘要与签名、来源证明、撤销状态和契约测试证据。
+
+发现、安装和激活是三个独立的受治理动作。未来安装服务只能从显式信任源取得固定版本发布物，验证签名、摘要、兼容性、来源与撤销状态后放入隔离区；Adapter 通过共享契约测试和无业务数据的健康探测后才可原子激活，失败时保留旧版本并可回滚。外部 Adapter 不得依赖不稳定的进程内 Rust 动态库 ABI 或任意源码执行；正式实现前应通过 ADR/Spike 在版本化进程外协议与受沙箱约束的组件模型之间选择，并证明 Secret broker、文件/网络权限、资源预算、升级、回滚和崩溃隔离满足安全门槛。
+
 ### 16.4 原生 Artifact，而非通用 Pipeline DSL
 
 PipelineIntent 可以描述输入、输出、转换、调度、质量和验收目标，但真正产物必须是用户框架的原生代码：
@@ -1236,6 +1244,8 @@ Runtime、Store 和 Adapters 互不直接形成循环依赖，由 apps/ysda 负�
 
 v0.2 同时允许技术用户在本地管理并选择经过验证的 Model Provider，使 Provider 差异不再要求修改代码或改变 Query Workflow。该扩展只改变模型接入与配置边界，不扩大 QueryIntent、数据权限、Workflow、Completion Gate 或可信交付承诺。
 
+v0.2 也允许技术用户在本地产品入口保存、验证并选择少量受支持的 SQLite、Postgres 或 DuckDB 数据源连接 Profile。该能力服务已有数据栈的 Bring Your Own Stack 路径，只减少启动参数和手工配置摩擦；它不执行 Workspace Bootstrap、客户成熟度诊断、Connector 自动发现、数据接入、基础设施 Provision 或写入授权。
+
 ### 26.2 首个用户、前置条件与支持场景
 
 直接用户、Workspace 前置条件和产品承诺遵循 §2.3。Pilot 至少覆盖：
@@ -1262,8 +1272,10 @@ v0.2 只实例化 Semantic & Metric、Metadata/Freshness、Query Planning & Veri
 - ToolCatalog、按 QueryPhase 生成的静态 ToolView、Tool Runtime 和 QueryBudget；
 - SQL AST、数据库只读身份、Source ACL、成本/行数/字节/超时与敏感结果防线；
 - 统一 ModelProvider 接入、受支持 Provider 的本地管理与能力门禁，以及 FakeProvider 和 ReplayProvider；
+- 受支持 SQLite/Postgres/DuckDB 数据源连接 Profile 的本地保存、凭证引用、连接验证、显式选择和新 Run 不可变绑定；
 - SQLite 测试数据源；
 - Postgres 第一个真实数据源；
+- DuckDB 本地分析型数据源及其只读、扩展加载、外部访问和文件写出边界；
 - dbt manifest 第一个工程 Context Adapter；
 - 文件型最小 Metric Registry；
 - 最小 ContextProvider/ContextResolver Seam、ContextManifest 与预算内 ContextPack；
@@ -1280,6 +1292,8 @@ v0.2 只实例化 Semantic & Metric、Metadata/Freshness、Query Planning & Veri
 Approval、action_hash、ExecutionHandle、ChangeRequest、TaskHandoff、通用 SemanticProvider 和生产审批身份仍保留在长期架构中，但 v0.2 不创建对应空 Trait、enum variant、ArtifactKind、Event 或透传 Module。
 
 Workspace Bootstrap、WorkspaceReadinessReport、Starter Data Stack Profile、ProvisioningPlan 和远程控制平面/数据平面协议同样不进入 v0.2 Rust 类型或配置 Schema。
+
+v0.2 的本地数据源连接 Profile 不是 Workspace Bootstrap 或 Starter Data Stack Profile。它只表达 Query Runtime 已支持的 SQLite/Postgres/DuckDB 连接、只读身份与验证状态，不引入成熟度诊断、自动发现、治理向导或基础设施生命周期类型。
 
 这些类型在首个真实调用者出现时，依据当时的权限、状态与错误语义设计。v0.2 只保留已经被 Query Runtime 使用的 TelemetrySink。
 
@@ -1299,6 +1313,8 @@ Workspace Bootstrap、WorkspaceReadinessReport、Starter Data Stack Profile、Pr
 - Embedding、Image、Audio、Moderation 等非 Chat 模态的模型能力；
 - Workspace Bootstrap、客户成熟度自动诊断和非技术治理向导；
 - Excel、CSV、SaaS Connector 和增量数据接入；
+- 运行时自动下载或安装 Connector/数据库驱动，以及把“可安装”或依赖中存在的 Adapter 自动声明为受支持；
+- 远程 Connector Catalog、Adapter 安装服务、外部 Adapter Host、签名验证、自动升级和撤销分发的当前版本实现；
 - Starter Data Stack 的 Provision、配置、升级和托管运维；
 - YS 托管控制平面与客户数据平面的远程协议。
 
@@ -1306,6 +1322,7 @@ Workspace Bootstrap、WorkspaceReadinessReport、Starter Data Stack Profile、Pr
 
 ~~~text
 用户在本地产品入口配置或选择受支持的 Model Provider
+→ 用户保存、验证或选择受支持的 SQLite/Postgres/DuckDB 数据源连接
 → ysda doctor 检查所选模型能力、Connector、只读权限、Metric、dbt 和 Freshness
 → 用户在 TUI 输入问题
 → AgentService 创建或继续 Task
@@ -1352,7 +1369,7 @@ v0.2 支持在持久化 Step 之间恢复，以及 WaitingForInput 后恢复。�
 
 1. `ysda doctor` 能从空 Workspace 检查配置，并给出阻断项、警告和修复动作。
 2. 运行 `ysda` 进入 TUI；默认界面不要求用户理解 Session、Run、Step 或 Workflow 内部术语。
-3. 用户可以对 SQLite 和 Postgres 执行 GovernedMetric、AdHocRead 和 Metadata Query。
+3. 用户可以对 SQLite、Postgres 和 DuckDB 执行 GovernedMetric、AdHocRead 和 Metadata Query。
 4. 未实现的 Analysis、Build、Operate 和 ML Data Prep 请求得到明确 UnsupportedCapability，不假装完成。
 5. Active Metric 查询展示 Contract 版本；Draft 或冲突 Metric 不被静默使用。
 6. 关键时间、时区、指标或维度歧义进入 WaitingForInput；空结果不解释为零。
@@ -1370,6 +1387,8 @@ v0.2 支持在持久化 Step 之间恢复，以及 WaitingForInput 后恢复。�
 18. Fake/Replay Provider 可以无网络运行核心测试。
 19. Query deterministic eval、Context Injection、安全和恢复场景全部通过后才允许发布。
 20. `cargo fmt`、`cargo clippy --all-targets --all-features -- -D warnings` 和 `cargo test --workspace` 全部通过。
+21. 技术用户可以仅用键盘从 TUI 搜索、选择并激活已验证的 SQLite/Postgres/DuckDB 数据源 Profile；未配置或验证失败的 Profile 不得伪装为可用。
+22. 数据源切换只影响之后启动的 Run；进行中的 Run 保持原数据源、只读身份和能力证据，Secret 或完整 DSN 不进入 Event、Artifact、Telemetry 或可序列化 Core 类型。
 
 ### 26.10 Pilot 成功指标
 
@@ -1400,6 +1419,16 @@ Pilot 的项目级结果门槛是：
 
 在进入 v0.3 前，v0.2 通过一个独立 Feature 增加受控的多 Provider 管理垂直切片：技术用户可以从本地产品入口选择经过验证的 Provider 与模型，而 Runtime 保持厂商无关的模型契约、能力门禁、Run 证据和 Query 治理。该里程碑不新增业务 Workflow，不引入自动路由或静默回退；具体范围和退出证据由 `provider-management` 的 cc-sdd 文档定义。
 
+### v0.2 当前扩展：本地数据源 Profile 管理
+
+在进入 v0.3 前，v0.2 通过一个独立 Feature 增加受控的本地数据源管理垂直切片：技术用户可以在统一 TUI 中保存、验证并显式选择 Query Runtime 已支持的 SQLite、Postgres 与 DuckDB 连接 Profile。活动 Profile 只供之后启动的 Run 解析为不可变 Connector 绑定；进行中的 Run 不被配置编辑或切换改变。该里程碑不执行 Workspace Bootstrap、远程 Connector 自动发现、数据接入、Provision、写操作或 Connector 范围扩张；具体范围和退出证据由 `datasource-management` 的 cc-sdd 文档定义。
+
+### Connector Adapter Ecosystem：先设计、按条件实现的横向里程碑
+
+项目长期使用独立 Connector Adapter Repository 管理新增 Connector，并由受信 Catalog 支持产品内自动查找。当前只固定 §16.3 的发现、安装、激活与隔离边界，不在 v0.2 创建远程 Registry、Installer、Adapter Host 或空插件类型。出现第三个正式 Connector、Adapter 需要独立发布节奏，或 v0.8 Connector 扩展启动时，再以独立 ADR、威胁模型、Spike 和 Feature 实现该里程碑。
+
+进入实现前至少需要证明：Catalog 和发布物可签名、固定版本、校验完整性并撤销；Core Contract 与平台兼容可在安装前判断；自动发现不会执行远端代码；安装与激活需要显式信任策略且可审计；外部 Adapter 可隔离 Secret、文件、网络、资源与崩溃；统一契约测试和健康探测能阻止不兼容 Adapter；升级失败可原子回滚；离线时只使用未撤销且仍在有效期内的已验证 Catalog 缓存。
+
 ### Agent Context Lakehouse：按条件启用的横向里程碑
 
 LanceContextRepository 不与某个业务 Workflow 版本强绑定。v0.2 之后只有同时出现以下信号，才启动独立 ADR、Spike 和正式实现：
@@ -1414,7 +1443,7 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 
 ### v0.3：Workspace Bootstrap
 
-- 面向没有常驻 Data Engineer、但已有 SQLite 或 Postgres 的客户；
+- 面向没有常驻 Data Engineer、但已有 SQLite、Postgres 或 DuckDB 的客户；
 - 识别 Workspace 数据成熟度、可用 Source、Schema、权限和能力缺口；
 - 通过业务语言引导业务数据责任人确认时区、新鲜度、敏感数据和 Query Budget；
 - 从 ObservedSchema 和可选 dbt Evidence 提出 Draft Metric、维度和数据质量建议；
@@ -1501,6 +1530,8 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 | Tool 数量膨胀 | ToolCatalog 与按 Step 生成的 ToolView 分离 |
 | LLM 自己验证自己 | 确定性 Verifier 和 Completion Gate 优先 |
 | 共享 Service Account 越权 | 用户权限、Workspace Policy 与 Connector Role 取交集 |
+| 数据源编辑或切换后仍复用旧连接 | 保存与激活保持原子性；缓存绑定 Profile revision 或脱敏配置指纹；配置、凭证或验证状态变化时关闭并淘汰旧 Connector |
+| 自动发现的 Connector 成为供应链或远程代码执行入口 | 发现与安装/激活分离；只信任签名且固定版本的 Catalog 与发布物；验证摘要、来源、兼容性和撤销状态；外部 Adapter 隔离运行并保留回滚版本 |
 | Trace 被误当 Runtime 状态 | Run Event、Telemetry、Eval Record 分离 |
 | TUI 与 Runtime 耦合 | TUI 仅通过 AgentService 与 Event Stream |
 | 长任务占用 Loop 和 token | 持久化等待、ExecutionHandle、事件唤醒 |
@@ -1536,12 +1567,16 @@ Spike 至少覆盖 10k/100k Evidence 的写入、更新、失效、混合检索�
 21. YS Data Agent 可以 Provision 和管理成熟基础设施，但不能重新实现数据库、计算引擎、转换框架或调度器。
 22. 托管控制平面不能默认复制客户原始业务数据；任何数据出境都必须经过 Workspace Policy 和敏感级别检查。
 23. Model Provider 或模型的配置、验证和切换不能改变 Policy、Tool Runtime、Workflow 或 Completion Gate 的权威；每个 Run 必须绑定不可变的 Provider 配置证据，未知能力必须 fail closed。
+24. 数据源 Profile 的配置、验证和切换必须经产品 Service 边界完成，TUI 不得直接创建数据库连接；每个 Run 必须绑定不可变的非敏感数据源证据，配置切换不得改变进行中 Run，Secret 和完整 DSN 不得进入可序列化 Core 类型或运行事件。
+25. 数据源支持范围与配置输入必须来自真实 Connector 注册元数据和能力声明；逻辑 Datasource Profile 与物理 Database Context 必须保持区分，同名配置或凭证变化不得继续复用旧 Connector。
+26. 自动发现 Connector 只能读取受信、签名且可撤销的 Catalog 元数据，不能因 Repository、包或本地文件存在就执行代码、自动授予能力或宣称 Supported。
+27. 外部 Connector 的发现、安装和激活必须保持为独立动作；安装或升级失败不得破坏当前活动 Adapter，Adapter 不能绕过 Secret、文件、网络、资源、Policy、QueryBudget 或 Tool Runtime 边界。
 
 ## 30. 参考项目的取舍
 
 ### 外部参考实现
 
-借鉴数据领域 Workflow、Context、语义工具和 Artifact；避免复制大量彼此耦合的 Agentic Node 和巨型工厂。
+借鉴数据领域 Workflow、Context、语义工具和 Artifact，以及 Provider/Plan 与数据源的统一可搜索键盘选择交互。数据源侧采用其“配置驱动 + Connector 注册元数据 + Manager 生命周期 + 上层统一能力”的边界，并保留 Datasource 与 Database 的概念区分；长期将其 entry-point discovery 思路演进为独立 Connector Adapter Repository 和受信 Catalog。不会复制大量彼此耦合的 Agentic Node、巨型工厂、明文 Credential、仅按名称集合缓存、未经签名与兼容验证的运行时自动安装，或把配置状态机放入 TUI。
 
 ### VTCode
 

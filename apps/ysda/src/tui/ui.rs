@@ -23,6 +23,20 @@ pub enum LayoutMode {
     Wide,
 }
 
+/// The visual prototype deliberately uses a bounded terminal shell on a large viewport.  Without
+/// this cap, every hierarchy in the conversation becomes excessively wide and the response card
+/// loses the dense, deliberate shape of the approved TUI.
+const WIDE_SHELL_MAX_WIDTH: u16 = 128;
+
+enum BodySection {
+    Text(Text<'static>),
+    Card {
+        heading: Option<Text<'static>>,
+        content: Text<'static>,
+        interactive: bool,
+    },
+}
+
 impl LayoutMode {
     pub fn resolve(area: Rect) -> Self {
         if area.width < 60 || area.height < 12 {
@@ -50,13 +64,14 @@ pub fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
         render_too_small(frame, app, area);
         return;
     }
+    let shell_area = centered_shell_area(area, mode);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border)),
-        area,
+        shell_area,
     );
-    let shell = area.inner(Margin {
+    let shell = shell_area.inner(Margin {
         horizontal: 1,
         vertical: 1,
     });
@@ -80,6 +95,19 @@ pub fn render(frame: &mut Frame<'_>, app: &mut TuiApp) {
     });
     render_body(frame, app, body, mode);
     render_bottom(frame, app, regions[2], mode);
+}
+
+fn centered_shell_area(area: Rect, mode: LayoutMode) -> Rect {
+    if mode != LayoutMode::Wide || area.width <= WIDE_SHELL_MAX_WIDTH {
+        return area;
+    }
+    let width = WIDE_SHELL_MAX_WIDTH;
+    Rect {
+        x: area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        y: area.y,
+        width,
+        height: area.height,
+    }
 }
 
 pub fn bottom_panel_height(app: &TuiApp, area: Rect) -> u16 {
@@ -140,10 +168,25 @@ fn render_header(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMo
             ),
         ]);
     }
-    let (access, access_color) = if header.read_only.eq_ignore_ascii_case("read-only") {
-        ("◆ READ ONLY".to_owned(), theme.success)
+    let (access, access_style) = if header.read_only.eq_ignore_ascii_case("read-only") {
+        (
+            "◆ READ ONLY".to_owned(),
+            Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::SLOW_BLINK),
+        )
+    } else if header.active_model_available {
+        (
+            "◆ CHAT ONLY".to_owned(),
+            Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::SLOW_BLINK),
+        )
     } else {
-        ("◆ SETUP REQUIRED".to_owned(), theme.warning)
+        (
+            "◆ SETUP REQUIRED".to_owned(),
+            Style::default().fg(theme.warning),
+        )
     };
     if header.context_unavailable && header.read_only.eq_ignore_ascii_case("read-only") {
         left.push(Span::styled(
@@ -155,7 +198,7 @@ fn render_header(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, mode: LayoutMo
     let access_width = access.chars().count();
     let padding = usize::from(area.width).saturating_sub(left_width + access_width);
     left.push(Span::raw(" ".repeat(padding)));
-    left.push(Span::styled(access, Style::default().fg(access_color)));
+    left.push(Span::styled(access, access_style));
     frame.render_widget(
         Paragraph::new(Line::from(left))
             .style(Style::default().bg(theme.header))
@@ -178,22 +221,19 @@ fn render_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect, _mode: Layou
                 ContentRoute::Timeline => match app.transient {
                     Some(TransientView::Detail(_)) => detail_lines(app),
                     _ => {
-                        let timeline_lines = timeline::render_lines(&app.timeline_state);
-                        if app.transcript.is_empty()
-                            && timeline_lines.is_empty()
-                            && app.safe_warning.is_none()
-                        {
+                        if has_governed_timeline(&app.timeline_state) {
+                            return render_governed_timeline_body(frame, app, area);
+                        } else if app.transcript.is_empty() && app.safe_warning.is_none() {
                             return render_text_body(frame, app, area, welcome_lines(app));
+                        } else if app
+                            .transcript
+                            .iter()
+                            .any(|item| matches!(item, TranscriptItem::Answer(_)))
+                        {
+                            return render_transcript_body(frame, app, area);
+                        } else {
+                            transcript_lines(app)
                         }
-                        let mut text = transcript_lines(app);
-                        let timeline_tone = app.timeline_state.view().status.tone();
-                        text.lines.extend(timeline_lines.into_iter().map(|line| {
-                            Line::from(Span::styled(
-                                safe(&line),
-                                Style::default().fg(timeline_color(timeline_tone, theme)),
-                            ))
-                        }));
-                        text
                     }
                 },
                 ContentRoute::Artifact => Text::from(
@@ -234,6 +274,191 @@ fn render_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect, _mode: Layou
             },
         };
     render_text_body(frame, app, area, text);
+}
+
+fn render_governed_timeline_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect) {
+    let sections = governed_timeline_sections(app);
+    render_body_sections(frame, app, area, sections);
+}
+
+fn render_transcript_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect) {
+    let sections = transcript_sections(app);
+    render_body_sections(frame, app, area, sections);
+}
+
+fn render_body_sections(
+    frame: &mut Frame<'_>,
+    app: &mut TuiApp,
+    area: Rect,
+    sections: Vec<BodySection>,
+) {
+    let total_height = sections
+        .iter()
+        .map(|section| body_section_height(section, area.width))
+        .sum::<usize>();
+    let scroll = resolved_body_scroll(app, total_height, area.height);
+    let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
+    let mut top = 0_usize;
+    app.timeline_state.result_card_hit_region = None;
+
+    for section in sections {
+        match section {
+            BodySection::Text(text) => {
+                let height = text_height(&text, area.width);
+                render_flow_text(frame, area, top, height, scroll, text, theme);
+                top = top.saturating_add(height);
+            }
+            BodySection::Card {
+                heading,
+                content,
+                interactive,
+            } => {
+                if let Some(heading) = heading {
+                    let height = text_height(&heading, area.width);
+                    render_flow_text(frame, area, top, height, scroll, heading, theme);
+                    top = top.saturating_add(height);
+                }
+                let height = card_height(&content, area.width);
+                if let Some(card_area) = visible_flow_area(area, top, height, scroll) {
+                    render_result_card(frame, card_area, content, theme);
+                    if interactive {
+                        app.timeline_state.result_card_hit_region = Some(timeline::HitRegion::new(
+                            card_area.x,
+                            card_area.y,
+                            card_area.width,
+                            card_area.height,
+                        ));
+                    }
+                }
+                top = top.saturating_add(height);
+            }
+        }
+    }
+}
+
+fn body_section_height(section: &BodySection, width: u16) -> usize {
+    match section {
+        BodySection::Text(text) => text_height(text, width),
+        BodySection::Card {
+            heading, content, ..
+        } => heading
+            .as_ref()
+            .map(|heading| text_height(heading, width))
+            .unwrap_or_default()
+            .saturating_add(card_height(content, width)),
+    }
+}
+
+fn text_height(text: &Text<'_>, width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    text.lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
+}
+
+fn card_height(content: &Text<'_>, width: u16) -> usize {
+    let content_width = width.saturating_sub(4).max(1);
+    text_height(content, content_width).saturating_add(2)
+}
+
+fn resolved_body_scroll(app: &TuiApp, total_height: usize, visible_height: u16) -> usize {
+    let maximum = total_height.saturating_sub(usize::from(visible_height));
+    if app.scroll == u16::MAX {
+        maximum
+    } else {
+        usize::from(app.scroll).min(maximum)
+    }
+}
+
+fn visible_flow_area(area: Rect, top: usize, height: usize, scroll: usize) -> Option<Rect> {
+    let viewport_end = scroll.saturating_add(usize::from(area.height));
+    let bottom = top.saturating_add(height);
+    let visible_top = top.max(scroll);
+    let visible_bottom = bottom.min(viewport_end);
+    if visible_top >= visible_bottom {
+        return None;
+    }
+    Some(Rect {
+        x: area.x,
+        y: area
+            .y
+            .saturating_add(u16::try_from(visible_top.saturating_sub(scroll)).unwrap_or(u16::MAX)),
+        width: area.width,
+        height: u16::try_from(visible_bottom.saturating_sub(visible_top)).unwrap_or(u16::MAX),
+    })
+}
+
+fn render_flow_text(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    top: usize,
+    height: usize,
+    scroll: usize,
+    text: Text<'static>,
+    theme: &super::theme::YsdaTheme,
+) {
+    let Some(visible_area) = visible_flow_area(area, top, height, scroll) else {
+        return;
+    };
+    let skipped_rows = scroll.saturating_sub(top).min(usize::from(u16::MAX));
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(theme.text).bg(theme.background))
+            .wrap(Wrap { trim: false })
+            .scroll((skipped_rows as u16, 0)),
+        visible_area,
+    );
+}
+
+fn render_result_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    content: Text<'static>,
+    theme: &super::theme::YsdaTheme,
+) {
+    if area.width < 3 || area.height < 3 {
+        frame.render_widget(
+            Paragraph::new(content)
+                .style(Style::default().fg(theme.text).bg(theme.background))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+    frame.render_widget(
+        Block::default()
+            .style(Style::default().bg(theme.background))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border)),
+        area,
+    );
+    // The rail is intentionally an interior layer: keeping the corner glyphs intact makes this
+    // a proper panel while the bright left edge identifies a result without a decorative
+    // text-art pseudo-card.
+    let rail_height = area.height.saturating_sub(2);
+    let rail_area = Rect {
+        x: area.x,
+        y: area.y.saturating_add(1),
+        width: 1,
+        height: rail_height,
+    };
+    let rail = (0..rail_height)
+        .map(|_| Line::from(Span::styled("│", Style::default().fg(theme.accent))))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(rail)), rail_area);
+    let inner = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.width > 0 && inner.height > 0 {
+        frame.render_widget(
+            Paragraph::new(content)
+                .style(Style::default().fg(theme.text).bg(theme.background))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
 }
 
 fn render_text_body(frame: &mut Frame<'_>, app: &mut TuiApp, area: Rect, text: Text<'static>) {
@@ -303,7 +528,7 @@ fn welcome_lines(app: &TuiApp) -> Text<'static> {
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "Trustworthy answers from your data.",
+            "Chat now; query your data when it is connected.",
             Style::default().fg(theme.muted),
         )),
         Line::from(""),
@@ -320,7 +545,7 @@ fn welcome_lines(app: &TuiApp) -> Text<'static> {
         ]),
         Line::from(vec![
             Span::styled("2  ", Style::default().fg(theme.muted)),
-            Span::raw("Connect a read-only datasource"),
+            Span::raw("Optionally connect a read-only datasource for data questions"),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -342,6 +567,312 @@ fn timeline_color(
     }
 }
 
+/// A timeline is evidence for a governed Run, not a decorative treatment for every chat reply.
+/// Plain conversations retain their compact transcript cards; typed Run state and events earn the
+/// richer execution view below.
+fn has_governed_timeline(state: &timeline::TimelineState) -> bool {
+    let view = state.view();
+    view.status != timeline::TimelineStatus::Idle
+        || !view.stages.is_empty()
+        || view.notice.is_some()
+        || view.result_card.is_some()
+}
+
+fn governed_timeline_sections(app: &TuiApp) -> Vec<BodySection> {
+    let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
+    let view = app.timeline_state.view();
+    let mut sections = Vec::new();
+
+    if let Some(question) = view.question {
+        sections.push(BodySection::Text(Text::from(vec![
+            Line::from(Span::styled(
+                "You",
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+            )),
+            Line::from(Span::styled(
+                safe(question),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            )),
+        ])));
+        sections.push(BodySection::Text(Text::from("")));
+    }
+
+    let mut lines = Vec::new();
+    let status_color = timeline_color(view.status.tone(), theme);
+    lines.push(Line::from(vec![
+        Span::styled(
+            "● ",
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            "Ys-da",
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            format!("  {}", timeline_completion_label(view.status)),
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+        ),
+    ]));
+
+    if view.stages.is_empty()
+        && matches!(
+            view.status,
+            timeline::TimelineStatus::Scheduled | timeline::TimelineStatus::Running
+        )
+    {
+        lines.push(timeline_stage_line("Preparing governed workflow…", theme));
+    } else {
+        lines.extend(
+            view.stages
+                .iter()
+                .map(|stage| timeline_stage_line(&stage.label, theme)),
+        );
+    }
+
+    if let Some(notice) = view.notice {
+        let notice_color = timeline_color(notice.tone, theme);
+        lines.push(Line::from(vec![
+            Span::styled("│  ", Style::default().fg(theme.border)),
+            Span::styled("! ", Style::default().fg(notice_color)),
+            Span::styled(safe(&notice.reason), Style::default().fg(notice_color)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("│  ", Style::default().fg(theme.border)),
+            Span::styled("→ ", Style::default().fg(theme.accent)),
+            Span::styled(safe(&notice.next_action), Style::default().fg(theme.muted)),
+        ]));
+    }
+
+    sections.push(BodySection::Text(Text::from(lines)));
+    if let Some(card) = view.result_card {
+        sections.push(BodySection::Text(Text::from("")));
+        sections.push(BodySection::Card {
+            heading: None,
+            content: query_result_card_content(card, theme),
+            interactive: true,
+        });
+    }
+
+    sections
+}
+
+fn query_result_card_content(
+    card: &timeline::TimelineResultCard,
+    theme: &super::theme::YsdaTheme,
+) -> Text<'static> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "QUERY ARTIFACT INTERNAL",
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+            ),
+            Span::styled("  ✓ VERIFIED", Style::default().fg(theme.success)),
+        ]),
+        Line::from(Span::styled(
+            safe(&card.answer_summary),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "Verification · ",
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(safe(&card.verification), Style::default().fg(theme.success)),
+        ]),
+    ];
+    lines.extend(card.warnings.iter().map(|warning| {
+        Line::from(vec![
+            Span::styled("Warning · ", Style::default().fg(theme.warning)),
+            Span::styled(safe(warning), Style::default().fg(theme.warning)),
+        ])
+    }));
+    lines.push(Line::from(vec![
+        Span::styled("↳ ", Style::default().fg(theme.accent)),
+        Span::styled("Open results · Enter", Style::default().fg(theme.accent)),
+    ]));
+    Text::from(lines)
+}
+
+fn timeline_completion_label(status: timeline::TimelineStatus) -> String {
+    match status {
+        timeline::TimelineStatus::Succeeded => "completed".to_owned(),
+        _ => status.label().to_ascii_lowercase(),
+    }
+}
+
+fn timeline_stage_line(label: &str, theme: &super::theme::YsdaTheme) -> Line<'static> {
+    let tool_or_policy_step = label.starts_with("Checking ")
+        || label.starts_with("Governed operation")
+        || label.starts_with("Policy check");
+    Line::from(vec![
+        Span::styled("│  ", Style::default().fg(theme.border)),
+        Span::styled(
+            "● ",
+            Style::default().fg(if tool_or_policy_step {
+                theme.accent
+            } else {
+                theme.success
+            }),
+        ),
+        Span::styled(
+            safe(label),
+            Style::default().fg(if tool_or_policy_step {
+                theme.accent
+            } else {
+                theme.text
+            }),
+        ),
+    ])
+}
+
+fn transcript_sections(app: &TuiApp) -> Vec<BodySection> {
+    let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
+    let mut sections = Vec::new();
+
+    for item in &app.transcript {
+        if !sections.is_empty() {
+            sections.push(BodySection::Text(Text::from("")));
+        }
+        match item {
+            TranscriptItem::UserMessage(text) => {
+                sections.push(BodySection::Text(Text::from(vec![
+                    Line::from(Span::styled(
+                        "You",
+                        Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+                    )),
+                    Line::from(Span::styled(
+                        safe(text),
+                        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                    )),
+                ])))
+            }
+            TranscriptItem::Answer(answer) => sections.push(BodySection::Card {
+                heading: Some(answer_heading(answer, theme)),
+                content: response_card_content(answer, theme),
+                interactive: false,
+            }),
+            TranscriptItem::Clarification {
+                question,
+                recommended_default,
+            } => {
+                let mut lines = vec![Line::from(vec![
+                    Span::styled(
+                        "Ys-da",
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  needs clarification", Style::default().fg(theme.warning)),
+                ])];
+                lines.push(Line::from(Span::styled(
+                    safe(question),
+                    Style::default().fg(theme.text),
+                )));
+                if let Some(value) = recommended_default {
+                    lines.push(Line::from(Span::styled(
+                        format!("Recommended: {}", safe(value)),
+                        Style::default().fg(theme.muted),
+                    )));
+                }
+                sections.push(BodySection::Text(Text::from(lines)));
+            }
+            TranscriptItem::Warning(text) => {
+                sections.push(BodySection::Text(Text::from(Line::from(Span::styled(
+                    format!("Warning  {}", safe(text)),
+                    Style::default().fg(theme.warning),
+                )))));
+            }
+            TranscriptItem::Error(text) => {
+                sections.push(BodySection::Text(Text::from(Line::from(Span::styled(
+                    format!("Error  {}", safe(text)),
+                    Style::default().fg(theme.error),
+                )))));
+            }
+        }
+    }
+
+    if let Some(status) = app
+        .runtime_status
+        .as_deref()
+        .filter(|status| *status != "Ready")
+    {
+        if !sections.is_empty() {
+            sections.push(BodySection::Text(Text::from("")));
+        }
+        sections.push(BodySection::Text(Text::from(Line::from(Span::styled(
+            format!("◦ {}", safe(status)),
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+        )))));
+    }
+    if let Some(code) = &app.safe_warning {
+        if !sections.is_empty() {
+            sections.push(BodySection::Text(Text::from("")));
+        }
+        sections.push(BodySection::Text(Text::from(Line::from(Span::styled(
+            format!("Warning  {}", safe(code)),
+            Style::default().fg(theme.warning),
+        )))));
+    }
+
+    sections
+}
+
+fn answer_heading(answer: &super::AnswerView, theme: &super::theme::YsdaTheme) -> Text<'static> {
+    let mut spans = vec![
+        Span::styled(
+            "● ",
+            Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            "Ys-da",
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+        ),
+    ];
+    if !answer.state.eq_ignore_ascii_case("chat") {
+        spans.push(Span::styled(
+            format!("  {}", safe(&answer.state)),
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+        ));
+    }
+    Text::from(Line::from(spans))
+}
+
+fn response_card_content(
+    answer: &super::AnswerView,
+    theme: &super::theme::YsdaTheme,
+) -> Text<'static> {
+    let mut lines = vec![Line::from(Span::styled(
+        safe(&answer.conclusion),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    ))];
+    let values = answer
+        .key_values
+        .iter()
+        .flatten()
+        .map(|value| safe(value))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if !values.is_empty() {
+        lines.push(Line::from(Span::styled(
+            values,
+            Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(explanation) = &answer.explanation {
+        lines.push(Line::from(Span::styled(
+            safe(explanation),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    Text::from(lines)
+}
+
 fn transcript_lines(app: &TuiApp) -> Text<'static> {
     let theme = app.preview_theme.as_ref().unwrap_or(&app.active_theme);
     if app.transcript.is_empty() {
@@ -356,52 +887,23 @@ fn transcript_lines(app: &TuiApp) -> Text<'static> {
     }
     let mut lines = Vec::new();
     for item in &app.transcript {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         match item {
             TranscriptItem::UserMessage(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "You",
-                        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("  {}", safe(text))),
-                ]));
-                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "You",
+                    Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+                )));
+                lines.push(Line::from(Span::styled(
+                    safe(text),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                )));
             }
             TranscriptItem::Answer(answer) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "Ys-da",
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  {}", safe(&answer.state)),
-                        Style::default().fg(theme.muted),
-                    ),
-                ]));
-                lines.push(Line::from(format!("       {}", safe(&answer.conclusion))));
-                let values = answer
-                    .key_values
-                    .iter()
-                    .flatten()
-                    .map(|value| safe(value))
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                if !values.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("       {values}"),
-                        Style::default()
-                            .fg(theme.success)
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                }
-                if let Some(explanation) = &answer.explanation {
-                    lines.push(Line::from(Span::styled(
-                        format!("       {}", safe(explanation)),
-                        Style::default().fg(theme.muted),
-                    )));
-                }
+                lines.extend(answer_heading(answer, theme).lines);
+                lines.extend(response_card_content(answer, theme).lines);
             }
             TranscriptItem::Clarification {
                 question,
@@ -434,7 +936,11 @@ fn transcript_lines(app: &TuiApp) -> Text<'static> {
             ))),
         }
     }
-    if let Some(status) = &app.runtime_status {
+    if let Some(status) = app
+        .runtime_status
+        .as_deref()
+        .filter(|status| *status != "Ready")
+    {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!("◦ {}", safe(status)),
@@ -610,10 +1116,7 @@ fn render_bottom(frame: &mut Frame<'_>, app: &TuiApp, area: Rect, _mode: LayoutM
                 .constraints([Constraint::Length(3), Constraint::Length(1)])
                 .split(area);
             let composer = if app.composer.text().is_empty() {
-                Span::styled(
-                    "› Ask a governed data question…",
-                    Style::default().fg(theme.muted),
-                )
+                Span::styled("› Ask a question…", Style::default().fg(theme.muted))
             } else {
                 Span::styled(
                     format!("› {}", safe(&app.composer.text())),
@@ -646,10 +1149,7 @@ fn render_composer_and_model_panel(frame: &mut Frame<'_>, app: &TuiApp, area: Re
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(area);
     let composer = if app.composer.text().is_empty() {
-        Span::styled(
-            "› Ask a governed data question…",
-            Style::default().fg(theme.muted),
-        )
+        Span::styled("› Ask a question…", Style::default().fg(theme.muted))
     } else {
         Span::styled(
             format!("› {}", safe(&app.composer.text())),
@@ -683,6 +1183,12 @@ fn render_composer_and_model_panel(frame: &mut Frame<'_>, app: &TuiApp, area: Re
         ),
         _ => unreachable!("model panel is rendered only on model routes"),
     };
+    // Model activation runs asynchronously.  Its result must remain visible in the model panel,
+    // where the user initiated it, instead of being written only to the hidden transcript body.
+    let status_line = (app.navigation.current() == ContentRoute::ModelSelection)
+        .then_some(app.runtime_status.as_deref())
+        .flatten()
+        .map(|status| format!("Status · {status}"));
     let content_capacity = usize::from(rows[1].height.saturating_sub(2));
     let title = if content_capacity <= 1 {
         match app.navigation.current() {
@@ -693,14 +1199,18 @@ fn render_composer_and_model_panel(frame: &mut Frame<'_>, app: &TuiApp, area: Re
     } else {
         base_title
     };
-    let fitted_lines = fit_panel_lines(
+    let mut fitted_lines = fit_panel_lines(
         raw_lines
             .into_iter()
             .filter(|line| line != "Model Selection")
             .collect(),
         hint,
-        content_capacity,
+        content_capacity.saturating_sub(usize::from(status_line.is_some())),
     );
+    if let Some(status_line) = status_line {
+        let insert_at = fitted_lines.len().saturating_sub(1);
+        fitted_lines.insert(insert_at, status_line);
+    }
     let lines = fitted_lines
         .into_iter()
         .map(|line| {
@@ -710,7 +1220,10 @@ fn render_composer_and_model_panel(frame: &mut Frame<'_>, app: &TuiApp, area: Re
                 theme.accent
             } else if line.contains("[needs setup]") || line.contains("Needs validation") {
                 theme.warning
-            } else if line.contains("Unavailable") || line.contains("Could not continue") {
+            } else if line.contains("Unavailable")
+                || line.contains("Could not continue")
+                || line.contains("activation failed")
+            {
                 theme.error
             } else {
                 theme.text
@@ -835,7 +1348,7 @@ fn context_key_hint(app: &TuiApp) -> &'static str {
     match app.navigation.current() {
         ContentRoute::Timeline => timeline_key_hint(
             app.timeline_state.view().result_card.is_some(),
-            app.query_submission_enabled(),
+            app.conversation_submission_enabled(),
         ),
         ContentRoute::Artifact => "Esc back",
         ContentRoute::ModelSelection => "Tab switch · Enter select · Esc back",

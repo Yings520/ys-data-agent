@@ -9,18 +9,26 @@
     reason = "The dependency-ordered Liter factory consumes this closed codec in task 3.7."
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
+use futures::StreamExt;
 use liter_llm::{
     client::{ClientConfig, ClientConfigBuilder},
-    types::{CreateResponseRequest, ResponseObject, ResponseTool, ResponseUsage},
+    types::{
+        CreateResponseRequest, ResponseObject, ResponseOutputItem, ResponseTool, ResponseUsage,
+    },
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use ys_agent_core::{
-    AgentAction, CredentialLease, ModelMessage, ModelRequest, ModelResponse, ModelRole, ModelUsage,
-    ParameterApplicability, ProviderErrorCode, ProviderField, ProviderManagementError,
-    ProviderParameterKey, ProviderRemediation, ProviderResult, ToolCall, ToolCallId, ToolSpec,
+    AgentAction, CredentialLease, ModelMessage, ModelRequest, ModelResponse, ModelResponseFormat,
+    ModelRole, ModelToolChoice, ModelUsage, ParameterApplicability, ProviderErrorCode,
+    ProviderField, ProviderManagementError, ProviderParameterKey, ProviderRemediation,
+    ProviderResult, ToolCall, ToolCallId, ToolSpec,
 };
 
 use crate::oauth::chatgpt::with_connected_chatgpt_responses_auth;
@@ -29,9 +37,18 @@ use crate::oauth::chatgpt::with_connected_chatgpt_responses_auth;
 pub(crate) const CHATGPT_RESPONSES_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
 /// Codex's fixed Responses request originator.
 pub(crate) const CHATGPT_RESPONSES_ORIGINATOR: &str = "codex_cli_rs";
+/// Fixed Codex client protocol version accepted by the subscription backend.
+pub(crate) const CHATGPT_CODEX_PROTOCOL_VERSION: &str = "0.152.1";
+/// Fixed Codex client identity required by both model discovery and Responses requests.
+pub(crate) const CHATGPT_CODEX_USER_AGENT: &str = "codex_cli_rs/0.152.1";
+/// Codex's Responses endpoint emits Server-Sent Events, including the terminal response object.
+pub(crate) const CHATGPT_RESPONSES_ACCEPT: &str = "text/event-stream";
 
 const CHATGPT_ACCOUNT_HEADER: &str = "ChatGPT-Account-ID";
 const CHATGPT_MODEL_PREFIX: &str = "chatgpt/";
+const CHATGPT_RESPONSES_PATH: &str = "responses";
+const MAX_CHATGPT_SSE_EVENT_BYTES: usize = 1_048_576;
+const MAX_CHATGPT_SSE_OUTPUT_ITEMS: usize = 16;
 
 /// Converts core model requests to and from ChatGPT's fixed Responses protocol.
 ///
@@ -46,6 +63,93 @@ pub(crate) struct ChatGptResponsesCodec {
 struct DeclaredCall {
     name: String,
     result_seen: bool,
+}
+
+/// A deliberately narrow SSE transport for the Codex Subscription backend.
+///
+/// The public Responses client expects a complete response object in
+/// `response.completed`, whereas Codex returns completed output items before a terminal event
+/// that contains only turn metadata. This transport preserves the fixed endpoint and credential
+/// boundary while assembling the completed items into the codec's closed response shape.
+#[derive(Clone)]
+pub(crate) struct ChatGptResponsesTransport {
+    http: reqwest::Client,
+    access_token: SecretString,
+    account_id: String,
+    base_url: String,
+    max_retries: u32,
+}
+
+impl ChatGptResponsesTransport {
+    pub(crate) fn from_config(config: ClientConfig) -> ProviderResult<Self> {
+        let base_url = config
+            .base_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(protocol_incompatible)?;
+        let account_id = config
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(CHATGPT_ACCOUNT_HEADER))
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(oauth_not_connected)?;
+        if config.api_key.expose_secret().trim().is_empty() {
+            return Err(oauth_not_connected());
+        }
+        let http = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .map_err(|_| network_error())?;
+
+        Ok(Self {
+            http,
+            access_token: config.api_key,
+            account_id,
+            base_url,
+            max_retries: config.max_retries,
+        })
+    }
+
+    pub(crate) async fn create_response(
+        &self,
+        request: CreateResponseRequest,
+    ) -> ProviderResult<ResponseObject> {
+        let model = request.model.clone();
+        let body = streaming_request_body(request)?;
+        let url = format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            CHATGPT_RESPONSES_PATH
+        );
+        let mut attempts = 0;
+
+        loop {
+            let response = self
+                .http
+                .post(&url)
+                .bearer_auth(self.access_token.expose_secret())
+                .header(CHATGPT_ACCOUNT_HEADER, &self.account_id)
+                .header("originator", CHATGPT_RESPONSES_ORIGINATOR)
+                .header("user-agent", CHATGPT_CODEX_USER_AGENT)
+                .header("accept", CHATGPT_RESPONSES_ACCEPT)
+                .json(&body)
+                .send()
+                .await
+                .map_err(reqwest_error)?;
+            let status = response.status();
+            if status.is_success() {
+                return collect_codex_sse_response(response, &model).await;
+            }
+            if retryable_status(status) && attempts < self.max_retries {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            return Err(status_error(status));
+        }
+    }
 }
 
 impl ChatGptResponsesCodec {
@@ -69,6 +173,10 @@ impl ChatGptResponsesCodec {
                 .map_err(|_| oauth_not_connected())?
                 .header("originator", CHATGPT_RESPONSES_ORIGINATOR)
                 .map_err(|_| oauth_not_connected())?
+                .header("user-agent", CHATGPT_CODEX_USER_AGENT)
+                .map_err(|_| oauth_not_connected())?
+                .header("accept", CHATGPT_RESPONSES_ACCEPT)
+                .map_err(|_| oauth_not_connected())?
                 .build();
             Ok(config)
         })
@@ -86,6 +194,31 @@ impl ChatGptResponsesCodec {
 
         let tools = convert_tools(&request.tools)?;
         let (input, _) = self.convert_messages(&request.messages, &request.tools)?;
+        let has_tools = !tools.is_empty();
+        let tool_choice = match request.tool_choice {
+            ModelToolChoice::Auto if has_tools => Some("auto"),
+            ModelToolChoice::Auto => None,
+            ModelToolChoice::Required if has_tools => Some("required"),
+            ModelToolChoice::Required => return Err(protocol_incompatible()),
+            ModelToolChoice::None if has_tools => Some("none"),
+            ModelToolChoice::None => None,
+        };
+        let mut controls = serde_json::Map::new();
+        if let Some(tool_choice) = tool_choice {
+            controls.insert("tool_choice".to_owned(), json!(tool_choice));
+        }
+        if has_tools {
+            controls.insert("parallel_tool_calls".to_owned(), json!(false));
+        }
+        // The subscription backend follows Codex's ephemeral-session protocol. Persisting a
+        // probe or a normal application turn is neither needed nor accepted by that transport.
+        controls.insert("store".to_owned(), json!(false));
+        if request.response_format == ModelResponseFormat::JsonObject {
+            controls.insert(
+                "text".to_owned(),
+                json!({"format": {"type": "json_object"}}),
+            );
+        }
         Ok(CreateResponseRequest {
             model: model.to_owned(),
             input: Value::Array(input),
@@ -94,7 +227,7 @@ impl ChatGptResponsesCodec {
             temperature: request.temperature.map(f64::from),
             max_output_tokens: None,
             metadata: None,
-            extra_body: None,
+            extra_body: (!controls.is_empty()).then_some(Value::Object(controls)),
             stream: None,
         })
     }
@@ -114,16 +247,27 @@ impl ChatGptResponsesCodec {
             || response.model.trim().is_empty()
             || response.status != "completed"
             || response.error.is_some()
-            || response.output.len() != 1
         {
             return Err(invalid_response());
         }
         let usage = response.usage.map(convert_usage).transpose()?;
-        let item = response
-            .output
-            .into_iter()
-            .next()
-            .ok_or_else(invalid_response)?;
+        // Reasoning-capable ChatGPT models prepend a non-actionable `reasoning` item to their
+        // actual response. It is neither a tool call nor user-visible content, so deliberately
+        // discard it here instead of treating a valid response as malformed or surfacing private
+        // reasoning in the product. The closed codec still accepts exactly one actionable item.
+        let mut actionable_item = None;
+        for item in response.output {
+            match item.item_type.as_str() {
+                "reasoning" => {}
+                "function_call" | "message" => {
+                    if actionable_item.replace(item).is_some() {
+                        return Err(invalid_response());
+                    }
+                }
+                _ => return Err(invalid_response()),
+            }
+        }
+        let item = actionable_item.ok_or_else(invalid_response)?;
 
         match item.item_type.as_str() {
             "function_call" => {
@@ -314,6 +458,121 @@ impl ChatGptResponsesCodec {
     }
 }
 
+fn streaming_request_body(mut request: CreateResponseRequest) -> ProviderResult<Value> {
+    request.stream = Some(true);
+    let mut body = serde_json::to_value(request).map_err(|_| protocol_incompatible())?;
+    let object = body.as_object_mut().ok_or_else(protocol_incompatible)?;
+    if let Some(extra_body) = object.remove("extra_body") {
+        let Value::Object(extra_body) = extra_body else {
+            return Err(protocol_incompatible());
+        };
+        object.extend(extra_body);
+    }
+    // This transport parses SSE, so do not allow an `extra_body` control to desynchronize the
+    // request mode from the response parser.
+    object.insert("stream".to_owned(), Value::Bool(true));
+    Ok(body)
+}
+
+async fn collect_codex_sse_response(
+    response: reqwest::Response,
+    model: &str,
+) -> ProviderResult<ResponseObject> {
+    let mut bytes = response.bytes_stream();
+    let mut pending = Vec::new();
+    let mut output = Vec::new();
+
+    while let Some(chunk) = bytes.next().await {
+        let chunk = chunk.map_err(reqwest_error)?;
+        pending.extend_from_slice(&chunk);
+        if pending.len() > MAX_CHATGPT_SSE_EVENT_BYTES {
+            return Err(invalid_response());
+        }
+
+        while let Some((event_end, delimiter_len)) = sse_event_delimiter(&pending) {
+            let event = pending.drain(..event_end).collect::<Vec<_>>();
+            pending.drain(..delimiter_len);
+            if let Some(response) = consume_codex_sse_event(&event, &mut output, model)? {
+                return Ok(response);
+            }
+        }
+    }
+
+    Err(invalid_response())
+}
+
+fn sse_event_delimiter(bytes: &[u8]) -> Option<(usize, usize)> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4))
+        .or_else(|| {
+            bytes
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|index| (index, 2))
+        })
+}
+
+fn consume_codex_sse_event(
+    event: &[u8],
+    output: &mut Vec<ResponseOutputItem>,
+    model: &str,
+) -> ProviderResult<Option<ResponseObject>> {
+    let event = std::str::from_utf8(event).map_err(|_| invalid_response())?;
+    let data = event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>();
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let data = data.join("\n");
+    if data == "[DONE]" {
+        return Ok(None);
+    }
+    let event: Value = serde_json::from_str(&data).map_err(|_| invalid_response())?;
+    let kind = event
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_response)?;
+
+    match kind {
+        "response.output_item.done" => {
+            let item = event.get("item").cloned().ok_or_else(invalid_response)?;
+            let item = serde_json::from_value(item).map_err(|_| invalid_response())?;
+            if output.len() == MAX_CHATGPT_SSE_OUTPUT_ITEMS {
+                return Err(invalid_response());
+            }
+            output.push(item);
+            Ok(None)
+        }
+        "response.completed" => {
+            let response = event
+                .get("response")
+                .and_then(Value::as_object)
+                .ok_or_else(invalid_response)?;
+            let id = response
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(invalid_response)?;
+            Ok(Some(ResponseObject {
+                id: id.to_owned(),
+                object: "response".to_owned(),
+                created_at: 0,
+                model: model.to_owned(),
+                status: "completed".to_owned(),
+                output: std::mem::take(output),
+                usage: None,
+                error: None,
+            }))
+        }
+        "response.failed" | "response.incomplete" => Err(invalid_response()),
+        _ => Ok(None),
+    }
+}
+
 fn convert_tools(tools: &[ToolSpec]) -> ProviderResult<Vec<ResponseTool>> {
     let mut names = BTreeSet::new();
     let mut converted = Vec::with_capacity(tools.len());
@@ -440,6 +699,59 @@ fn invalid_response() -> ProviderManagementError {
         Some(ProviderField::Validation),
         ProviderRemediation::ValidateProfile,
     )
+}
+
+fn reqwest_error(request_error: reqwest::Error) -> ProviderManagementError {
+    if request_error.is_timeout() {
+        return error(
+            ProviderErrorCode::Timeout,
+            Some(ProviderField::Model),
+            ProviderRemediation::Retry,
+        );
+    }
+    network_error()
+}
+
+fn network_error() -> ProviderManagementError {
+    error(
+        ProviderErrorCode::Network,
+        Some(ProviderField::Model),
+        ProviderRemediation::Retry,
+    )
+}
+
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+fn status_error(status: reqwest::StatusCode) -> ProviderManagementError {
+    match status.as_u16() {
+        401 | 403 => error(
+            ProviderErrorCode::AuthenticationInvalid,
+            Some(ProviderField::Credential),
+            ProviderRemediation::ReturnToEdit,
+        ),
+        404 => error(
+            ProviderErrorCode::ModelNotFound,
+            Some(ProviderField::Model),
+            ProviderRemediation::ReturnToEdit,
+        ),
+        429 => error(
+            ProviderErrorCode::RateLimited,
+            Some(ProviderField::Model),
+            ProviderRemediation::Retry,
+        ),
+        500..=599 => error(
+            ProviderErrorCode::Server,
+            Some(ProviderField::Model),
+            ProviderRemediation::Retry,
+        ),
+        _ => error(
+            ProviderErrorCode::ModelIncompatible,
+            Some(ProviderField::Model),
+            ProviderRemediation::ValidateProfile,
+        ),
+    }
 }
 
 fn protocol_incompatible() -> ProviderManagementError {

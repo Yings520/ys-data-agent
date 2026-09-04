@@ -239,6 +239,7 @@ impl ChatGptOAuthManager {
     async fn complete_authorization(
         &self,
         operation_id: OperationId,
+        generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
         let pending = {
             let state = self.lock_state();
@@ -251,8 +252,9 @@ impl ChatGptOAuthManager {
             pending
         };
 
+        validate_oauth_generation(pending.profile_id, generation)?;
         let result = self
-            .complete_authorization_inner(operation_id, pending.clone())
+            .complete_authorization_inner(operation_id, pending.clone(), generation)
             .await;
         if result.is_err()
             && result
@@ -273,6 +275,7 @@ impl ChatGptOAuthManager {
         &self,
         operation_id: OperationId,
         pending: Arc<PendingDeviceAuthorization>,
+        generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
         let mut code_response = self.poll_for_authorization(&pending).await?;
         self.ensure_current(pending.profile_id, operation_id)?;
@@ -293,13 +296,6 @@ impl ChatGptOAuthManager {
             .await?;
         self.ensure_current(pending.profile_id, operation_id)?;
 
-        let generation_number = self.next_generation(pending.profile_id)?;
-        let generation = CredentialGeneration::new(
-            pending.profile_id,
-            generation_number,
-            CredentialKind::OAuthConnection,
-        )
-        .map_err(|_| internal_error())?;
         let expires_at_epoch_seconds = bundle.expires_at_epoch_seconds;
         self.write_bundle(pending.profile_id, generation, bundle)
             .await?;
@@ -390,19 +386,6 @@ impl ChatGptOAuthManager {
         token_bundle_from_initial_response(response)
     }
 
-    fn next_generation(&self, profile_id: ProfileId) -> ProviderResult<u64> {
-        self.lock_state()
-            .profiles
-            .get(&profile_id)
-            .and_then(|connection| connection.generation)
-            .map_or(Ok(1), |generation| {
-                generation
-                    .number()
-                    .checked_add(1)
-                    .ok_or_else(internal_error)
-            })
-    }
-
     async fn write_bundle(
         &self,
         profile_id: ProfileId,
@@ -456,6 +439,7 @@ impl ChatGptOAuthManager {
         &self,
         profile_id: ProfileId,
         operation_id: OperationId,
+        next_generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
         let generation = {
             let mut state = self.lock_state();
@@ -473,8 +457,12 @@ impl ChatGptOAuthManager {
             connection.generation.ok_or_else(oauth_not_connected)?
         };
 
+        validate_oauth_generation(profile_id, next_generation)?;
+        if next_generation.number() <= generation.number() {
+            return Err(stale_operation());
+        }
         let result = self
-            .refresh_connection_inner(profile_id, operation_id, generation)
+            .refresh_connection_inner(profile_id, operation_id, generation, next_generation)
             .await;
         if result.is_err()
             && result
@@ -505,6 +493,7 @@ impl ChatGptOAuthManager {
         profile_id: ProfileId,
         operation_id: OperationId,
         generation: CredentialGeneration,
+        next_generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
         let lease = self
             .vault
@@ -541,13 +530,6 @@ impl ChatGptOAuthManager {
         }
         let response: TokenResponse = decode_response(response).await?;
         update_bundle_from_refresh(&mut bundle, response)?;
-        let next_number = generation
-            .number()
-            .checked_add(1)
-            .ok_or_else(internal_error)?;
-        let next_generation =
-            CredentialGeneration::new(profile_id, next_number, CredentialKind::OAuthConnection)
-                .map_err(|_| internal_error())?;
         let expires_at_epoch_seconds = bundle.expires_at_epoch_seconds;
         self.ensure_current(profile_id, operation_id)?;
         self.write_bundle(profile_id, next_generation, bundle)
@@ -689,16 +671,22 @@ impl OAuthConnectionService for ChatGptOAuthManager {
         self.begin_authorization(profile_id, operation_id).await
     }
 
-    async fn complete(&self, operation_id: OperationId) -> ProviderResult<OAuthConnectionView> {
-        self.complete_authorization(operation_id).await
+    async fn complete(
+        &self,
+        operation_id: OperationId,
+        generation: CredentialGeneration,
+    ) -> ProviderResult<OAuthConnectionView> {
+        self.complete_authorization(operation_id, generation).await
     }
 
     async fn refresh(
         &self,
         profile_id: ProfileId,
         operation_id: OperationId,
+        generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
-        self.refresh_connection(profile_id, operation_id).await
+        self.refresh_connection(profile_id, operation_id, generation)
+            .await
     }
 
     async fn reauthorize(

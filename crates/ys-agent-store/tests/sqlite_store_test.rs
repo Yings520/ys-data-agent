@@ -763,8 +763,8 @@ async fn credential_journal_migration_blocks_unverifiable_pre_contract_recovery_
             "INSERT INTO provider_credential_generations(
                 profile_id, generation, kind, vault_locator, status, created_at, updated_at
              ) VALUES
-                (?1, 1, 'api_key', 'io.ysda.provider://legacy:1', 'available', 'legacy', 'legacy'),
-                (?1, 2, 'api_key', 'io.ysda.provider://legacy:2', 'available', 'legacy', 'legacy')",
+                (?1, 1, 'api_key', 'io.ysda.local-credential://legacy:1', 'available', 'legacy', 'legacy'),
+                (?1, 2, 'api_key', 'io.ysda.local-credential://legacy:2', 'available', 'legacy', 'legacy')",
             [profile_id.to_string()],
         )
         .expect("legacy generations");

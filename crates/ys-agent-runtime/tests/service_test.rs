@@ -6,7 +6,7 @@ use std::sync::{
 use async_trait::async_trait;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
-use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
+use ys_agent_adapters::credential::memory::InMemoryCredentialVault;
 use ys_agent_core::{
     AgentAction, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactKind, ArtifactMetadata,
     ArtifactStore, CellValue, CommandId, CommandReceipt, CommandResultKind, CoreError, CoreResult,
@@ -128,18 +128,33 @@ struct ServiceFixture {
 
 impl ServiceFixture {
     async fn new() -> Self {
-        Self::build(None, true).await
+        Self::build(None, true, None).await
     }
 
     async fn with_conversation_model(model: Arc<dyn ys_agent_core::ModelProvider>) -> Self {
-        Self::build(Some(model), true).await
+        Self::build(Some(model), true, None).await
+    }
+
+    async fn with_conversation_model_and_disabled_queries(
+        model: Arc<dyn ys_agent_core::ModelProvider>,
+    ) -> Self {
+        Self::build(
+            Some(model),
+            true,
+            Some("Connect a read-only datasource before asking data questions."),
+        )
+        .await
     }
 
     async fn without_provider_binding() -> Self {
-        Self::build(None, false).await
+        Self::build(None, false, None).await
     }
 
-    async fn build(model: Option<Arc<dyn ys_agent_core::ModelProvider>>, bind_runs: bool) -> Self {
+    async fn build(
+        model: Option<Arc<dyn ys_agent_core::ModelProvider>>,
+        bind_runs: bool,
+        disabled_query_message: Option<&str>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = Arc::new(
             SqliteRuntimeStore::open(directory.path().join("runtime.db"))
@@ -174,6 +189,9 @@ impl ServiceFixture {
         }
         if let Some(model) = model {
             service = service.with_conversation_model(model, "test-model");
+        }
+        if let Some(message) = disabled_query_message {
+            service = service.with_query_submission_disabled(message);
         }
         let service = Arc::new(service);
         let principal = Principal::local_operator("Data Engineer");
@@ -880,6 +898,31 @@ async fn data_request_start_query_creates_exactly_one_run() {
     assert_eq!(first.run_id(), replay.run_id());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.created_run_count().await, 1);
+}
+
+#[tokio::test]
+async fn data_request_without_a_query_runtime_returns_guidance_without_a_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model = front_door_model(calls.clone(), AgentAction::StartQuery);
+    let fixture = ServiceFixture::with_conversation_model_and_disabled_queries(model).await;
+
+    let reply = fixture
+        .service
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            fixture.session_id(),
+            "What was yesterday's GMV?",
+        ))
+        .await
+        .expect("datasource guidance reply");
+
+    assert!(matches!(
+        reply,
+        ServiceReply::Conversation { ref message }
+            if message == "Connect a read-only datasource before asking data questions."
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.created_run_count().await, 0);
 }
 
 #[tokio::test]

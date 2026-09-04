@@ -100,6 +100,8 @@ fn all_selectable_bindings_create_only_fixed_client_plans() {
                             FIXTURE_ACCOUNT_ID.to_owned()
                         ),
                         ("originator".to_owned(), "codex_cli_rs".to_owned()),
+                        ("user-agent".to_owned(), "codex_cli_rs/0.152.1".to_owned()),
+                        ("accept".to_owned(), "text/event-stream".to_owned()),
                     ]
                 );
                 assert!(!config.load_env);

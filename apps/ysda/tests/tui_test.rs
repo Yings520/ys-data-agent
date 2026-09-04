@@ -1,15 +1,21 @@
 use chrono::Utc;
-use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Color};
+use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    layout::Rect,
+    style::{Color, Modifier},
+};
 use ys_agent_core::{
     ActiveProviderView, ArtifactId, EventActor, EventEnvelope, EventId, PolicyDecision, Principal,
-    ProfileId, ProviderId, ProviderModelId, ProviderParameters, RunEventKind, RunId,
-    SelectionAvailability, SelectionCurrentStatus, SelectionTarget, SelectionTargetView, TaskId,
-    ToolCallId, VersionedRunEvent, WorkspaceId,
+    ProfileId, ProviderId, ProviderModelId, ProviderParameters, QueryIntent, RetentionPolicy,
+    RunEventKind, RunId, RunSnapshot, RunStatus, SelectionAvailability, SelectionCurrentStatus,
+    SelectionTarget, SelectionTargetView, SemanticStatus, Sensitivity, SourceId, TaskId,
+    ToolCallId, VersionedRunEvent, WorkflowKind, WorkspaceId,
 };
 
 use ys_agent_runtime::{
-    DatasourceDisplayState, QueryDisplayState, TuiDisplayContext, TuiDisplayContextInput,
-    provider::catalog::GovernedProviderCatalog,
+    DatasourceDisplayState, QueryArtifact, QueryDisplayState, TuiDisplayContext,
+    TuiDisplayContextInput, VerificationReport, provider::catalog::GovernedProviderCatalog,
 };
 use ysda::tui::{
     ArtifactWorkspaceState, AsyncChannel, AsyncResultGuard, ColorSpec, ContentRoute, DetailKind,
@@ -52,6 +58,45 @@ fn rendered_color(app: &TuiApp, width: u16, height: u16, needle: &str) -> Color 
     panic!("rendered output did not contain {needle:?}");
 }
 
+fn rendered_modifier(app: &TuiApp, width: u16, height: u16, needle: &str) -> Modifier {
+    let mut app = app.clone();
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| ysda::tui::render(frame, &mut app))
+        .expect("render production TUI");
+    let buffer = terminal.backend().buffer();
+    for row in 0..height {
+        let line = (0..width)
+            .map(|column| buffer[(column, row)].symbol())
+            .collect::<String>();
+        if let Some(byte_offset) = line.find(needle) {
+            let column = line[..byte_offset].chars().count() as u16;
+            return buffer[(column, row)].modifier;
+        }
+    }
+    panic!("rendered output did not contain {needle:?}");
+}
+
+fn rendered_column(app: &TuiApp, width: u16, height: u16, needle: &str) -> u16 {
+    let mut app = app.clone();
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| ysda::tui::render(frame, &mut app))
+        .expect("render production TUI");
+    let buffer = terminal.backend().buffer();
+    for row in 0..height {
+        let line = (0..width)
+            .map(|column| buffer[(column, row)].symbol())
+            .collect::<String>();
+        if let Some(byte_offset) = line.find(needle) {
+            return line[..byte_offset].chars().count() as u16;
+        }
+    }
+    panic!("rendered output did not contain {needle:?}");
+}
+
 #[test]
 fn welcome_is_minimal_and_shows_safe_header_labels() {
     let app = TuiApp::test_home(
@@ -68,7 +113,7 @@ fn welcome_is_minimal_and_shows_safe_header_labels() {
     assert!(rendered.contains("READ ONLY"));
     assert!(rendered.contains("Welcome to YS·DA"));
     assert!(rendered.contains("Choose an LLM provider and model"));
-    assert!(rendered.contains("Ask a governed data question"));
+    assert!(rendered.contains("Ask a question"));
     assert!(!rendered.contains("Recent work"));
     assert!(!rendered.contains("Recent tasks"));
     assert!(!rendered.contains("Artifact"));
@@ -325,7 +370,7 @@ fn home_shell_matches_the_approved_product_prototype() {
         "SQLite · demo.db",
         "AUTO › QUERY",
         "READ ONLY",
-        "Ask a governed data question…",
+        "Ask a question…",
         "/mode  /model",
     ] {
         assert!(
@@ -339,6 +384,263 @@ fn home_shell_matches_the_approved_product_prototype() {
             "implementation-oriented shell copy is visible: {implementation_copy}\n{rendered}"
         );
     }
+}
+
+#[test]
+fn wide_terminal_centers_a_constrained_shell_and_content_column() {
+    let app = TuiApp::test_answer(
+        "Which result matters most?",
+        "The final response remains inside the prototype content column.",
+        [None, None],
+        None,
+    );
+
+    assert_eq!(rendered_column(&app, 150, 40, "YS·DA"), 12);
+    assert_eq!(rendered_column(&app, 150, 40, "You"), 20);
+}
+
+#[test]
+fn plain_chat_uses_a_compact_answer_card_without_a_governed_execution_trace() {
+    let app = TuiApp::test_answer(
+        "Are you a data engineer?",
+        "I can help you investigate and query governed data.",
+        [None, None],
+        None,
+    );
+    let rendered = render_to_string(&app, 120, 32);
+
+    assert!(rendered.contains("Are you a data engineer?"));
+    assert!(!rendered.contains("RESPONSE"));
+    assert!(rendered.contains("I can help you investigate"));
+    assert!(!rendered.contains("Conversation response received"));
+    assert!(!rendered.contains("Reason ·"));
+    assert!(!rendered.contains("Status ·"));
+    assert!(!rendered.contains("QUERY ARTIFACT"));
+}
+
+#[test]
+fn direct_reply_uses_an_unlabeled_full_response_panel_not_a_character_drawn_corner() {
+    let app = TuiApp::test_answer(
+        "Can I chat before connecting a datasource?",
+        "Yes. A connected model is enough for a direct conversation.",
+        [None, None],
+        None,
+    );
+    let rendered = render_to_string(&app, 120, 32);
+    let lines = rendered.lines().collect::<Vec<_>>();
+    let answer_row = lines
+        .iter()
+        .position(|line| line.contains("Yes. A connected model is enough"))
+        .expect("direct answer is rendered");
+    let panel_top = lines
+        .get(answer_row.saturating_sub(1))
+        .expect("a response panel has a top border")
+        .split_once('┌')
+        .map(|(_, panel)| panel)
+        .expect("a response panel has a top-left corner");
+
+    assert!(
+        panel_top.contains('┐'),
+        "the answer must sit inside a real rectangular panel without a decorative label\n{rendered}"
+    );
+    assert!(
+        panel_top.chars().count() > 70,
+        "the response panel must span the content column\n{rendered}"
+    );
+    assert!(!rendered.contains("RESPONSE"));
+}
+
+#[test]
+fn direct_reply_body_has_stronger_typographic_weight_than_its_metadata() {
+    let app = TuiApp::test_answer(
+        "Which result matters most?",
+        "The final response is the visual focal point.",
+        [None, None],
+        None,
+    );
+
+    assert!(
+        rendered_modifier(&app, 120, 32, "The final response").contains(Modifier::BOLD),
+        "the response body must be visually emphasized"
+    );
+}
+
+#[test]
+fn completion_metadata_is_dimmed_below_the_answer_hierarchy() {
+    let app = TuiApp::test_answer(
+        "Which result matters most?",
+        "The final response is the visual focal point.",
+        [None, None],
+        None,
+    );
+
+    for metadata in ["Ys-da", "completed"] {
+        assert!(
+            rendered_modifier(&app, 120, 32, metadata).contains(Modifier::DIM),
+            "{metadata} must be low-emphasis completion metadata"
+        );
+    }
+}
+
+#[test]
+fn repeated_provider_failure_is_shown_once_until_the_user_starts_a_new_attempt() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("error-dedup-test"));
+    app.push_transcript(ysda::tui::TranscriptItem::Error(
+        "What happened: provider.credential_missing. Open diagnostics for details.".to_owned(),
+    ));
+    app.push_transcript(ysda::tui::TranscriptItem::Error(
+        "Provider setup could not continue · provider.credential_missing".to_owned(),
+    ));
+
+    assert_eq!(
+        app.transcript.len(),
+        1,
+        "one failed operation must not duplicate the same credential error"
+    );
+
+    app.push_transcript(ysda::tui::TranscriptItem::UserMessage("retry".to_owned()));
+    app.push_transcript(ysda::tui::TranscriptItem::Error(
+        "What happened: provider.credential_missing. Open diagnostics for details.".to_owned(),
+    ));
+    assert_eq!(
+        app.transcript.len(),
+        3,
+        "a new attempt may report its own failure"
+    );
+}
+
+#[test]
+fn governed_run_uses_the_timeline_for_typed_steps_and_tool_work() {
+    let mut app = TuiApp::test_home("local", "warehouse", "read-only", "gpt-5.6");
+    app.timeline_state
+        .begin_query("Which customer has the highest total order amount?");
+    app.timeline_state
+        .apply_event(&timeline_event(1, RunEventKind::RunStarted));
+    app.timeline_state.apply_event(&timeline_event(
+        2,
+        RunEventKind::StepStarted {
+            step_id: ys_agent_core::StepId::new(),
+            label: "Classifying governed request".to_owned(),
+        },
+    ));
+    app.timeline_state.apply_event(&timeline_event(
+        3,
+        RunEventKind::ToolCallProposed {
+            call: ys_agent_core::ToolCall {
+                id: ToolCallId::new(),
+                provider_call_id: None,
+                name: "query_data".to_owned(),
+                arguments: serde_json::json!({}),
+                version: "v1".to_owned(),
+            },
+        },
+    ));
+
+    let rendered = render_to_string(&app, 120, 32);
+    assert!(rendered.contains("Which customer has the highest"));
+    assert!(rendered.contains("Ys-da"));
+    assert!(
+        !rendered.contains("Status · Running"),
+        "the compact completion line is the only status metadata in the timeline"
+    );
+    assert!(rendered.contains("Classifying governed request"));
+    assert!(rendered.contains("Checking query_data"));
+    assert!(!rendered.contains("RESPONSE"));
+}
+
+#[test]
+fn verified_query_result_uses_a_full_artifact_panel_with_a_result_rail() {
+    let mut app = TuiApp::test_home("local", "warehouse", "read-only", "gpt-5.6");
+    let task_id = TaskId::new();
+    let run_id = RunId::new();
+    app.timeline_state
+        .begin_query("Which customer has the highest total order amount?");
+    app.timeline_state.apply_snapshot(&RunSnapshot {
+        run_id,
+        task_id,
+        workflow: WorkflowKind::Query,
+        status: RunStatus::Succeeded,
+        attempt: 1,
+        retry_of_run_id: None,
+        version: 1,
+        workflow_state: serde_json::json!({}),
+        pending_wait_metadata: None,
+        primary_artifact_id: Some(ArtifactId::new()),
+        last_completed_step_id: None,
+    });
+    assert!(
+        app.timeline_state
+            .apply_persisted_query_artifact(&QueryArtifact {
+                question: "Which customer has the highest total order amount?".to_owned(),
+                intent: QueryIntent::Metadata,
+                answer_summary: "Acme Singapore has the highest total order amount.".to_owned(),
+                metric: None,
+                semantic_status: SemanticStatus::Observed,
+                source_id: SourceId::new("warehouse"),
+                source_relations: Vec::new(),
+                time_range: None,
+                executed_sql: None,
+                bound_parameters: Vec::new(),
+                result_schema: Default::default(),
+                result_artifact: None,
+                freshness: None,
+                verification: VerificationReport {
+                    checks: Vec::new(),
+                    hard_failures: Vec::new(),
+                    warnings: Vec::new(),
+                    evidence_refs: Vec::new(),
+                },
+                assumptions: Vec::new(),
+                warning_codes: Vec::new(),
+                sensitivity: Sensitivity::Internal,
+                retention_policy: RetentionPolicy::Session,
+                expires_at: None,
+                generated_at: Utc::now(),
+            })
+    );
+
+    let rendered = render_to_string(&app, 120, 32);
+    let lines = rendered.lines().collect::<Vec<_>>();
+    let artifact_row = lines
+        .iter()
+        .position(|line| line.contains("QUERY ARTIFACT INTERNAL"))
+        .expect("verified artifact metadata is rendered");
+    let panel_top = lines
+        .get(artifact_row.saturating_sub(1))
+        .and_then(|line| line.split_once('┌').map(|(_, panel)| panel))
+        .expect("the artifact result is a bordered panel");
+
+    assert!(panel_top.contains('┐'));
+    assert!(panel_top.chars().count() > 70);
+    assert!(rendered.contains("Open results · Enter"));
+    assert!(!rendered.contains("\nResults\n"));
+
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| ysda::tui::render(frame, &mut app))
+        .expect("render production TUI");
+    assert!(
+        app.timeline_state.result_card_hit_region.is_some(),
+        "the visible artifact panel remains clickable after moving from text lines to a widget"
+    );
+}
+
+#[test]
+fn active_model_without_a_datasource_is_labeled_chat_only() {
+    let mut app = TuiApp::for_principal(Principal::local_operator("chat-only-test"));
+    app.apply_active_provider_view(Some(&ActiveProviderView {
+        activation_revision: 1,
+        profile_id: ProfileId::new(),
+        profile_revision: 1,
+        provider: ProviderId::DeepSeek,
+        model: ProviderModelId::new(ProviderId::DeepSeek, "deepseek/chat").expect("valid model"),
+        parameters: ProviderParameters::default(),
+    }));
+
+    let rendered = render_to_string(&app, 100, 28);
+    assert!(rendered.contains("CHAT ONLY"));
+    assert!(!rendered.contains("CHAT READY"));
 }
 
 #[test]
@@ -360,7 +662,7 @@ fn model_selection_is_a_bottom_panel_below_the_composer() {
 
     let rendered = render_to_string(&app, 100, 32);
     let composer = rendered
-        .find("Ask a governed data question…")
+        .find("Ask a question…")
         .expect("composer remains visible");
     let picker = rendered
         .find("Model Selection")
@@ -473,7 +775,10 @@ fn chat_reply_renders_as_a_ys_da_answer_without_starting_a_query_view() {
     let rendered = render_to_string(&app, 100, 28);
 
     assert!(rendered.contains("Ys-da"));
-    assert!(rendered.contains("Chat"));
+    assert!(
+        !rendered.contains("Chat"),
+        "ordinary conversation must not add a redundant Chat state label:\n{rendered}"
+    );
     assert!(rendered.contains("I am Ys-da. I answer chat without starting a Query Run."));
     assert!(!rendered.contains("Query scheduled"));
 }
@@ -598,7 +903,7 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
             RunEventKind::RunWaiting {
                 reason: "Need a governed date range".to_owned(),
             },
-            "Status · Waiting for input",
+            "waiting for input",
             "Need a governed date range",
             shell.active_theme.warning,
         ),
@@ -610,7 +915,7 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
                     message: "provider detail must stay hidden".to_owned(),
                 },
             },
-            "Status · Denied",
+            "denied",
             "policy.read_denied",
             shell.active_theme.error,
         ),
@@ -619,7 +924,7 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
                 code: "query.execution_failed".to_owned(),
                 message: "transport body must stay hidden".to_owned(),
             },
-            "Status · Failed",
+            "failed",
             "query.execution_failed",
             shell.active_theme.error,
         ),
@@ -627,7 +932,7 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
             RunEventKind::RunCancelled {
                 reason: "Cancelled by operator".to_owned(),
             },
-            "Status · Cancelled",
+            "cancelled",
             "Cancelled by operator",
             shell.active_theme.warning,
         ),
@@ -635,8 +940,8 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
             RunEventKind::RunCompleted {
                 primary_artifact_id: ArtifactId::new(),
             },
-            "Status · Succeeded",
-            "Status · Succeeded",
+            "completed",
+            "completed",
             shell.active_theme.success,
         ),
     ];
@@ -653,11 +958,12 @@ fn responsive_renderer_goldens_cover_shell_artifact_and_outcome_matrix() {
                 rendered.contains(reason),
                 "{width}×{height} omitted {reason}"
             );
-            if !status.ends_with("Succeeded") {
+            if status != "completed" {
                 assert!(!rendered.contains("Verified"));
             }
         }
-        assert_eq!(rendered_color(&app, 100, 28, status), expected_color);
+        assert_eq!(rendered_color(&app, 100, 28, "●"), expected_color);
+        assert!(rendered_modifier(&app, 100, 28, "Ys-da").contains(Modifier::DIM));
     }
 
     let mut warning = shell;

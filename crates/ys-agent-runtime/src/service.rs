@@ -673,6 +673,7 @@ pub struct InProcessAgentService {
     event_sender: broadcast::Sender<ServiceEvent>,
     artifact_retention_days: u32,
     front_door: Option<FrontDoorAgent>,
+    query_submission_disabled_message: Option<String>,
     run_provider_bindings: Arc<dyn RunProviderBindingSource>,
     provider_management: Option<Arc<dyn ProviderManagementApi>>,
     tui_display_context_source: Arc<dyn TuiDisplayContextSource>,
@@ -927,6 +928,7 @@ impl InProcessAgentService {
             event_sender,
             artifact_retention_days: options.artifact_retention_days,
             front_door: None,
+            query_submission_disabled_message: None,
             run_provider_bindings: Arc::new(UnavailableRunProviderBindingSource),
             provider_management: None,
             tui_display_context_source: Arc::new(UnconfiguredTuiDisplayContextSource),
@@ -951,6 +953,13 @@ impl InProcessAgentService {
         model_name: impl Into<String>,
     ) -> Self {
         self.with_front_door_agent(provider, model_name)
+    }
+
+    /// Keeps ordinary front-door conversation available while intentionally declining only
+    /// data-query Runs when their runtime dependencies have not been configured.
+    pub fn with_query_submission_disabled(mut self, message: impl Into<String>) -> Self {
+        self.query_submission_disabled_message = Some(message.into());
+        self
     }
 
     pub fn with_run_provider_binding_source(
@@ -1007,6 +1016,8 @@ impl InProcessAgentService {
                 tools: Vec::new(),
                 context_manifest: ContextManifest::empty(1_024),
                 temperature: Some(0.0),
+                tool_choice: ys_agent_core::ModelToolChoice::None,
+                response_format: ys_agent_core::ModelResponseFormat::JsonObject,
             })
             .await?;
         match response.action {
@@ -1102,6 +1113,32 @@ impl InProcessAgentService {
             })
             .await?;
         Ok(receipt)
+    }
+
+    async fn commit_conversation_reply(
+        &self,
+        command_id: CommandId,
+        fingerprint: String,
+        session_id: SessionId,
+        task_id: Option<TaskId>,
+        message: String,
+    ) -> CoreResult<ServiceReply> {
+        self.commit_front_door_reply(
+            fingerprint.clone(),
+            CommandReceipt {
+                command_id,
+                command_fingerprint: fingerprint,
+                result_kind: CommandResultKind::ConversationResponded,
+                session_id: Some(session_id),
+                task_id,
+                run_id: None,
+                artifact_id: None,
+                message: Some(message.clone()),
+                capability: None,
+            },
+        )
+        .await?;
+        Ok(ServiceReply::Conversation { message })
     }
 
     async fn commit_unsupported(
@@ -1420,32 +1457,35 @@ impl AgentServiceApi for InProcessAgentService {
             CoordinationDecision::FrontDoor { input } => {
                 match self.classify_front_door(&input).await? {
                     FrontDoorDecision::Respond(message) => {
-                        self.commit_front_door_reply(
-                            fingerprint.clone(),
-                            CommandReceipt {
-                                command_id: request.command_id,
-                                command_fingerprint: fingerprint,
-                                result_kind: CommandResultKind::ConversationResponded,
-                                session_id: Some(session.id),
-                                task_id: focused.as_ref().map(|task| task.id),
-                                run_id: None,
-                                artifact_id: None,
-                                message: Some(message.clone()),
-                                capability: None,
-                            },
-                        )
-                        .await?;
-                        Ok(ServiceReply::Conversation { message })
-                    }
-                    FrontDoorDecision::StartQuery => {
-                        self.start_query_run(
+                        self.commit_conversation_reply(
                             request.command_id,
                             fingerprint,
-                            &session,
-                            input,
-                            &request.text,
+                            session.id,
+                            focused.as_ref().map(|task| task.id),
+                            message,
                         )
                         .await
+                    }
+                    FrontDoorDecision::StartQuery => {
+                        if let Some(message) = &self.query_submission_disabled_message {
+                            self.commit_conversation_reply(
+                                request.command_id,
+                                fingerprint,
+                                session.id,
+                                focused.as_ref().map(|task| task.id),
+                                message.clone(),
+                            )
+                            .await
+                        } else {
+                            self.start_query_run(
+                                request.command_id,
+                                fingerprint,
+                                &session,
+                                input,
+                                &request.text,
+                            )
+                            .await
+                        }
                     }
                     FrontDoorDecision::Unsupported { workflow, message } => {
                         self.commit_unsupported(

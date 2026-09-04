@@ -8,7 +8,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::{Mutex, OnceCell};
 use ys_agent_core::{
-    CredentialVault, CredentialViewStatus, ModelProvider, ProviderClientBinding,
+    CoreError, CoreResult, CredentialVault, CredentialViewStatus, ModelCapabilities, ModelProvider,
+    ModelRequest, ModelResponse, ProfileRevisionRepository, ProfileState, ProviderClientBinding,
     ProviderClientFactory, ProviderCredentialReference, ProviderErrorCode, ProviderField,
     ProviderManagementError, ProviderRemediation, ProviderResult, ResolvedRunProvider, RunId,
     RunModelProviderResolver, RunProviderBindingRepository,
@@ -33,12 +34,82 @@ pub struct FixedRunModelProviderResolver {
     provider: Arc<dyn ModelProvider>,
 }
 
+/// Resolves the currently active Provider for a non-Query conversation.
+///
+/// A conversation intentionally has no durable Query Run binding: it cannot call governed data
+/// tools and each turn reads the current active Profile. This keeps ordinary chat usable before a
+/// datasource exists, while Query Runs retain their immutable binding behavior.
+pub struct ActiveProfileModelProvider {
+    profiles: Arc<dyn ProfileRevisionRepository>,
+    vault: Arc<dyn CredentialVault>,
+    factory: Arc<dyn ProviderClientFactory>,
+}
+
 impl FixedRunModelProviderResolver {
     pub fn new(
         bindings: Arc<dyn RunProviderBindingRepository>,
         provider: Arc<dyn ModelProvider>,
     ) -> Self {
         Self { bindings, provider }
+    }
+}
+
+impl ActiveProfileModelProvider {
+    pub fn new(
+        profiles: Arc<dyn ProfileRevisionRepository>,
+        vault: Arc<dyn CredentialVault>,
+        factory: Arc<dyn ProviderClientFactory>,
+    ) -> Self {
+        Self {
+            profiles,
+            vault,
+            factory,
+        }
+    }
+
+    async fn resolve_active(&self) -> CoreResult<(ProviderClientBinding, Arc<dyn ModelProvider>)> {
+        let active = self
+            .profiles
+            .active()
+            .await
+            .map_err(provider_to_core)?
+            .ok_or_else(no_active_provider)?;
+        let revision = self
+            .profiles
+            .load_revision(active.profile_id(), active.profile_revision())
+            .await
+            .map_err(provider_to_core)?;
+        if revision.profile_id() != active.profile_id()
+            || revision.revision() != active.profile_revision()
+            || revision.state() != ProfileState::Ready
+            || revision.credential_generation() != Some(active.credential_generation())
+        {
+            return Err(stale_active_provider());
+        }
+
+        let binding = ProviderClientBinding::from_revision(&revision)?;
+        let reference = ProviderCredentialReference {
+            profile_id: binding.profile_id,
+            generation: binding.credential_generation,
+        };
+        ensure_usable_credential(
+            self.vault
+                .credential_status(reference.clone())
+                .await
+                .map_err(provider_to_core)?,
+        )
+        .map_err(provider_to_core)?;
+        let credential = self
+            .vault
+            .read_generation(reference)
+            .await
+            .map_err(provider_to_core)?;
+        let provider = self
+            .factory
+            .build(binding.clone(), credential)
+            .await
+            .map_err(provider_to_core)?;
+        Ok((binding, provider))
     }
 }
 
@@ -137,6 +208,25 @@ impl RunModelProviderResolver for FixedRunModelProviderResolver {
     }
 }
 
+#[async_trait::async_trait]
+impl ModelProvider for ActiveProfileModelProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        // The active Profile's persisted compatibility evidence is authoritative. This adapter
+        // does not invent capabilities synchronously before resolving that Profile.
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, mut request: ModelRequest) -> CoreResult<ModelResponse> {
+        let (binding, provider) = self.resolve_active().await?;
+        // The front-door agent supplies a bootstrap placeholder. The bound client accepts only
+        // its persisted model and parameters, so replace both before the request crosses the
+        // Provider boundary.
+        request.model = binding.model.as_str().to_owned();
+        request.temperature = binding.parameters.temperature();
+        provider.complete(request).await
+    }
+}
+
 fn ensure_usable_credential(status: CredentialViewStatus) -> ProviderResult<()> {
     match status {
         CredentialViewStatus::Saved => Ok(()),
@@ -167,4 +257,24 @@ fn binding_error() -> ProviderManagementError {
         Some(ProviderField::Provider),
         ProviderRemediation::WaitForCurrentOperation,
     )
+}
+
+fn provider_to_core(error: ProviderManagementError) -> CoreError {
+    CoreError::validation(error.code(), error.code())
+}
+
+fn no_active_provider() -> CoreError {
+    provider_to_core(ProviderManagementError::new(
+        ProviderErrorCode::NoActiveProfile,
+        Some(ProviderField::Activation),
+        ProviderRemediation::ActivateAnotherProfile,
+    ))
+}
+
+fn stale_active_provider() -> CoreError {
+    provider_to_core(ProviderManagementError::new(
+        ProviderErrorCode::ValidationStale,
+        Some(ProviderField::Validation),
+        ProviderRemediation::ValidateProfile,
+    ))
 }

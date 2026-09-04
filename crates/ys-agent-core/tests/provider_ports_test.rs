@@ -229,6 +229,14 @@ impl ProfileRevisionRepository for FakeProviderProfileRepository {
 
 #[async_trait::async_trait]
 impl CredentialMutationRepository for FakeProviderProfileRepository {
+    async fn next_credential_generation(
+        &self,
+        _profile_id: ProfileId,
+        _kind: ys_agent_core::CredentialKind,
+    ) -> ProviderResult<CredentialGeneration> {
+        unavailable()
+    }
+
     async fn begin_credential_mutation(
         &self,
         _intent: CredentialMutationIntent,
@@ -419,7 +427,11 @@ impl OAuthConnectionService for FakeOAuthConnectionService {
         unavailable()
     }
 
-    async fn complete(&self, _operation_id: OperationId) -> ProviderResult<OAuthConnectionView> {
+    async fn complete(
+        &self,
+        _operation_id: OperationId,
+        _generation: CredentialGeneration,
+    ) -> ProviderResult<OAuthConnectionView> {
         unavailable()
     }
 
@@ -427,6 +439,7 @@ impl OAuthConnectionService for FakeOAuthConnectionService {
         &self,
         _profile_id: ProfileId,
         _operation_id: OperationId,
+        _generation: CredentialGeneration,
     ) -> ProviderResult<OAuthConnectionView> {
         unavailable()
     }

@@ -8,23 +8,25 @@ use std::{
 };
 
 use tempfile::TempDir;
-use ys_agent_adapters::credential::keyring::InMemoryCredentialVault;
+use ys_agent_adapters::credential::memory::InMemoryCredentialVault;
 use ys_agent_core::{
-    ActivateProfileRequest, ActivationPrecondition, ActiveProviderSnapshot, CompatibilityEvidence,
-    ContextManifest, CoreError, CoreResult, CredentialGeneration, CredentialKind, CredentialLease,
-    CredentialMutation, CredentialMutationIntent, CredentialMutationRequest,
-    CredentialProtectionStatus, CredentialVault, CredentialViewStatus, ModelCapabilities,
-    ModelProvider, ModelRequest, ModelResponse, OperationId, ProfileId, ProfileRevision,
-    ProtectedCredentialWrite, ProviderClientBinding, ProviderClientFactory,
-    ProviderCredentialReference, ProviderErrorCode, ProviderField, ProviderId,
-    ProviderManagementError, ProviderRemediation, ProviderResult, RunId, RunModelProviderResolver,
-    RunProviderBinding, RunProviderBindingRepository, RunProviderBindingSource, SecretValue,
-    ValidationCommit, ValidationCommitPrecondition, ValidationVersions,
+    ActivateProfileRequest, ActivationPrecondition, ActiveProviderSnapshot, AgentAction,
+    CompatibilityEvidence, ContextManifest, CoreError, CoreResult, CredentialGeneration,
+    CredentialKind, CredentialLease, CredentialMutation, CredentialMutationIntent,
+    CredentialMutationRequest, CredentialProtectionStatus, CredentialVault, CredentialViewStatus,
+    ModelCapabilities, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
+    ModelResponseFormat, ModelRole, ModelToolChoice, OperationId, ProfileId, ProfileRevision,
+    ProfileRevisionRepository, ProfileSummary, ProtectedCredentialWrite, ProviderClientBinding,
+    ProviderClientFactory, ProviderCredentialReference, ProviderErrorCode, ProviderField,
+    ProviderId, ProviderManagementError, ProviderRemediation, ProviderResult, RunId,
+    RunModelProviderResolver, RunProviderBinding, RunProviderBindingRepository,
+    RunProviderBindingSource, SaveProfileRevision, SecretValue, ValidationCommit,
+    ValidationCommitPrecondition, ValidationVersions,
 };
 use ys_agent_runtime::{
     ActiveRunProviderBindingSource,
     provider::{
-        resolver::RunBoundProviderResolver,
+        resolver::{ActiveProfileModelProvider, RunBoundProviderResolver},
         service::{CredentialService, ProviderManagementService},
     },
 };
@@ -36,6 +38,48 @@ mod provider_fixture;
 struct Bindings {
     values: HashMap<RunId, RunProviderBinding>,
     statuses: HashMap<CredentialGeneration, CredentialViewStatus>,
+}
+
+struct ActiveProfiles {
+    active: ActiveProviderSnapshot,
+    revision: ProfileRevision,
+}
+
+#[async_trait::async_trait]
+impl ProfileRevisionRepository for ActiveProfiles {
+    async fn list_profiles(&self) -> ProviderResult<Vec<ProfileSummary>> {
+        unreachable!("active conversation resolution does not list Profiles")
+    }
+
+    async fn load_current_revision(
+        &self,
+        profile_id: ProfileId,
+    ) -> ProviderResult<ProfileRevision> {
+        self.load_revision(profile_id, self.revision.revision())
+            .await
+    }
+
+    async fn load_revision(
+        &self,
+        profile_id: ProfileId,
+        revision: u64,
+    ) -> ProviderResult<ProfileRevision> {
+        if profile_id == self.revision.profile_id() && revision == self.revision.revision() {
+            return Ok(self.revision.clone());
+        }
+        Err(missing_binding())
+    }
+
+    async fn save_revision(
+        &self,
+        _request: SaveProfileRevision,
+    ) -> ProviderResult<ProfileRevision> {
+        unreachable!("active conversation resolution does not save Profiles")
+    }
+
+    async fn active(&self) -> ProviderResult<Option<ActiveProviderSnapshot>> {
+        Ok(Some(self.active.clone()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -160,6 +204,53 @@ impl ModelProvider for TestProvider {
     }
 }
 
+#[derive(Default)]
+struct ConversationProvider {
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for ConversationProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> CoreResult<ModelResponse> {
+        self.requests
+            .lock()
+            .expect("conversation request state")
+            .push(request);
+        Ok(ModelResponse {
+            action: AgentAction::Respond {
+                message: "你好，我可以聊天。".to_owned(),
+            },
+            raw_content: None,
+            usage: None,
+        })
+    }
+}
+
+struct ConversationFactory {
+    provider: Arc<ConversationProvider>,
+    bindings: Mutex<Vec<ProviderClientBinding>>,
+}
+
+#[async_trait::async_trait]
+impl ProviderClientFactory for ConversationFactory {
+    async fn build(
+        &self,
+        binding: ProviderClientBinding,
+        credential: CredentialLease,
+    ) -> ProviderResult<Arc<dyn ModelProvider>> {
+        credential.with_secret(|_| ());
+        self.bindings
+            .lock()
+            .expect("conversation binding state")
+            .push(binding);
+        Ok(self.provider.clone())
+    }
+}
+
 #[async_trait::async_trait]
 impl ProviderClientFactory for Factory {
     async fn build(
@@ -178,7 +269,7 @@ impl ProviderClientFactory for Factory {
     }
 }
 
-fn binding(run_id: RunId, profile_id: ProfileId, generation: u64) -> RunProviderBinding {
+fn ready_revision(profile_id: ProfileId, generation: u64) -> ProfileRevision {
     let credential = CredentialGeneration::new(
         profile_id,
         generation,
@@ -200,6 +291,11 @@ fn binding(run_id: RunId, profile_id: ProfileId, generation: u64) -> RunProvider
     revision
         .accept_validation(evidence, versions)
         .expect("ready revision");
+    revision
+}
+
+fn binding(run_id: RunId, profile_id: ProfileId, generation: u64) -> RunProviderBinding {
+    let revision = ready_revision(profile_id, generation);
     RunProviderBinding::from_active(
         run_id,
         ActiveProviderSnapshot::from_ready(&revision, 1).expect("active snapshot"),
@@ -221,6 +317,70 @@ fn missing_credential() -> ProviderManagementError {
         Some(ProviderField::Credential),
         ProviderRemediation::ConfigureCredentialStore,
     )
+}
+
+#[tokio::test]
+async fn active_profile_provider_uses_the_active_model_for_a_conversation() {
+    let profile_id = ProfileId::new();
+    let revision = ready_revision(profile_id, 1);
+    let credential = revision
+        .credential_generation()
+        .expect("ready revision credential");
+    let vault = Arc::new(Vault::default());
+    vault.save(credential);
+    let provider = Arc::new(ConversationProvider::default());
+    let factory = Arc::new(ConversationFactory {
+        provider: provider.clone(),
+        bindings: Mutex::new(Vec::new()),
+    });
+    let model = ActiveProfileModelProvider::new(
+        Arc::new(ActiveProfiles {
+            active: ActiveProviderSnapshot::from_ready(&revision, 1).expect("active snapshot"),
+            revision,
+        }),
+        vault,
+        factory.clone(),
+    );
+
+    let response = model
+        .complete(ModelRequest {
+            model: "bootstrap-placeholder".to_owned(),
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                content: "你好".to_owned(),
+                tool_call_id: None,
+                name: None,
+                assistant_tool_call: None,
+            }],
+            tools: Vec::new(),
+            context_manifest: ContextManifest::empty(1_024),
+            temperature: Some(0.0),
+            tool_choice: ModelToolChoice::None,
+            response_format: ModelResponseFormat::JsonObject,
+        })
+        .await
+        .expect("active Provider conversation");
+
+    assert!(matches!(response.action, AgentAction::Respond { .. }));
+    let request = provider
+        .requests
+        .lock()
+        .expect("conversation request state")
+        .pop()
+        .expect("bound Provider received the request");
+    assert_eq!(request.model, "deepseek/resolver-model");
+    assert_eq!(request.temperature, None);
+    assert_eq!(
+        factory
+            .bindings
+            .lock()
+            .expect("conversation binding state")
+            .as_slice(),
+        &[
+            ProviderClientBinding::from_revision(&ready_revision(profile_id, 1))
+                .expect("client binding")
+        ]
+    );
 }
 
 #[tokio::test]
@@ -472,6 +632,8 @@ async fn exercise_rotated_run_bindings() {
             tools: Vec::new(),
             context_manifest: ContextManifest::empty(1),
             temperature: None,
+            tool_choice: ys_agent_core::ModelToolChoice::None,
+            response_format: ys_agent_core::ModelResponseFormat::JsonObject,
         })
         .await
         .expect_err("a Provider failure must remain visible rather than route Run A elsewhere");

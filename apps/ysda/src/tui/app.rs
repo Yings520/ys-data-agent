@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -182,6 +182,7 @@ pub(super) struct HeaderView<'a> {
     #[allow(dead_code)]
     pub query_state: QueryDisplayState,
     pub current_model: &'a str,
+    pub active_model_available: bool,
     pub context_unavailable: bool,
 }
 
@@ -201,6 +202,7 @@ pub struct TuiApp {
     pub doctor_report: Option<DoctorReport>,
     pub focused_task: Option<TaskSummary>,
     pub transcript: Vec<TranscriptItem>,
+    transcript_error_fingerprints: BTreeSet<String>,
     pub runtime_status: Option<String>,
     pub primary_artifact_id: Option<ArtifactId>,
     pub rendered_answer_artifact_id: Option<ArtifactId>,
@@ -248,6 +250,7 @@ impl TuiApp {
             doctor_report: None,
             focused_task: None,
             transcript: Vec::new(),
+            transcript_error_fingerprints: BTreeSet::new(),
             runtime_status: None,
             primary_artifact_id: None,
             rendered_answer_artifact_id: None,
@@ -320,6 +323,12 @@ impl TuiApp {
             && self.header.active_model_available
     }
 
+    /// Chat needs only an active Provider. Datasource readiness remains a separate requirement
+    /// for governed Query Runs.
+    pub fn conversation_submission_enabled(&self) -> bool {
+        self.header.active_model_available
+    }
+
     pub fn apply_display_context(&mut self, context: TuiDisplayContext) {
         self.header.workspace = context.workspace_display_name().to_owned();
         self.header.datasource = match context.datasource() {
@@ -380,6 +389,7 @@ impl TuiApp {
             query: &self.header.query,
             query_state: self.header.query_state,
             current_model: &self.header.current_model,
+            active_model_available: self.header.active_model_available,
             context_unavailable: self.header.context_unavailable,
         }
     }
@@ -446,8 +456,29 @@ impl TuiApp {
     }
 
     pub fn push_transcript(&mut self, item: TranscriptItem) {
+        match &item {
+            TranscriptItem::UserMessage(_)
+            | TranscriptItem::Answer(_)
+            | TranscriptItem::Clarification { .. } => self.begin_transcript_attempt(),
+            TranscriptItem::Error(message) => {
+                if !self
+                    .transcript_error_fingerprints
+                    .insert(transcript_error_fingerprint(message))
+                {
+                    return;
+                }
+            }
+            TranscriptItem::Warning(_) => {}
+        }
         self.transcript.push(item);
         self.scroll = u16::MAX;
+    }
+
+    /// Start a new user-visible action. Repeated status observations within one action should not
+    /// fill the transcript with the same provider failure, while an explicit retry may show its
+    /// own outcome.
+    pub fn begin_transcript_attempt(&mut self) {
+        self.transcript_error_fingerprints.clear();
     }
 
     pub fn set_runtime_status(&mut self, status: impl Into<String>) {
@@ -473,6 +504,28 @@ impl TuiApp {
             Err(error) => self.safe_warning = Some(error.code().to_owned()),
         }
     }
+}
+
+fn transcript_error_fingerprint(message: &str) -> String {
+    let stable_code = message
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
+        })
+        .map(|token| token.trim_end_matches('.'))
+        .find(|token| {
+            let Some((namespace, remainder)) = token.split_once('.') else {
+                return false;
+            };
+            !namespace.is_empty()
+                && !remainder.is_empty()
+                && namespace
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase())
+        });
+    stable_code.map_or_else(
+        || format!("message:{message}"),
+        |code| format!("code:{code}"),
+    )
 }
 
 /// Maps typed terminal actions onto the single AgentService boundary.
@@ -1062,6 +1115,7 @@ impl TuiController {
                 "The current Provider screen state does not allow this operation",
             ));
         }
+        app.begin_transcript_attempt();
         refresh_provider_detail(app, screen);
         Ok(operation_id)
     }
@@ -1389,7 +1443,7 @@ impl TuiController {
                     .complete_operation(completion.operation_id, ProviderResultOutcome::Succeeded);
                 screen.apply_active_provider(active.clone());
                 app.apply_active_provider_view(Some(&active));
-                app.set_runtime_status("Model ready for new queries");
+                app.set_runtime_status("Model ready for chat");
                 refresh_doctor = true;
                 activated = Some(active);
             }
@@ -2032,7 +2086,10 @@ impl TuiController {
                     self.request_doctor_refresh();
                 }
                 Err(error) => {
-                    app.set_runtime_status(format!("Model activation failed · {}", error.code()));
+                    app.set_runtime_status(format!(
+                        "Model activation failed · {} · Press Enter to retry",
+                        error.code()
+                    ));
                     self.refresh_candidates_after_model_mutation(app);
                 }
             }
@@ -2252,13 +2309,10 @@ impl TuiController {
         app: &mut TuiApp,
         text: String,
     ) -> ys_agent_core::CoreResult<()> {
-        if !app.query_submission_enabled() {
+        if !app.conversation_submission_enabled() {
             app.transient = None;
-            let message = if !app.header.active_model_available {
-                "No active LLM model configured. Use /model to choose a Provider and model."
-            } else {
-                "Datasource setup is incomplete. Configure a read-only datasource before asking a question."
-            };
+            let message =
+                "No active LLM model configured. Use /model to choose a Provider and model.";
             app.push_transcript(TranscriptItem::Warning(message.to_owned()));
             return Ok(());
         }
@@ -2332,6 +2386,10 @@ impl TuiController {
         app.timeline_state.apply_service_reply(&reply);
         match reply {
             ServiceReply::Conversation { message } => {
+                // A direct chat reply is deliberately not a governed Run. Remove the provisional
+                // question used while waiting so the timeline never fabricates an execution
+                // trace for a simple conversation.
+                app.timeline_state = TimelineState::default();
                 app.push_transcript(TranscriptItem::Answer(AnswerView {
                     state: "Chat".to_owned(),
                     conclusion: message,
@@ -2917,17 +2975,20 @@ fn provider_management_lines(
     lines
 }
 
-fn provider_error_message(error: &ProviderManagementError) -> &'static str {
-    match error.code() {
+fn provider_error_message(error: &ProviderManagementError) -> String {
+    let message = match error.code() {
         "provider.operation.stale" => "Sign-in state changed before it could finish",
         "provider.oauth.not_connected" => "Browser sign-in was not completed",
         "provider.credential.missing" => "A credential is required to continue",
+        "provider.storage.conflict" => "Credential state conflict",
+        "provider.protocol.invalid_response" => "Provider returned an incompatible response",
         "provider.discovery.failed" | "provider.discovery.empty" => {
             "Could not load the online model list"
         }
         "provider.timeout" => "The provider did not respond in time",
         _ => "Could not continue with these provider settings",
-    }
+    };
+    format!("{message} · {}", error.code())
 }
 
 fn provider_display_name(
@@ -3286,7 +3347,7 @@ mod provider_management_tests {
     use async_trait::async_trait;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ys_agent_adapters::{
-        credential::keyring::InMemoryCredentialVault,
+        credential::memory::InMemoryCredentialVault,
         model::{discovery::LiterModelDiscovery, liter::LiterProviderFactory},
     };
     use ys_agent_core::{
@@ -3319,6 +3380,29 @@ mod provider_management_tests {
             .expect_err("a new revision invalidates the completed validation");
         assert_eq!(error.code(), "provider.operation.stale");
         assert_eq!(error.field(), Some(&ProviderField::Validation));
+    }
+
+    #[test]
+    fn provider_setup_failures_keep_the_safe_stable_error_code_visible() {
+        let storage = ProviderManagementError::new(
+            ProviderErrorCode::StorageConflict,
+            Some(ProviderField::Credential),
+            ProviderRemediation::ReturnToEdit,
+        );
+        assert_eq!(
+            provider_error_message(&storage),
+            "Credential state conflict · provider.storage.conflict"
+        );
+
+        let protocol = ProviderManagementError::new(
+            ProviderErrorCode::ProtocolInvalidResponse,
+            Some(ProviderField::Validation),
+            ProviderRemediation::ValidateProfile,
+        );
+        assert_eq!(
+            provider_error_message(&protocol),
+            "Provider returned an incompatible response · provider.protocol.invalid_response"
+        );
     }
 
     struct SequenceDisplayContextSource {
@@ -4589,6 +4673,31 @@ mod event_timeline_tests {
         };
         app.apply_active_provider_view(Some(&active));
         assert!(app.query_submission_enabled());
+    }
+
+    #[test]
+    fn conversation_readiness_requires_only_an_authoritative_active_model() {
+        let mut app = TuiApp::for_principal(Principal::local_operator("chat-readiness-test"));
+        app.doctor_report = Some(DoctorReport {
+            blocker_codes: vec!["connector_unavailable".to_owned()],
+            warning_codes: Vec::new(),
+            ready_capabilities: Vec::new(),
+            repairs: vec!["Configure a datasource".to_owned()],
+        });
+        let active = ActiveProviderView {
+            activation_revision: 1,
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            provider: ProviderId::DeepSeek,
+            model: ys_agent_core::ProviderModelId::new(ProviderId::DeepSeek, "deepseek/ready")
+                .expect("model"),
+            parameters: ys_agent_core::ProviderParameters::default(),
+        };
+
+        app.apply_active_provider_view(Some(&active));
+
+        assert!(!app.query_submission_enabled());
+        assert!(app.conversation_submission_enabled());
     }
 
     #[test]

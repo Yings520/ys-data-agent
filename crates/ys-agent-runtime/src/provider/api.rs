@@ -337,7 +337,13 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
                 credential_status,
                 &catalog_view.support_status,
             );
-            if !revision.model().is_setup_pending() {
+            // A ChatGPT Subscription model list is account-scoped and authoritative.  Do not
+            // surface a stale draft (for example the old built-in codex-mini-latest) ahead of
+            // the models the signed-in account can actually use.  If directory discovery is
+            // unavailable we still retain the saved revision below as a safe offline fallback.
+            let uses_account_model_directory =
+                provider == ys_agent_core::ProviderId::ChatGptSubscription;
+            if !uses_account_model_directory && !revision.model().is_setup_pending() {
                 candidates.push(model_candidate_view(
                     summary.profile_id,
                     revision.revision(),
@@ -375,8 +381,79 @@ impl ProviderManagementApi for InProcessProviderManagementApi {
             )
             .await;
             let Ok(Ok(discovered)) = discovered else {
+                if uses_account_model_directory && !revision.model().is_setup_pending() {
+                    candidates.push(model_candidate_view(
+                        summary.profile_id,
+                        revision.revision(),
+                        expected_activation_revision,
+                        provider,
+                        revision.model().clone(),
+                        &summary.name,
+                        saved_status,
+                        current,
+                    )?);
+                }
                 continue;
             };
+            if uses_account_model_directory {
+                let discovered_models = discovered
+                    .into_iter()
+                    .filter_map(|discovered| {
+                        let status = if discovered.context_limit.is_some_and(|limit| limit > 0) {
+                            ModelCandidateStatus::NeedsValidation
+                        } else {
+                            ModelCandidateStatus::Unavailable
+                        };
+                        ProviderModelId::new(provider, discovered.model)
+                            .ok()
+                            .map(|model| (model, status))
+                    })
+                    .collect::<Vec<_>>();
+                let saved_model_is_listed = discovered_models
+                    .iter()
+                    .any(|(model, _)| model == revision.model());
+
+                for (model, discovered_status) in discovered_models {
+                    let is_saved_model = model == *revision.model();
+                    candidates.push(model_candidate_view(
+                        summary.profile_id,
+                        revision.revision(),
+                        expected_activation_revision,
+                        provider,
+                        model,
+                        &summary.name,
+                        if is_saved_model {
+                            saved_status
+                        } else {
+                            discovered_status
+                        },
+                        if is_saved_model {
+                            current
+                        } else {
+                            SelectionCurrentStatus::NotCurrent
+                        },
+                    )?);
+                }
+
+                // Keep a currently active model renderable even if the service stops listing it,
+                // but never let an inactive draft masquerade as an account-supported model.
+                if !revision.model().is_setup_pending()
+                    && !saved_model_is_listed
+                    && current.is_current()
+                {
+                    candidates.push(model_candidate_view(
+                        summary.profile_id,
+                        revision.revision(),
+                        expected_activation_revision,
+                        provider,
+                        revision.model().clone(),
+                        &summary.name,
+                        saved_status,
+                        current,
+                    )?);
+                }
+                continue;
+            }
             let mut seen_models = if revision.model().is_setup_pending() {
                 HashSet::new()
             } else {
@@ -1006,7 +1083,10 @@ fn internal_error() -> ProviderManagementError {
 
 fn codec_version(provider: ys_agent_core::ProviderId) -> &'static str {
     match provider {
-        ys_agent_core::ProviderId::ChatGptSubscription => "chatgpt-responses-v1",
+        // Codex subscription responses are assembled from its native SSE item events rather
+        // than decoded as a public Responses `response.completed` object. Bump this marker so
+        // compatibility evidence produced by the old, incompatible decoder is never reused.
+        ys_agent_core::ProviderId::ChatGptSubscription => "chatgpt-codex-sse-v2",
         _ => "liter-chat-v1",
     }
 }

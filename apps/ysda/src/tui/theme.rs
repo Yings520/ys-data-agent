@@ -239,7 +239,7 @@ impl Default for ThemeRegistry {
                 "deep-navy",
                 [
                     "#071423", "#101D2E", "#202A38", "#224B79", "#C5CAD3", "#7E8999", "#4389E6",
-                    "#66BAD9", "#E0B866", "#E06C75",
+                    "#77F5A7", "#E0B866", "#E06C75",
                 ],
             ),
             (
@@ -380,7 +380,7 @@ mod tests {
             .expect("preset");
         assert_eq!(theme.background, Color::Rgb(0x07, 0x14, 0x23));
         assert_eq!(theme.accent, Color::Rgb(0x43, 0x89, 0xE6));
-        assert_eq!(theme.success, Color::Rgb(0x66, 0xBA, 0xD9));
+        assert_eq!(theme.success, Color::Rgb(0x77, 0xF5, 0xA7));
     }
 
     #[test]
