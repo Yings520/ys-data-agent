@@ -1,3 +1,6 @@
+#[path = "../../ys-agent-core/tests/support/datasource.rs"]
+mod datasource_support;
+
 use std::{fs, path::Path};
 
 use rusqlite::Connection;
@@ -1585,6 +1588,7 @@ async fn create_run(store: &SqliteRuntimeStore, snapshot: RunSnapshot) -> Create
     CreateRunCommand::new(
         snapshot,
         RunProviderBinding::from_active(run_id, active).expect("test Run binding"),
+        datasource_support::datasource_binding(run_id),
         Vec::new(),
     )
     .expect("complete Run create command")

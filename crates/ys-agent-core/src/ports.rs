@@ -29,6 +29,7 @@ use crate::{
 pub struct CreateRunCommand {
     snapshot: RunSnapshot,
     provider_binding: RunProviderBinding,
+    datasource_binding: crate::RunDatasourceBinding,
     initial_events: Vec<PendingRunEvent>,
 }
 
@@ -43,12 +44,20 @@ impl CreateRunCommand {
     pub fn new(
         snapshot: RunSnapshot,
         provider_binding: RunProviderBinding,
+        datasource_binding: crate::RunDatasourceBinding,
         initial_events: Vec<PendingRunEvent>,
     ) -> CoreResult<Self> {
         if snapshot.run_id != provider_binding.run_id() {
             return Err(CoreError::validation(
                 "run_provider_binding_mismatch",
                 "a Run creation binding must belong to the Run being created",
+            ));
+        }
+        datasource_binding.validate_supported()?;
+        if snapshot.run_id != datasource_binding.run_id() {
+            return Err(CoreError::validation(
+                "run_datasource_binding_mismatch",
+                "a datasource binding must belong to the Run being created",
             ));
         }
         if initial_events
@@ -73,6 +82,7 @@ impl CreateRunCommand {
         Ok(Self {
             snapshot,
             provider_binding,
+            datasource_binding,
             initial_events: events,
         })
     }
@@ -83,6 +93,10 @@ impl CreateRunCommand {
 
     pub fn provider_binding(&self) -> &RunProviderBinding {
         &self.provider_binding
+    }
+
+    pub fn datasource_binding(&self) -> &crate::RunDatasourceBinding {
+        &self.datasource_binding
     }
 
     pub fn initial_events(&self) -> &[PendingRunEvent] {

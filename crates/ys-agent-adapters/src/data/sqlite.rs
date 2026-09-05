@@ -54,6 +54,8 @@ impl SqliteConnector {
             freshness_reader: true,
             supports_explain: false,
             supports_read_only_tx: false,
+            preflight_reader: true,
+            read_only_mechanism: Some(ys_agent_core::ReadOnlyMechanism::FileReadOnly),
             max_concurrency: self.config.max_concurrency,
         }
     }

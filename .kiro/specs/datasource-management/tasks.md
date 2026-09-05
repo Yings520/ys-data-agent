@@ -6,7 +6,7 @@
 
 实现以 design.md 的 File Structure Plan 和指定 Datus 参考映射为准。顺序任务共享契约、驱动文件和组合根，不声明并行。按用户要求合并有同一交付成果的实施与测试；跨层工作明确标为集成任务，不再拆字段、接口或单独测试任务。
 
-- [ ] 1. 固定数据源身份与统一连接契约
+- [x] 1. 固定数据源身份与统一连接契约
   - 定义 Profile/revision、DatabaseContext、Credential 引用、验证证据、Capability、管理请求/错误和 Run binding；区分 Draft 与非法输入、当前与默认，保留旧 revision 身份。
   - 声明 Service、Repository、Vault、Factory、Manager resolver 接缝及双 binding Run 创建契约；适配现有构造调用以维持编译，不填入可绕过生产门禁的默认 binding。
   - 完成态：身份、版本、秘密类型和状态不变量测试通过；上下层能针对同一契约实现，既有 Provider 契约保持有效。

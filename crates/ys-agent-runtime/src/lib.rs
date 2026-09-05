@@ -32,8 +32,8 @@ pub use service::{
     DatasourceDisplayState, DatasourceUnavailableReason, EventSubscription, InProcessAgentService,
     NoopRunScheduler, QueryDisplayState, QueryNonSuccessReason, QueryResultPreviewView,
     RunScheduler, SendMessageRequest, ServiceEvent, ServiceEventPublisher, ServiceReply,
-    StaticRunProviderBindingSource, TuiDisplayContext, TuiDisplayContextInput,
-    TuiDisplayContextSource, UnavailableRunProviderBindingSource,
+    StaticRunDatasourceBindingSource, StaticRunProviderBindingSource, TuiDisplayContext,
+    TuiDisplayContextInput, TuiDisplayContextSource, UnavailableRunProviderBindingSource,
 };
 pub use workflow::query::{
     ClarificationNeed, FreshnessState, MetricReference, ParameterKind, QUERY_SYSTEM_PROMPT_VERSION,

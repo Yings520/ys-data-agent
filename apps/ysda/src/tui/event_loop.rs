@@ -2315,6 +2315,9 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
             InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_run_datasource_binding_source(Arc::new(
+                    ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(workspace_id),
+                ))
                 .with_run_provider_binding_source(Arc::new(
                     StaticRunProviderBindingSource::for_test(),
                 )),
@@ -2465,6 +2468,9 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
             InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_run_datasource_binding_source(Arc::new(
+                    ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(workspace_id),
+                ))
                 .with_run_provider_binding_source(Arc::new(
                     StaticRunProviderBindingSource::for_test(),
                 ))
@@ -2568,6 +2574,9 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
             InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
+                .with_run_datasource_binding_source(Arc::new(
+                    ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(workspace_id),
+                ))
                 .with_run_provider_binding_source(Arc::new(
                     StaticRunProviderBindingSource::for_test(),
                 ))

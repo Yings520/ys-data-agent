@@ -92,6 +92,8 @@ impl PostgresConnector {
             freshness_reader: true,
             supports_explain: true,
             supports_read_only_tx: true,
+            preflight_reader: true,
+            read_only_mechanism: Some(ys_agent_core::ReadOnlyMechanism::TransactionReadOnly),
             max_concurrency: self.config.max_connections as usize,
         }
     }

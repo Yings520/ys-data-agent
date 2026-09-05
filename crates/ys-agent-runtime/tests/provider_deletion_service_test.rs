@@ -1,3 +1,6 @@
+#[path = "../../ys-agent-core/tests/support/datasource.rs"]
+mod datasource_support;
+
 use std::sync::Arc;
 
 use tempfile::TempDir;
@@ -104,6 +107,7 @@ async fn create_nonterminal_run(
                 CreateRunCommand::new(
                     snapshot,
                     binding,
+                    datasource_support::datasource_binding(run.id),
                     vec![PendingRunEvent {
                         actor: EventActor::System,
                         kind: RunEventKind::RunStarted,

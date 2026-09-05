@@ -1341,6 +1341,9 @@ pub async fn assemble_deterministic_query_runtime(
     });
     let service: Arc<dyn AgentServiceApi> = Arc::new(
         InProcessAgentService::new(workspace_id, runtime_store, artifact_store, scheduler)
+            .with_run_datasource_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(workspace_id),
+            ))
             .with_run_provider_binding_source(Arc::new(
                 StaticRunProviderBindingSource::from_active(active_provider),
             )),
@@ -1515,7 +1518,13 @@ fn query_phase_name(phase: QueryPhase) -> &'static str {
 }
 
 fn resolve_env_reference(reference: &CredentialReference) -> CoreResult<String> {
-    nonempty_env(reference.environment_variable_name()).ok_or_else(|| {
+    let name = reference.environment_variable_name().ok_or_else(|| {
+        CoreError::validation(
+            "invalid_credential_reference",
+            "this configuration requires an environment reference",
+        )
+    })?;
+    nonempty_env(name).ok_or_else(|| {
         CoreError::validation(
             "required_config_missing",
             "a required environment value is missing",

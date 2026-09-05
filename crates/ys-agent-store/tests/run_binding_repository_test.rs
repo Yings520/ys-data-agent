@@ -1,3 +1,6 @@
+#[path = "../../ys-agent-core/tests/support/datasource.rs"]
+mod datasource_support;
+
 use rusqlite::Connection;
 use tempfile::TempDir;
 use ys_agent_core::{
@@ -141,6 +144,7 @@ fn create_batch(task: Option<Task>, run: &Run, binding: RunProviderBinding) -> R
             CreateRunCommand::new(
                 snapshot,
                 binding,
+                datasource_support::datasource_binding(run.id),
                 vec![PendingRunEvent {
                     actor: ys_agent_core::EventActor::System,
                     kind: RunEventKind::RunStarted,

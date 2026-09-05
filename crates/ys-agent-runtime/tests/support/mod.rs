@@ -311,6 +311,9 @@ impl QueryWorkflowFixture {
                 artifacts.clone(),
                 Arc::new(ys_agent_runtime::NoopRunScheduler),
             )
+            .with_run_datasource_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(workspace_id),
+            ))
             .with_run_provider_binding_source(Arc::new(
                 ys_agent_runtime::StaticRunProviderBindingSource::from_active(active_provider),
             )),
@@ -1368,6 +1371,9 @@ async fn open_runtime_components(
             artifacts,
             Arc::new(ys_agent_runtime::NoopRunScheduler),
         )
+        .with_run_datasource_binding_source(Arc::new(
+            ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(workspace_id),
+        ))
         .with_run_provider_binding_source(Arc::new(
             ys_agent_runtime::StaticRunProviderBindingSource::from_active(active_provider),
         )),

@@ -2,6 +2,7 @@ mod artifact;
 mod command;
 mod connector;
 mod context;
+mod datasource;
 mod error;
 mod event;
 mod identity;
@@ -26,11 +27,27 @@ pub use command::{CommandReceipt, CommandResultKind};
 pub use connector::{
     CapabilityDescriptor, CellValue, CredentialReference, FreshnessObservation, ObservedColumn,
     ObservedRelation, ObservedSchema, QueryCostEstimate, QueryPreflight, QueryPreflightDecision,
-    QueryRequest, QueryResult, SchemaKnowledgeKind, SourceId,
+    QueryRequest, QueryResult, ReadOnlyMechanism, SchemaKnowledgeKind, SourceId,
 };
 
 pub use context::{
     ContextEvidence, ContextManifest, ContextOmission, ContextSourceType, InstructionTrust,
+};
+pub use datasource::{
+    AdapterId, AdapterVersion, ConnectorCatalog, ConnectorDescriptor, ConnectorFactory,
+    ConnectorOpenInput, ConnectorSupport, DatabaseContext, DatasourceChange, DatasourceCommit,
+    DatasourceDetail, DatasourceDigest, DatasourceDoctorReport, DatasourceDoctorRequest,
+    DatasourceField, DatasourceGovernanceContext, DatasourceHeader, DatasourceManagementApi,
+    DatasourceName, DatasourceProfile, DatasourceReceipt, DatasourceRepository, DatasourceRevision,
+    DatasourceRevisionId, DatasourceRevisionInput, DatasourceScope, DatasourceSecretRef,
+    DatasourceSelectionKind, DatasourceSnapshot, DatasourceValidationInputs, DatasourceVault,
+    DatasourceView, DatasourceWriteContext, DeleteDatasource, DeleteDatasourceDisposition, DsError,
+    DsErrorCode, DsRemediation, DsResult, FieldId, FieldInput, FieldIssue, FieldIssueCode,
+    FieldValue, ManagedConnector, ProbeEvidence, ProtectionStatus, ResolvedRunDatasource,
+    RevisionState, RunDatasourceBinding, RunDatasourceBindingSource, RunDatasourceContext,
+    RunDatasourceResolver, SaveDatasource, SecretEdit, SecretLease, SecretMutation,
+    SecretMutationPhase, SelectDatasource, SelectionSnapshot, ValidateDatasource,
+    ValidationEvidence, ValidationMode, ValidationReport, validate_datasource_fields,
 };
 pub use error::{CoreError, CoreResult};
 pub use event::{

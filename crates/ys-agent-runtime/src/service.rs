@@ -675,12 +675,109 @@ pub struct InProcessAgentService {
     front_door: Option<FrontDoorAgent>,
     query_submission_disabled_message: Option<String>,
     run_provider_bindings: Arc<dyn RunProviderBindingSource>,
+    run_datasource_bindings: Option<Arc<dyn ys_agent_core::RunDatasourceBindingSource>>,
     provider_management: Option<Arc<dyn ProviderManagementApi>>,
     tui_display_context_source: Arc<dyn TuiDisplayContextSource>,
 }
 
 #[derive(Debug, Default)]
 pub struct UnavailableRunProviderBindingSource;
+
+/// Explicit deterministic assembly for contract tests and Replay only. Production leaves the
+/// datasource source absent until the management service supplies a durable selection.
+pub struct StaticRunDatasourceBindingSource {
+    scope: ys_agent_core::DatasourceScope,
+    revision: ys_agent_core::DatasourceRevision,
+    evidence: ys_agent_core::ValidationEvidence,
+}
+
+impl StaticRunDatasourceBindingSource {
+    pub fn for_test(workspace_id: WorkspaceId) -> Self {
+        use ys_agent_core::*;
+        let source = SourceId::new("fixture");
+        let revision = DatasourceRevision::new(DatasourceRevisionInput {
+            schema_version: 1,
+            workspace_id,
+            profile_id: ProfileId::new(),
+            revision: 1,
+            adapter_id: "sqlite".try_into().expect("test adapter"),
+            adapter_version: "test".try_into().expect("test version"),
+            config_version: 1,
+            source_id: Some(source.clone()),
+            fields: Default::default(),
+            context: DatabaseContext::Database {
+                catalog: None,
+                database: "fixture".into(),
+                schema: "main".into(),
+            },
+            credential: None,
+        })
+        .expect("test revision");
+        let capability = CapabilityDescriptor {
+            source_id: source,
+            dialect: "sqlite".into(),
+            catalog_reader: true,
+            sql_query_executor: true,
+            freshness_reader: true,
+            supports_explain: false,
+            supports_read_only_tx: false,
+            max_concurrency: 1,
+            preflight_reader: true,
+            read_only_mechanism: Some(ReadOnlyMechanism::FileReadOnly),
+        };
+        let inputs = DatasourceValidationInputs::new(
+            &revision,
+            &capability,
+            DatasourceDigest::of(&"test-policy").expect("test policy"),
+        )
+        .expect("test inputs");
+        let evidence = ValidationEvidence::new(
+            inputs,
+            "test".try_into().expect("test version"),
+            ProbeEvidence {
+                authenticated: true,
+                target_verified: true,
+                read_only_verified: true,
+                least_privilege_verified: true,
+                capabilities_verified: true,
+            },
+            chrono::Utc::now(),
+        )
+        .expect("test evidence");
+        Self {
+            scope: DatasourceScope {
+                workspace_id,
+                session_id: SessionId::new(),
+            },
+            revision,
+            evidence,
+        }
+    }
+}
+
+#[async_trait]
+impl ys_agent_core::RunDatasourceBindingSource for StaticRunDatasourceBindingSource {
+    async fn bind_new_run(
+        &self,
+        run_id: RunId,
+        scope: Option<ys_agent_core::DatasourceScope>,
+    ) -> ys_agent_core::DsResult<ys_agent_core::RunDatasourceBinding> {
+        ys_agent_core::RunDatasourceBinding::from_validated(
+            run_id,
+            scope.unwrap_or(self.scope),
+            1,
+            &self.revision,
+            &self.evidence,
+            self.evidence.inputs(),
+        )
+        .map_err(|_| ys_agent_core::DsError {
+            code: ys_agent_core::DsErrorCode::ValidationStale,
+            field: None,
+            remediation: ys_agent_core::DsRemediation::Revalidate,
+            operation_id: None,
+        })
+    }
+}
 
 #[async_trait]
 impl RunProviderBindingSource for UnavailableRunProviderBindingSource {
@@ -930,6 +1027,7 @@ impl InProcessAgentService {
             front_door: None,
             query_submission_disabled_message: None,
             run_provider_bindings: Arc::new(UnavailableRunProviderBindingSource),
+            run_datasource_bindings: None,
             provider_management: None,
             tui_display_context_source: Arc::new(UnconfiguredTuiDisplayContextSource),
         }
@@ -967,6 +1065,14 @@ impl InProcessAgentService {
         source: Arc<dyn RunProviderBindingSource>,
     ) -> Self {
         self.run_provider_bindings = source;
+        self
+    }
+
+    pub fn with_run_datasource_binding_source(
+        mut self,
+        source: Arc<dyn ys_agent_core::RunDatasourceBindingSource>,
+    ) -> Self {
+        self.run_datasource_bindings = Some(source);
         self
     }
 
@@ -1230,8 +1336,26 @@ impl InProcessAgentService {
                 .bind_new_run(snapshot.run_id)
                 .await
                 .map_err(|error| CoreError::validation(error.code(), error.to_string()))?;
-            let create_run =
-                ys_agent_core::CreateRunCommand::new(snapshot.clone(), binding, events.clone())?;
+            let datasource = self
+                .run_datasource_bindings
+                .as_ref()
+                .ok_or_else(|| {
+                    CoreError::validation(
+                        "no_ready_datasource",
+                        "select a verified datasource before starting a Query",
+                    )
+                })?
+                .bind_new_run(snapshot.run_id, None)
+                .await
+                .map_err(|error| {
+                    CoreError::validation("datasource_binding_unavailable", error.to_string())
+                })?;
+            let create_run = ys_agent_core::CreateRunCommand::new(
+                snapshot.clone(),
+                binding,
+                datasource,
+                events.clone(),
+            )?;
             let result = self
                 .store
                 .commit_command(RuntimeCommandBatch {
