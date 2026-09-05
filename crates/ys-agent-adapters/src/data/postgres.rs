@@ -1,19 +1,29 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use futures::TryStreamExt;
 use serde_json::Value;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode};
 use sqlx::{AssertSqlSafe, Column, PgPool, Postgres, Row, Transaction, TypeInfo, ValueRef};
 use ys_agent_core::{
     CapabilityDescriptor, CatalogReader, CellValue, CoreError, CoreResult, FreshnessObservation,
     FreshnessReader, ObservedColumn, ObservedRelation, ObservedSchema, QueryCostEstimate,
     QueryParameter, QueryPreflight, QueryPreflightDecision, QueryPreflightReader, QueryRequest,
     QueryResult, SchemaKnowledgeKind, SourceId, SqlQueryExecutor,
+};
+use ys_agent_core::{
+    ConnectorFactory, ConnectorOpenInput, DatabaseContext, DatasourceGovernanceContext,
+    DatasourceRevision, DsError, DsErrorCode, DsRemediation, DsResult, FieldId, FieldIssue,
+    FieldIssueCode, FieldValue, ManagedConnector, ProbeEvidence, QueryBudget,
+    validate_datasource_fields,
 };
 
 use super::result_policy::{
@@ -37,9 +47,91 @@ pub struct PostgresConnector {
     pool: PgPool,
     sql_policy: SqlReadOnlyPolicy,
     result_policy: ResultPolicy,
+    managed: Option<Arc<ManagedPostgresState>>,
+}
+
+struct ManagedPostgresState {
+    governance: DatasourceGovernanceContext,
+    database: String,
+    schema: String,
+    username: String,
+    closed: AtomicBool,
 }
 
 impl PostgresConnector {
+    async fn connect_managed(
+        config: PostgresConnectorConfig,
+        options: PgConnectOptions,
+        state: Arc<ManagedPostgresState>,
+    ) -> DsResult<Self> {
+        let default_timeout_ms = duration_millis(config.default_statement_timeout);
+        let pool = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .acquire_timeout(config.acquire_timeout)
+            .after_connect(move |connection, _metadata| {
+                Box::pin(async move {
+                    sqlx::query("SET default_transaction_read_only = on")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                        .bind(format!("{default_timeout_ms}ms"))
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await
+            .map_err(classify_connect_error)?;
+        Ok(Self {
+            sql_policy: SqlReadOnlyPolicy::new(
+                super::SupportedDialect::Postgres,
+                state.governance.budget.max_sql_bytes,
+            ),
+            result_policy: ResultPolicy::from_scope(&state.governance.data_scope),
+            config,
+            pool,
+            managed: Some(state),
+        })
+    }
+
+    fn managed_state(&self) -> CoreResult<&ManagedPostgresState> {
+        let state = self.managed.as_deref().ok_or_else(|| {
+            CoreError::validation("datasource_policy_denied", "managed operation required")
+        })?;
+        if state.closed.load(Ordering::Acquire) || self.pool.is_closed() {
+            return Err(CoreError::validation(
+                "datasource_closed",
+                "datasource operation rejected",
+            ));
+        }
+        Ok(state)
+    }
+
+    fn validate_managed_request(&self, request: &QueryRequest) -> CoreResult<QueryBudget> {
+        let state = self.managed_state()?;
+        if request.scope != state.governance.data_scope {
+            return Err(CoreError::validation(
+                "datasource_policy_denied",
+                "datasource operation rejected",
+            ));
+        }
+        let budget = limit_budget(&request.budget, &state.governance.budget);
+        if budget.max_sql_bytes == 0
+            || budget.statement_timeout_ms == 0
+            || budget.acquire_timeout_ms == 0
+            || budget.max_rows == 0
+            || budget.max_result_bytes == 0
+            || budget.max_concurrency == 0
+        {
+            return Err(CoreError::validation(
+                "datasource_timeout",
+                "datasource budget cannot be zero",
+            ));
+        }
+        Ok(budget)
+    }
+
     pub async fn connect(
         config: PostgresConnectorConfig,
         database_url: &str,
@@ -80,6 +172,7 @@ impl PostgresConnector {
             pool,
             sql_policy,
             result_policy,
+            managed: None,
         })
     }
 
@@ -99,7 +192,21 @@ impl PostgresConnector {
     }
 
     async fn build_preflight(&self, request: &QueryRequest) -> CoreResult<QueryPreflight> {
+        let effective;
+        let request = if self.managed.is_some() {
+            effective = {
+                let mut request = request.clone();
+                request.budget = self.validate_managed_request(&request)?;
+                request
+            };
+            &effective
+        } else {
+            request
+        };
         validate_request_source(&self.config.source_id, request)?;
+        if request.sql.len() > request.budget.max_sql_bytes {
+            return Ok(preflight_rejected(request, "sql_too_large"));
+        }
         let policy = self.sql_policy.evaluate(&request.sql, &request.scope);
         if policy.disposition == SqlPolicyDisposition::Rejected {
             return Ok(preflight_from_policy(request, &policy));
@@ -197,15 +304,20 @@ impl PostgresConnector {
     ) -> CoreResult<Transaction<'static, Postgres>> {
         let requested_timeout = Duration::from_millis(request.budget.acquire_timeout_ms);
         let timeout = requested_timeout.min(self.config.acquire_timeout);
-        tokio::time::timeout(timeout, self.pool.begin_with("BEGIN READ ONLY"))
-            .await
-            .map_err(|_| {
-                CoreError::validation(
-                    "connection_acquire_timeout",
-                    "timed out while acquiring a PostgreSQL connection",
-                )
-            })?
-            .map_err(|_| safe_database_error("begin read-only PostgreSQL transaction"))
+        let mut transaction =
+            tokio::time::timeout(timeout, self.pool.begin_with("BEGIN READ ONLY"))
+                .await
+                .map_err(|_| {
+                    CoreError::validation(
+                        "connection_acquire_timeout",
+                        "timed out while acquiring a PostgreSQL connection",
+                    )
+                })?
+                .map_err(|_| safe_database_error("begin read-only PostgreSQL transaction"))?;
+        if let Some(state) = &self.managed {
+            set_local_context(&mut transaction, &state.schema).await?;
+        }
+        Ok(transaction)
     }
 
     pub async fn cancel(&self, external_query_id: i32) -> CoreResult<bool> {
@@ -243,7 +355,7 @@ impl PostgresConnector {
         while let Some(row) = stream
             .try_next()
             .await
-            .map_err(|_| safe_database_error("stream PostgreSQL rows"))?
+            .map_err(|error| safe_query_error("stream PostgreSQL rows", &error))?
         {
             if columns.is_empty() {
                 columns = row
@@ -289,15 +401,30 @@ impl PostgresConnector {
 
     pub async fn execute_governed(
         &self,
-        request: QueryRequest,
+        mut request: QueryRequest,
         restricted_context: Option<&RestrictedResultContext>,
     ) -> CoreResult<GovernedQueryResult> {
+        if self.managed.is_some() {
+            request.budget = self.validate_managed_request(&request)?;
+        }
         validate_request_source(&self.config.source_id, &request)?;
+        if request.sql.len() > request.budget.max_sql_bytes {
+            return Err(CoreError::validation(
+                "sql_too_large",
+                "SQL exceeds the governed byte budget",
+            ));
+        }
         let policy_decision = self.sql_policy.evaluate(&request.sql, &request.scope);
         policy_decision.ensure_allowed()?;
 
+        let started = Instant::now();
         let mut transaction = self.begin_read_only(&request).await?;
-        set_local_statement_timeout(&mut transaction, request.budget.statement_timeout_ms).await?;
+        let remaining = Duration::from_millis(request.budget.statement_timeout_ms)
+            .checked_sub(started.elapsed())
+            .ok_or_else(|| {
+                CoreError::validation("datasource_timeout", "datasource operation timed out")
+            })?;
+        set_local_statement_timeout(&mut transaction, duration_millis(remaining)).await?;
         sqlx::query("SELECT set_config('application_name', $1, true)")
             .bind(safe_query_tag(&request.query_tag))
             .execute(&mut *transaction)
@@ -331,6 +458,247 @@ impl PostgresConnector {
     }
 }
 
+pub struct PostgresConnectorFactory;
+
+struct ManagedPostgresConfig {
+    host: String,
+    port: u16,
+    database: String,
+    schema: String,
+    username: String,
+    tls: PgSslMode,
+    source_id: SourceId,
+}
+
+#[async_trait]
+impl ConnectorFactory for PostgresConnectorFactory {
+    fn validate_config(&self, revision: &DatasourceRevision) -> Vec<FieldIssue> {
+        let descriptor =
+            super::catalog::builtin_descriptor("postgres").expect("static PostgreSQL descriptor");
+        let input = revision.input();
+        let mut issues = validate_datasource_fields(
+            &descriptor.fields,
+            &input.fields,
+            input.credential.is_some(),
+            true,
+        );
+        if input.adapter_id != descriptor.adapter_id
+            || input.adapter_version != descriptor.adapter_version
+            || input.config_version != descriptor.config_version
+            || parse_managed_config(revision).is_err()
+        {
+            issues.push(FieldIssue {
+                field: FieldId::new("host").expect("static field"),
+                code: FieldIssueCode::Invalid,
+            });
+        }
+        issues
+    }
+
+    async fn open(&self, input: ConnectorOpenInput) -> DsResult<Arc<dyn ManagedConnector>> {
+        if !self.validate_config(&input.revision).is_empty() {
+            return Err(ds_failure(DsErrorCode::InvalidField));
+        }
+        let parsed = parse_managed_config(&input.revision)?;
+        let reference = input
+            .revision
+            .input()
+            .credential
+            .ok_or_else(|| ds_failure(DsErrorCode::CredentialMissing))?;
+        let secret = input
+            .secret
+            .ok_or_else(|| ds_failure(DsErrorCode::CredentialMissing))?;
+        if secret.reference != reference {
+            return Err(ds_failure(DsErrorCode::CredentialExpired));
+        }
+        let revision = input.revision.input();
+        if revision.workspace_id != input.governance.data_scope.workspace_id
+            || parsed.source_id.as_str() != input.governance.data_scope.source_id
+            || input.governance.result_policy != input.governance.data_scope.relations
+            || input.governance.data_scope.relations.is_empty()
+            || !input.governance.allowed_roots.is_empty()
+            || input.governance.budget.max_concurrency == 0
+            || input.governance.budget.max_concurrency > 2
+            || !scope_matches_schema(&input.governance, &parsed.schema)
+        {
+            return Err(ds_failure(DsErrorCode::PolicyDenied));
+        }
+        let options = secret.value.with_exposed(|password| {
+            PgConnectOptions::new()
+                .host(&parsed.host)
+                .port(parsed.port)
+                .database(&parsed.database)
+                .username(&parsed.username)
+                .password(password)
+                .ssl_mode(parsed.tls)
+                .application_name("ysda")
+        });
+        let state = Arc::new(ManagedPostgresState {
+            governance: input.governance,
+            database: parsed.database,
+            schema: parsed.schema,
+            username: parsed.username,
+            closed: AtomicBool::new(false),
+        });
+        let connector = PostgresConnector::connect_managed(
+            PostgresConnectorConfig {
+                source_id: parsed.source_id,
+                max_connections: state.governance.budget.max_concurrency as u32,
+                acquire_timeout: Duration::from_millis(state.governance.budget.acquire_timeout_ms),
+                default_statement_timeout: Duration::from_millis(
+                    state.governance.budget.statement_timeout_ms,
+                ),
+                confirmation_cost_units: state
+                    .governance
+                    .budget
+                    .max_estimated_cost_units
+                    .unwrap_or(u64::MAX),
+                freshness_columns: BTreeMap::new(),
+            },
+            options,
+            state,
+        )
+        .await?;
+        Ok(Arc::new(connector))
+    }
+}
+
+fn parse_managed_config(revision: &DatasourceRevision) -> DsResult<ManagedPostgresConfig> {
+    let input = revision.input();
+    let text = |name: &str| match input.fields.get(&FieldId::new(name).expect("static field")) {
+        Some(FieldValue::Text(value)) => Some(value.clone()),
+        _ => None,
+    };
+    let host = text("host").ok_or_else(|| ds_failure(DsErrorCode::InvalidField))?;
+    let database = text("database").ok_or_else(|| ds_failure(DsErrorCode::InvalidField))?;
+    let schema = text("schema").ok_or_else(|| ds_failure(DsErrorCode::InvalidField))?;
+    let username = text("username").ok_or_else(|| ds_failure(DsErrorCode::InvalidField))?;
+    let port = match input
+        .fields
+        .get(&FieldId::new("port").expect("static field"))
+    {
+        Some(FieldValue::Integer(port)) => {
+            u16::try_from(*port).map_err(|_| ds_failure(DsErrorCode::InvalidField))?
+        }
+        _ => return Err(ds_failure(DsErrorCode::InvalidField)),
+    };
+    let tls = match text("tls").as_deref() {
+        Some("disable") => PgSslMode::Disable,
+        Some("require") => PgSslMode::Require,
+        Some("verify_full") => PgSslMode::VerifyFull,
+        _ => return Err(ds_failure(DsErrorCode::InvalidField)),
+    };
+    if host.is_empty()
+        || host.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | '@' | '?' | '#')
+        })
+        || host.contains("://")
+        || !safe_identifier(&database)
+        || !safe_identifier(&schema)
+        || !safe_identifier(&username)
+    {
+        return Err(ds_failure(DsErrorCode::InvalidField));
+    }
+    let DatabaseContext::Database {
+        catalog,
+        database: context_database,
+        schema: context_schema,
+    } = &input.context
+    else {
+        return Err(ds_failure(DsErrorCode::InvalidField));
+    };
+    if catalog.as_deref() != Some(format!("{host}:{port}").as_str())
+        || context_database != &database
+        || context_schema != &schema
+    {
+        return Err(ds_failure(DsErrorCode::InvalidField));
+    }
+    let source_id = input
+        .source_id
+        .clone()
+        .ok_or_else(|| ds_failure(DsErrorCode::PolicyDenied))?;
+    Ok(ManagedPostgresConfig {
+        host,
+        port,
+        database,
+        schema,
+        username,
+        tls,
+        source_id,
+    })
+}
+
+fn safe_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn scope_matches_schema(governance: &DatasourceGovernanceContext, schema: &str) -> bool {
+    governance.data_scope.relations.keys().all(|relation| {
+        relation
+            .split_once('.')
+            .is_some_and(|(prefix, table)| prefix == schema && safe_identifier(table))
+    })
+}
+
+fn limit_budget(request: &QueryBudget, policy: &QueryBudget) -> QueryBudget {
+    QueryBudget {
+        max_sql_bytes: request.max_sql_bytes.min(policy.max_sql_bytes),
+        statement_timeout_ms: request
+            .statement_timeout_ms
+            .min(policy.statement_timeout_ms),
+        acquire_timeout_ms: request.acquire_timeout_ms.min(policy.acquire_timeout_ms),
+        max_rows: request.max_rows.min(policy.max_rows),
+        max_result_bytes: request.max_result_bytes.min(policy.max_result_bytes),
+        max_concurrency: request.max_concurrency.min(policy.max_concurrency),
+        max_estimated_cost_units: policy.max_estimated_cost_units,
+        max_scanned_bytes: policy.max_scanned_bytes,
+    }
+}
+
+fn ds_failure(code: DsErrorCode) -> DsError {
+    DsError {
+        code,
+        field: None,
+        remediation: match code {
+            DsErrorCode::CredentialMissing
+            | DsErrorCode::CredentialExpired
+            | DsErrorCode::AuthenticationFailed => DsRemediation::ReplaceCredential,
+            DsErrorCode::Timeout => DsRemediation::Retry,
+            DsErrorCode::Network | DsErrorCode::Protocol => DsRemediation::CheckConnectivity,
+            DsErrorCode::PermissionDenied
+            | DsErrorCode::PolicyDenied
+            | DsErrorCode::ReadOnlyUnproven => DsRemediation::RepairPolicy,
+            _ => DsRemediation::EditConfiguration,
+        },
+        operation_id: None,
+    }
+}
+
+fn classify_connect_error(error: sqlx::Error) -> DsError {
+    let code = match &error {
+        sqlx::Error::Database(database) => match database.code().as_deref() {
+            Some("28P01" | "28000") => DsErrorCode::AuthenticationFailed,
+            Some("3D000") => DsErrorCode::TargetMissing,
+            Some("42501") => DsErrorCode::PermissionDenied,
+            Some(code) if code.starts_with("08") => DsErrorCode::Network,
+            _ => DsErrorCode::Protocol,
+        },
+        sqlx::Error::Tls(_) => DsErrorCode::Protocol,
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut => DsErrorCode::Network,
+        sqlx::Error::Configuration(_) | sqlx::Error::InvalidArgument(_) => {
+            DsErrorCode::InvalidField
+        }
+        _ => DsErrorCode::Protocol,
+    };
+    ds_failure(code)
+}
+
 fn decode_postgres_cell(row: &PgRow, index: usize) -> CoreResult<(CellValue, Option<String>)> {
     let raw = row
         .try_get_raw(index)
@@ -357,18 +725,9 @@ fn decode_postgres_cell(row: &PgRow, index: usize) -> CoreResult<(CellValue, Opt
             bytes: decode::<Vec<u8>>(row, index)?.len(),
         },
         _ => {
-            let debug_value = raw
-                .as_bytes()
-                .map(|bytes| format!("{:?}", &bytes[..bytes.len().min(32)]))
-                .unwrap_or_else(|_| "<unavailable>".to_owned());
-            return Ok((
-                CellValue::Text(format!(
-                    "<unsupported postgres type {type_name}: {debug_value}>"
-                )),
-                Some(format!(
-                    "postgres_type_conversion_fallback:{}",
-                    type_name.to_ascii_lowercase()
-                )),
+            return Err(CoreError::validation(
+                "unsupported_postgres_type",
+                "PostgreSQL result type is not supported without loss",
             ));
         }
     };
@@ -519,6 +878,9 @@ impl QueryPreflightReader for PostgresConnector {
 #[async_trait]
 impl CatalogReader for PostgresConnector {
     async fn observe_schema(&self, source_id: &SourceId) -> CoreResult<ObservedSchema> {
+        if self.managed.is_some() {
+            self.managed_state()?;
+        }
         ensure_source(&self.config.source_id, source_id)?;
         inspect_postgres_catalog(&self.pool, source_id, &self.result_policy).await
     }
@@ -539,12 +901,180 @@ impl FreshnessReader for PostgresConnector {
         relation: &str,
         time_column: &str,
     ) -> CoreResult<FreshnessObservation> {
+        if self.managed.is_some() {
+            self.managed_state()?;
+        }
         ensure_source(&self.config.source_id, source_id)?;
         let scope = self
             .result_policy
             .allowed_scope(ys_agent_core::WorkspaceId::new(), source_id)?;
         ensure_freshness_scope(&scope, relation, time_column)?;
         read_postgres_freshness(&self.pool, source_id, relation, time_column).await
+    }
+}
+
+#[async_trait]
+impl ManagedConnector for PostgresConnector {
+    async fn probe(&self) -> DsResult<ProbeEvidence> {
+        let state = self.managed_state().map_err(classify_core_error)?;
+        let request = QueryRequest {
+            source_id: self.config.source_id.clone(),
+            sql: "SELECT 1".into(),
+            parameters: Vec::new(),
+            budget: state.governance.budget.clone(),
+            query_tag: "datasource-probe".into(),
+            scope: state.governance.data_scope.clone(),
+            confirmation_granted: true,
+        };
+        let mut transaction = self
+            .begin_read_only(&request)
+            .await
+            .map_err(classify_core_error)?;
+        set_local_statement_timeout(
+            &mut transaction,
+            state.governance.budget.statement_timeout_ms.min(10_000),
+        )
+        .await
+        .map_err(classify_core_error)?;
+
+        let (database, username, read_only, schema_exists): (String, String, bool, bool) =
+            sqlx::query_as(
+                "SELECT current_database(), current_user, current_setting('transaction_read_only') = 'on', to_regnamespace($1) IS NOT NULL",
+            )
+            .bind(&state.schema)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(classify_connect_error)?;
+        if database != state.database || username != state.username || !schema_exists {
+            return Err(ds_failure(DsErrorCode::TargetMissing));
+        }
+        if !read_only {
+            return Err(ds_failure(DsErrorCode::ReadOnlyUnproven));
+        }
+
+        let dangerous_role: bool = sqlx::query_scalar(
+            r#"
+WITH RECURSIVE inherited AS (
+  SELECT oid, rolname, rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls
+  FROM pg_roles WHERE rolname = current_user
+  UNION
+  SELECT parent.oid, parent.rolname, parent.rolsuper, parent.rolcreaterole,
+         parent.rolcreatedb, parent.rolreplication, parent.rolbypassrls
+  FROM inherited child
+  JOIN pg_auth_members membership ON membership.member = child.oid
+  JOIN pg_roles parent ON parent.oid = membership.roleid
+)
+SELECT COALESCE(bool_or(rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication
+                       OR rolbypassrls OR rolname LIKE 'pg\_%' ESCAPE '\'), false)
+FROM inherited
+"#,
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(classify_connect_error)?;
+        let broad_target_privilege: bool = sqlx::query_scalar(
+            "SELECT has_schema_privilege(current_user, $1, 'CREATE') OR has_database_privilege(current_user, current_database(), 'CREATE') OR has_database_privilege(current_user, current_database(), 'TEMP')",
+        )
+        .bind(&state.schema)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(classify_connect_error)?;
+        if dangerous_role || broad_target_privilege {
+            return Err(ds_failure(DsErrorCode::PermissionDenied));
+        }
+
+        for (relation, columns) in &state.governance.data_scope.relations {
+            let (schema, table) = relation
+                .split_once('.')
+                .ok_or_else(|| ds_failure(DsErrorCode::PolicyDenied))?;
+            let row: Option<(String, bool, bool, bool)> = sqlx::query_as(
+                r#"
+SELECT c.relkind::text,
+       pg_has_role(current_user, c.relowner, 'MEMBER'),
+       has_table_privilege(current_user, c.oid, 'SELECT'),
+       has_table_privilege(current_user, c.oid, 'INSERT')
+       OR has_table_privilege(current_user, c.oid, 'UPDATE')
+       OR has_table_privilege(current_user, c.oid, 'DELETE')
+       OR has_table_privilege(current_user, c.oid, 'TRUNCATE')
+       OR has_table_privilege(current_user, c.oid, 'REFERENCES')
+       OR has_table_privilege(current_user, c.oid, 'TRIGGER')
+       OR has_any_column_privilege(current_user, c.oid, 'INSERT')
+       OR has_any_column_privilege(current_user, c.oid, 'UPDATE')
+       OR has_any_column_privilege(current_user, c.oid, 'REFERENCES')
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND c.relname = $2
+"#,
+            )
+            .bind(schema)
+            .bind(table)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(classify_connect_error)?;
+            let Some((kind, owns, table_select, writes)) = row else {
+                return Err(ds_failure(DsErrorCode::TargetMissing));
+            };
+            if !matches!(kind.as_str(), "r" | "p") || owns || writes {
+                return Err(ds_failure(DsErrorCode::PermissionDenied));
+            }
+            for (column, action) in columns {
+                if *action == ys_agent_core::ColumnPolicy::Deny {
+                    continue;
+                }
+                let column_select: bool = sqlx::query_scalar(
+                    "SELECT has_column_privilege(current_user, $1, $2, 'SELECT')",
+                )
+                .bind(relation)
+                .bind(column)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(classify_connect_error)?;
+                if !table_select && !column_select {
+                    return Err(ds_failure(DsErrorCode::PermissionDenied));
+                }
+            }
+        }
+
+        let sequence_write: bool = sqlx::query_scalar(
+            r#"
+SELECT COALESCE(bool_or(
+    pg_has_role(current_user, c.relowner, 'MEMBER')
+    OR has_sequence_privilege(current_user, c.oid, 'USAGE')
+    OR has_sequence_privilege(current_user, c.oid, 'UPDATE')
+), false)
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'S' AND n.nspname = $1
+"#,
+        )
+        .bind(&state.schema)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(classify_connect_error)?;
+        if sequence_write {
+            return Err(ds_failure(DsErrorCode::PermissionDenied));
+        }
+        transaction
+            .rollback()
+            .await
+            .map_err(classify_connect_error)?;
+        Ok(ProbeEvidence {
+            authenticated: true,
+            target_verified: true,
+            read_only_verified: true,
+            least_privilege_verified: true,
+            capabilities_verified: true,
+        })
+    }
+
+    async fn close(&self) -> DsResult<()> {
+        let state = self
+            .managed
+            .as_ref()
+            .ok_or_else(|| ds_failure(DsErrorCode::PolicyDenied))?;
+        state.closed.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), self.pool.close())
+            .await
+            .map_err(|_| ds_failure(DsErrorCode::Timeout))?;
+        Ok(())
     }
 }
 
@@ -566,6 +1096,20 @@ fn preflight_from_policy(request: &QueryRequest, policy: &SqlPolicyDecision) -> 
     }
 }
 
+fn preflight_rejected(request: &QueryRequest, code: &str) -> QueryPreflight {
+    QueryPreflight {
+        sql: request.sql.clone(),
+        decision: QueryPreflightDecision::Rejected,
+        cost: QueryCostEstimate {
+            estimated_cost_units: None,
+            scanned_bytes: None,
+            estimator_version: None,
+        },
+        reason_codes: vec![code.to_owned()],
+        warnings: Vec::new(),
+    }
+}
+
 async fn set_local_statement_timeout(
     transaction: &mut Transaction<'_, Postgres>,
     timeout_ms: u64,
@@ -574,7 +1118,20 @@ async fn set_local_statement_timeout(
         .bind(format!("{timeout_ms}ms"))
         .execute(&mut **transaction)
         .await
-        .map_err(|_| safe_database_error("set local PostgreSQL statement timeout"))?;
+        .map_err(|error| safe_query_error("set local PostgreSQL statement timeout", &error))?;
+    Ok(())
+}
+
+async fn set_local_context(
+    transaction: &mut Transaction<'_, Postgres>,
+    schema: &str,
+) -> CoreResult<()> {
+    let search_path = format!("pg_catalog, \"{schema}\"");
+    sqlx::query("SELECT set_config('search_path', $1, true)")
+        .bind(search_path)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| safe_query_error("set PostgreSQL target schema", &error))?;
     Ok(())
 }
 
@@ -674,4 +1231,30 @@ fn safe_query_tag(candidate: &str) -> String {
 
 fn safe_database_error(context: &'static str) -> CoreError {
     CoreError::validation("postgres_connector_error", format!("{context} failed"))
+}
+
+fn safe_query_error(context: &'static str, error: &sqlx::Error) -> CoreError {
+    let code = match error {
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("57014") => {
+            "datasource_timeout"
+        }
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("42501") => {
+            "datasource_permission_denied"
+        }
+        sqlx::Error::PoolTimedOut => "connection_acquire_timeout",
+        sqlx::Error::PoolClosed => "datasource_closed",
+        _ => "postgres_connector_error",
+    };
+    CoreError::validation(code, format!("{context} failed"))
+}
+
+fn classify_core_error(error: CoreError) -> DsError {
+    ds_failure(match error.code() {
+        "connection_acquire_timeout" | "datasource_timeout" => DsErrorCode::Timeout,
+        "datasource_closed" => DsErrorCode::Cancelled,
+        "source_mismatch" | "scope_source_mismatch" | "datasource_policy_denied" => {
+            DsErrorCode::PolicyDenied
+        }
+        _ => DsErrorCode::Protocol,
+    })
 }

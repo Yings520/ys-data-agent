@@ -31,7 +31,7 @@
   - _Boundary: BuiltinConnectorCatalog、SQLite Connector、驱动依赖构建及共享 SQL/Result Policy 驱动边界_
   - _Depends: 2_
 
-- [ ] 4. 接通 PostgreSQL 普通连接
+- [x] 4. 接通 PostgreSQL 普通连接
   - 支持 host、port、database、schema、username、受保护 password 和 TLS 配置；覆盖 localhost、本机映射端口及可达远程主机，不引入 SSH。
   - 用系统元数据证明目标、认证、只读与最小权限；真实查询使用只读事务、固定 Context、共享 SQL/结果门禁，连接池有界并显式关闭。
   - 完成态：真实 PostgreSQL 通过共享契约；正确参数可查询，错误密码/目标/TLS/权限、超时和连接失败稳定报错，凭证不出现在 DSN 输出中。

@@ -6,7 +6,7 @@ mod sqlite;
 pub use catalog::{
     BuiltinConnectorCatalog, ConnectorRegistration, SqliteConnectorFactory, builtin_descriptor,
 };
-pub use postgres::{PostgresConnector, PostgresConnectorConfig};
+pub use postgres::{PostgresConnector, PostgresConnectorConfig, PostgresConnectorFactory};
 pub use result_policy::{
     ColumnAction, GovernedQueryResult, RestrictedResultContext, RestrictedResultPayload,
     ResultPolicy,

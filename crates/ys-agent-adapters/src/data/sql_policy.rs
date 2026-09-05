@@ -80,6 +80,7 @@ pub struct SqlReadOnlyPolicy {
     dialect: SupportedDialect,
     max_sql_bytes: usize,
     blocked_functions: BTreeSet<String>,
+    allowed_functions: Option<BTreeSet<String>>,
 }
 
 impl SqlReadOnlyPolicy {
@@ -117,10 +118,48 @@ impl SqlReadOnlyPolicy {
             .map(str::to_owned)
             .collect(),
         };
+        let allowed_functions = (dialect == SupportedDialect::Postgres).then(|| {
+            [
+                "abs",
+                "avg",
+                "ceil",
+                "ceiling",
+                "char_length",
+                "coalesce",
+                "concat",
+                "count",
+                "current_date",
+                "current_timestamp",
+                "date_part",
+                "date_trunc",
+                "extract",
+                "floor",
+                "greatest",
+                "least",
+                "length",
+                "lower",
+                "ltrim",
+                "max",
+                "min",
+                "nullif",
+                "replace",
+                "round",
+                "rtrim",
+                "substring",
+                "sum",
+                "to_char",
+                "trim",
+                "upper",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        });
         Self {
             dialect,
             max_sql_bytes,
             blocked_functions,
+            allowed_functions,
         }
     }
 
@@ -216,6 +255,21 @@ impl SqlReadOnlyPolicy {
             return SqlPolicyDecision::rejected(
                 "function_not_allowed",
                 format!("function {function} is blocked by query policy"),
+            );
+        }
+        if let Some(allowed) = &self.allowed_functions
+            && let Some(function) = facts.functions.iter().find(|name| {
+                let mut parts = name.rsplit('.');
+                let base = parts.next().unwrap_or_default();
+                let qualifier = parts.next();
+                parts.next().is_some()
+                    || !allowed.contains(base)
+                    || qualifier.is_some_and(|schema| schema != "pg_catalog")
+            })
+        {
+            return SqlPolicyDecision::rejected(
+                "function_not_allowed",
+                format!("function {function} is not in the audited read-only set"),
             );
         }
 
@@ -507,6 +561,31 @@ mod tests {
             &scope(),
         );
         assert_eq!(decision.reasons[0].code, "function_not_allowed");
+    }
+
+    #[test]
+    fn postgres_allows_only_audited_builtin_functions() {
+        let policy = SqlReadOnlyPolicy::new(SupportedDialect::Postgres, 1024);
+        assert_eq!(
+            policy
+                .evaluate(
+                    "SELECT pg_catalog.sum(paid_amount) FROM mart_orders",
+                    &scope()
+                )
+                .disposition,
+            SqlPolicyDisposition::Allowed
+        );
+        for sql in [
+            "SELECT public.sum(paid_amount) FROM mart_orders",
+            "SELECT custom_reader(customer_email) FROM mart_orders",
+            "SELECT pg_catalog.pg_sleep(1) FROM mart_orders",
+        ] {
+            assert_eq!(
+                policy.evaluate(sql, &scope()).disposition,
+                SqlPolicyDisposition::Rejected,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

@@ -122,7 +122,14 @@ async fn managed_sqlite_real_contract_and_close() {
     assert_eq!(result.rows[0][0], CellValue::Integer(42));
     assert_eq!(result.rows[0][1], CellValue::Text("[REDACTED]".into()));
     assert!(!result.model_preview.contains("canary"));
-    connector_contract::assert_contract(&connector, request, "readings", "recorded_at").await;
+    connector_contract::assert_contract(
+        &connector,
+        request,
+        CellValue::Integer(42),
+        "readings",
+        "recorded_at",
+    )
+    .await;
 }
 
 #[tokio::test]

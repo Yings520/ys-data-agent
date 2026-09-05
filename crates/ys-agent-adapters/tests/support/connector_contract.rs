@@ -4,6 +4,7 @@ use ys_agent_core::{CellValue, ManagedConnector, QueryPreflightDecision, QueryRe
 pub async fn assert_contract(
     connector: &dyn ManagedConnector,
     request: QueryRequest,
+    expected_first: CellValue,
     relation: &str,
     time_column: &str,
 ) {
@@ -22,7 +23,7 @@ pub async fn assert_contract(
         QueryPreflightDecision::Allowed
     );
     let result = connector.execute_query(request.clone()).await.unwrap();
-    assert_eq!(result.rows[0][0], CellValue::Integer(42));
+    assert_eq!(result.rows[0][0], expected_first);
     assert!(
         connector
             .read_freshness(&source, relation, time_column)

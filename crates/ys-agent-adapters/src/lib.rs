@@ -10,8 +10,8 @@ pub mod tools;
 pub use context::{DbtManifestAdapter, FileMetricRegistry};
 pub use data::{
     ColumnAction, GovernedQueryResult, PostgresConnector, PostgresConnectorConfig,
-    RestrictedResultContext, RestrictedResultPayload, ResultPolicy, SqlPolicyDecision,
-    SqlPolicyDisposition, SqlPolicyReason, SqlReadOnlyPolicy, SqliteConnector,
+    PostgresConnectorFactory, RestrictedResultContext, RestrictedResultPayload, ResultPolicy,
+    SqlPolicyDecision, SqlPolicyDisposition, SqlPolicyReason, SqlReadOnlyPolicy, SqliteConnector,
     SqliteConnectorConfig, SupportedDialect,
 };
 pub use tools::{
