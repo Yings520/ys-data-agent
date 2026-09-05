@@ -699,7 +699,7 @@ impl StaticRunDatasourceBindingSource {
         repository: Arc<dyn ys_agent_core::DatasourceRepository>,
     ) -> Self {
         use ys_agent_core::*;
-        let source = SourceId::new("fixture");
+        let source = SourceId::new("sqlite-demo");
         let revision = DatasourceRevision::new(DatasourceRevisionInput {
             schema_version: 1,
             workspace_id,
@@ -761,62 +761,83 @@ impl StaticRunDatasourceBindingSource {
         }
     }
 
-    async fn initialize(&self) -> ys_agent_core::DsResult<()> {
+    async fn initialize(
+        &self,
+        target_scope: ys_agent_core::DatasourceScope,
+    ) -> ys_agent_core::DsResult<()> {
         use ys_agent_core::*;
         let mut initialized = self.initialized.lock().await;
-        if *initialized {
-            return Ok(());
-        }
-        let profile = DatasourceProfile {
-            schema_version: 1,
-            workspace_id: self.scope.workspace_id,
-            profile_id: self.revision.identity().profile_id,
-            source_id: self.revision.input().source_id.clone(),
-            name: DatasourceName::new(format!("Fixture {}", self.revision.identity().profile_id))
+        if !*initialized {
+            let profile = DatasourceProfile {
+                schema_version: 1,
+                workspace_id: self.scope.workspace_id,
+                profile_id: self.revision.identity().profile_id,
+                source_id: self.revision.input().source_id.clone(),
+                name: DatasourceName::new(format!(
+                    "Fixture {}",
+                    self.revision.identity().profile_id
+                ))
                 .expect("fixture name"),
-            head_revision: self.revision.identity().revision,
-            deleted_at: None,
-        };
-        let mut version = self.repository.load(self.scope).await?.version;
-        for change in [
-            DatasourceChange::SaveRevision {
-                profile,
-                revision: self.revision.clone(),
-                mutation_id: None,
-            },
-            DatasourceChange::Validation {
-                revision: self.revision.identity(),
-                state: RevisionState::Ready,
-                evidence: Some(self.evidence.clone()),
-            },
-            DatasourceChange::Selection {
+                head_revision: self.revision.identity().revision,
+                deleted_at: None,
+            };
+            let mut version = self.repository.load(self.scope).await?.version;
+            for change in [
+                DatasourceChange::SaveRevision {
+                    profile,
+                    revision: self.revision.clone(),
+                    mutation_id: None,
+                },
+                DatasourceChange::Validation {
+                    revision: self.revision.identity(),
+                    state: RevisionState::Ready,
+                    evidence: Some(self.evidence.clone()),
+                },
+            ] {
+                let expected_head_revision =
+                    if matches!(change, DatasourceChange::SaveRevision { .. }) {
+                        None
+                    } else {
+                        Some(self.revision.identity().revision)
+                    };
+                version = self
+                    .repository
+                    .commit(DatasourceCommit {
+                        schema_version: 1,
+                        write: DatasourceWriteContext {
+                            command_id: CommandId::new(),
+                            scope: self.scope,
+                            expected_version: version,
+                            expected_head_revision,
+                        },
+                        command_digest: DatasourceDigest::of(&change).expect("fixture digest"),
+                        change,
+                    })
+                    .await?
+                    .committed_version;
+            }
+            *initialized = true;
+        }
+        let snapshot = self.repository.load(target_scope).await?;
+        if snapshot.selection.current != Some(self.revision.identity()) {
+            let change = DatasourceChange::Selection {
                 revision: self.revision.identity(),
                 kind: DatasourceSelectionKind::Session,
-            },
-        ] {
-            let expected_head_revision = if matches!(change, DatasourceChange::SaveRevision { .. })
-            {
-                None
-            } else {
-                Some(self.revision.identity().revision)
             };
-            version = self
-                .repository
+            self.repository
                 .commit(DatasourceCommit {
                     schema_version: 1,
                     write: DatasourceWriteContext {
                         command_id: CommandId::new(),
-                        scope: self.scope,
-                        expected_version: version,
-                        expected_head_revision,
+                        scope: target_scope,
+                        expected_version: snapshot.version,
+                        expected_head_revision: Some(self.revision.identity().revision),
                     },
                     command_digest: DatasourceDigest::of(&change).expect("fixture digest"),
                     change,
                 })
-                .await?
-                .committed_version;
+                .await?;
         }
-        *initialized = true;
         Ok(())
     }
 }
@@ -827,12 +848,18 @@ impl ys_agent_core::RunDatasourceBindingSource for StaticRunDatasourceBindingSou
         &self,
         run_id: RunId,
         scope: Option<ys_agent_core::DatasourceScope>,
+        _retry_of: Option<RunId>,
     ) -> ys_agent_core::DsResult<ys_agent_core::RunDatasourceBinding> {
-        self.initialize().await?;
+        let scope = scope.unwrap_or(self.scope);
+        self.initialize(scope).await?;
         ys_agent_core::RunDatasourceBinding::from_validated(
             run_id,
-            scope.unwrap_or(self.scope),
-            1,
+            scope,
+            self.repository
+                .load(scope)
+                .await?
+                .selection
+                .selection_version,
             &self.revision,
             &self.evidence,
             self.evidence.inputs(),
@@ -1250,6 +1277,10 @@ impl InProcessAgentService {
             .commit_run(
                 command_id,
                 fingerprint,
+                Some(ys_agent_core::DatasourceScope {
+                    workspace_id: session.workspace_id,
+                    session_id: session.id,
+                }),
                 Some(task),
                 snapshot,
                 vec![system_event(RunEventKind::RunStarted)],
@@ -1382,6 +1413,7 @@ impl InProcessAgentService {
         &self,
         command_id: CommandId,
         fingerprint: String,
+        datasource_scope: Option<ys_agent_core::DatasourceScope>,
         task: Option<Task>,
         snapshot: RunSnapshot,
         events: Vec<PendingRunEvent>,
@@ -1412,7 +1444,7 @@ impl InProcessAgentService {
                         "select a verified datasource before starting a Query",
                     )
                 })?
-                .bind_new_run(snapshot.run_id, None)
+                .bind_new_run(snapshot.run_id, datasource_scope, snapshot.retry_of_run_id)
                 .await
                 .map_err(|error| {
                     CoreError::validation("datasource_binding_unavailable", error.to_string())
@@ -1483,7 +1515,10 @@ fn ensure_usable_credential(status: CredentialViewStatus) -> ProviderResult<()> 
 }
 
 fn active_snapshot_changed(error: &CoreError) -> bool {
-    error.code() == "active_provider_snapshot_changed"
+    matches!(
+        error.code(),
+        "active_provider_snapshot_changed" | "datasource_binding_conflict"
+    )
 }
 
 #[async_trait]
@@ -1709,6 +1744,10 @@ impl AgentServiceApi for InProcessAgentService {
                     .commit_run(
                         request.command_id,
                         fingerprint,
+                        Some(ys_agent_core::DatasourceScope {
+                            workspace_id: session.workspace_id,
+                            session_id: session.id,
+                        }),
                         None,
                         snapshot,
                         vec![system_event(RunEventKind::RunStarted)],
@@ -1736,6 +1775,10 @@ impl AgentServiceApi for InProcessAgentService {
                     .commit_run(
                         request.command_id,
                         fingerprint,
+                        Some(ys_agent_core::DatasourceScope {
+                            workspace_id: session.workspace_id,
+                            session_id: session.id,
+                        }),
                         None,
                         snapshot,
                         vec![
@@ -1797,6 +1840,7 @@ impl AgentServiceApi for InProcessAgentService {
                 command_id,
                 fingerprint,
                 None,
+                None,
                 snapshot,
                 vec![system_event(RunEventKind::RunStarted)],
             )
@@ -1823,6 +1867,7 @@ impl AgentServiceApi for InProcessAgentService {
             self.commit_run(
                 command_id,
                 fingerprint,
+                None,
                 None,
                 retry.clone(),
                 vec![system_event(RunEventKind::RunStarted)],

@@ -929,12 +929,14 @@ pub trait RunDatasourceResolver: Send + Sync {
 
 #[async_trait]
 pub trait RunDatasourceBindingSource: Send + Sync {
-    /// None means the caller has no Session identity; production must fail closed rather than
-    /// guessing a Session or falling back to the Workspace default.
+    /// A new Run needs an explicit Session scope. A retry may recover that scope only from its
+    /// durable prior Run binding; otherwise production fails closed rather than guessing a
+    /// Session or falling back to the Workspace default.
     async fn bind_new_run(
         &self,
         run_id: crate::RunId,
         scope: Option<DatasourceScope>,
+        retry_of: Option<crate::RunId>,
     ) -> DsResult<RunDatasourceBinding>;
 }
 

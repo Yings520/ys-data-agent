@@ -11,7 +11,8 @@ use serde_json::Value;
 use ys_agent_core::{
     ArtifactAccessContext, ArtifactId, ArtifactMetadata, ArtifactRef, ArtifactStore, CatalogReader,
     CoreError, CoreResult, CostClass, FreshnessReader, PutArtifact, QueryPreflightReader,
-    RuntimeStore, SourceId, SqlQueryExecutor, ToolFailure, ToolFailureCategory, ToolOutcome,
+    RunDatasourceResolver, RunId, RuntimeStore, SourceId, SqlQueryExecutor, ToolFailure,
+    ToolFailureCategory, ToolOutcome,
 };
 
 pub use inspect_schema::InspectSchemaTool;
@@ -39,11 +40,19 @@ pub struct ConnectorHandle {
 #[derive(Clone, Default)]
 pub struct ConnectorRegistry {
     connectors: BTreeMap<String, ConnectorHandle>,
+    run_resolver: Option<Arc<dyn RunDatasourceResolver>>,
 }
 
 impl ConnectorRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_run_resolver(resolver: Arc<dyn RunDatasourceResolver>) -> Self {
+        Self {
+            connectors: BTreeMap::new(),
+            run_resolver: Some(resolver),
+        }
     }
 
     pub fn register<T>(
@@ -89,6 +98,52 @@ impl ConnectorRegistry {
                 entity: "connector",
                 id: source_id.as_str().to_owned(),
             })
+    }
+
+    pub async fn resolve(
+        &self,
+        run_id: RunId,
+        source_id: &SourceId,
+    ) -> CoreResult<ConnectorHandle> {
+        let Some(resolver) = &self.run_resolver else {
+            return self.get(source_id);
+        };
+        let resolved = resolver.resolve(run_id).await.map_err(|error| {
+            CoreError::validation("run_datasource_unavailable", error.to_string())
+        })?;
+        if resolved.context.binding.source_id() != source_id {
+            return Err(CoreError::validation(
+                "run_datasource_source_mismatch",
+                "requested source does not match the immutable Run datasource binding",
+            ));
+        }
+        let dialect = match resolved
+            .context
+            .binding
+            .evidence()
+            .inputs()
+            .capability()
+            .dialect
+            .as_str()
+        {
+            "sqlite" => MetricSqlDialect::Sqlite,
+            "postgres" => MetricSqlDialect::Postgres,
+            "duckdb" => MetricSqlDialect::DuckDb,
+            _ => {
+                return Err(CoreError::validation(
+                    "run_datasource_dialect_unsupported",
+                    "the bound Connector capability has an unsupported SQL dialect",
+                ));
+            }
+        };
+        let connector = resolved.connector;
+        Ok(ConnectorHandle {
+            dialect,
+            catalog: connector.clone(),
+            preflight: connector.clone(),
+            query: connector.clone(),
+            freshness: connector,
+        })
     }
 }
 

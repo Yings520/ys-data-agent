@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,9 +7,9 @@ use chrono::Utc;
 use tempfile::TempDir;
 use ys_agent_adapters::{DbtManifestAdapter, FileMetricRegistry};
 use ys_agent_core::{
-    ArtifactAccessContext, ArtifactAccessPurpose, ArtifactRef, ArtifactStore, ContextEvidence,
-    ContextSourceType, InstructionTrust, ModelRole, RunEventKind, Sensitivity, ToolRisk, ToolSpec,
-    WorkspaceId,
+    AllowedDataScope, ArtifactAccessContext, ArtifactAccessPurpose, ArtifactRef, ArtifactStore,
+    ColumnPolicy, ContextEvidence, ContextSourceType, InstructionTrust, ModelRole, RunEventKind,
+    Sensitivity, ToolRisk, ToolSpec, WorkspaceId,
 };
 use ys_agent_runtime::{
     ContextAssembler, ContextAssemblyRequest, ContextManifestArtifactWriter,
@@ -263,4 +264,56 @@ async fn persisted_manifest_id_is_written_to_model_requested() {
     let stored: ys_agent_core::ContextManifest =
         serde_json::from_slice(&bytes).expect("decode stored manifest");
     assert_eq!(stored, assembled.manifest);
+}
+
+#[tokio::test]
+async fn datasource_scoped_assembly_omits_evidence_from_another_source() {
+    let (assembler, memory) = assembler_fixture().await;
+    memory
+        .insert(observed_schema_evidence(
+            serde_json::json!({
+                "source_id": "source_b",
+                "relations": [{"name": "mart_orders"}]
+            })
+            .to_string(),
+            Duration::from_secs(1),
+        ))
+        .await;
+    let scope = AllowedDataScope {
+        workspace_id: WorkspaceId::new(),
+        source_id: "source_a".to_owned(),
+        relations: [(
+            "mart_orders".to_owned(),
+            BTreeMap::from([("paid_amount".to_owned(), ColumnPolicy::Allow)]),
+        )]
+        .into(),
+    };
+    let request = ContextAssemblyRequest {
+        task_goal: "Answer GMV".to_owned(),
+        query: "GMV".to_owned(),
+        token_budget: 2_000,
+        schema_ttl: Duration::from_secs(3_600),
+        requires_schema: true,
+        requires_freshness: false,
+        recent_task_summary: None,
+        now: Utc::now(),
+    };
+    let assembled = assembler
+        .assemble_scoped(&request, &context_tools(), Some(&scope))
+        .await
+        .unwrap();
+    assert!(
+        assembled
+            .manifest
+            .included
+            .iter()
+            .all(|evidence| { !evidence.text.contains("source_b") })
+    );
+    assert!(
+        assembled
+            .manifest
+            .omitted
+            .iter()
+            .any(|omission| { omission.reason == "datasource_scope_mismatch" })
+    );
 }

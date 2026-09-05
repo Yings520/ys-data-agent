@@ -273,7 +273,11 @@ impl QueryDataTool {
             Ok(plan) => plan,
             Err(error) => return Ok(artifact_rejection(&error)),
         };
-        let connector = match self.connectors.get(&plan.source_id) {
+        let connector = match self
+            .connectors
+            .resolve(context.run_id, &plan.source_id)
+            .await
+        {
             Ok(connector) => connector,
             Err(error) => return Ok(safe_internal_failure(&error, CostClass::Low)),
         };
@@ -600,7 +604,11 @@ impl QueryDataTool {
             ));
         }
 
-        let connector = match self.connectors.get(&plan.source_id) {
+        let connector = match self
+            .connectors
+            .resolve(context.run_id, &plan.source_id)
+            .await
+        {
             Ok(connector) => connector,
             Err(error) => return Ok(safe_internal_failure(&error, CostClass::Unknown)),
         };

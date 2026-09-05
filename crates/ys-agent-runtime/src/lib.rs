@@ -20,7 +20,9 @@ pub use context_assembler::{
 };
 
 pub use coordinator::{CoordinationDecision, Coordinator, FutureWorkflow, RuleBasedCoordinator};
-pub use datasource::{ConnectorManager, DatasourceService, SourcePolicy};
+pub use datasource::{
+    ActiveRunDatasourceBindingSource, ConnectorManager, DatasourceService, SourcePolicy,
+};
 pub use harness::{Harness, HarnessConfig, HarnessDependencies};
 pub use loop_driver::{
     HarnessStep, LoopBudget, LoopDriver, LoopResult, LoopUsage, StepAccounting, StepOutcome,

@@ -56,7 +56,7 @@
   - _Boundary: DatasourceService、ConnectorManager 与 Source Policy 目标匹配的管理集成_
   - _Depends: 5_
 
-- [ ] 7. 集成真实 Query、治理与重启恢复
+- [x] 7. 集成真实 Query、治理与重启恢复
   - Run 与双 binding 原子创建；Harness、Query Tools、ResultPolicy、Context 按 RunId 消费精确数据源，替换启动时固定连接；消费任务 6 的 Source Policy v2，新目标不继承旧授权。
   - 接通 Source/Context 证据过滤、Policy/预算快照、Doctor、QueryArtifact 与 VerificationReport；迁移旧 Workspace，缺 binding 的旧非终态 Run 明确不可恢复，无 Ready 时阻止新 Query。
   - 完成态：A Run 暂停后切换并启动 B，B 真实查询新源，重启恢复 A 仍查询原源；Policy/Schema/Freshness 不串源，故障不回退，产物和 Doctor 身份一致。

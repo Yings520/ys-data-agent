@@ -12,10 +12,17 @@ use chrono::Utc;
 use serde_json::json;
 use ys_agent_adapters::credential::datasource::LocalEncryptedDatasourceVault;
 use ys_agent_adapters::data::BuiltinConnectorCatalog;
-use ys_agent_adapters::{DuckDbConnectorFactory, PostgresConnectorFactory};
+use ys_agent_adapters::{ConnectorRegistry, DuckDbConnectorFactory, PostgresConnectorFactory};
 use ys_agent_core::*;
-use ys_agent_runtime::{ConnectorManager, DatasourceService, SourcePolicy};
-use ys_agent_store::SqliteRuntimeStore;
+use ys_agent_runtime::{
+    ActiveRunDatasourceBindingSource, AgentServiceApi, ConnectorManager, DatasourceService,
+    InProcessAgentService, NoopRunScheduler, SendMessageRequest, ServiceReply, SourcePolicy,
+    StaticRunProviderBindingSource,
+};
+use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
+
+#[path = "support/provider_fixture.rs"]
+mod provider_fixture;
 
 fn file_policy(path: &std::path::Path, root: &std::path::Path) -> SourcePolicy {
     SourcePolicy::from_json_bytes(
@@ -220,6 +227,23 @@ async fn service_runs_real_sqlite_crud_validate_select_and_delete() {
         .unwrap();
     assert_eq!(connected.state, RevisionState::Ready);
     assert!(connected.evidence.is_some());
+    let doctor = service
+        .doctor(DatasourceDoctorRequest {
+            scope,
+            revision: Some(saved.revision.identity()),
+            operation_id: OperationId::new(),
+        })
+        .await
+        .unwrap();
+    assert!(doctor.findings.is_empty());
+    assert_eq!(
+        doctor
+            .validation
+            .as_ref()
+            .and_then(|report| report.evidence.as_ref())
+            .map(|evidence| evidence.inputs().revision()),
+        Some(saved.revision.identity())
+    );
 
     let selection = service
         .select(SelectDatasource {
@@ -972,4 +996,330 @@ fn ds_error(code: DsErrorCode) -> DsError {
         remediation: DsRemediation::Retry,
         operation_id: None,
     }
+}
+
+#[tokio::test]
+async fn active_binding_source_requires_explicit_ready_session_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let path = root.join("binding.db");
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute_batch("CREATE TABLE readings(value INTEGER); INSERT INTO readings VALUES (7)")
+        .unwrap();
+    drop(database);
+    let repository = Arc::new(
+        SqliteRuntimeStore::open(root.join("runtime.db"))
+            .await
+            .unwrap()
+            .datasource_repository(),
+    );
+    let policy = Arc::new(file_policy(&path, &root));
+    let catalog = Arc::new(
+        BuiltinConnectorCatalog::new(
+            Arc::new(PostgresConnectorFactory),
+            Arc::new(DuckDbConnectorFactory),
+        )
+        .unwrap(),
+    );
+    let service = DatasourceService::new(
+        repository.clone(),
+        Arc::new(LocalEncryptedDatasourceVault::new(root.join("vault"))),
+        catalog.clone(),
+        policy.clone(),
+    );
+    let scope = DatasourceScope {
+        workspace_id: WorkspaceId::new(),
+        session_id: SessionId::new(),
+    };
+    let saved = service
+        .save(SaveDatasource {
+            write: write(scope, 0, None),
+            profile_id: None,
+            name: DatasourceName::new("Binding source").unwrap(),
+            adapter_id: "sqlite".try_into().unwrap(),
+            adapter_version: "1".try_into().unwrap(),
+            config_version: 1,
+            fields: [(
+                FieldId::new("database_path").unwrap(),
+                FieldValue::Text(path.to_string_lossy().into_owned()),
+            )]
+            .into(),
+            context: DatabaseContext::File {
+                canonical_path: path,
+            },
+            secret: SecretEdit::Keep,
+        })
+        .await
+        .unwrap();
+    service
+        .validate(ValidateDatasource {
+            write: write(scope, 1, Some(1)),
+            revision: saved.revision.identity(),
+            mode: ValidationMode::Connection,
+            operation_id: OperationId::new(),
+        })
+        .await
+        .unwrap();
+    service
+        .select(SelectDatasource {
+            write: write(scope, 2, Some(1)),
+            revision: saved.revision.identity(),
+            kind: DatasourceSelectionKind::Session,
+        })
+        .await
+        .unwrap();
+
+    let source =
+        ActiveRunDatasourceBindingSource::new(repository.clone(), catalog.clone(), policy.clone());
+    let binding = source
+        .bind_new_run(RunId::new(), Some(scope), None)
+        .await
+        .unwrap();
+    assert_eq!(binding.revision(), saved.revision.identity());
+    assert_eq!(binding.selection_version(), 1);
+    assert_eq!(
+        source
+            .bind_new_run(RunId::new(), None, None)
+            .await
+            .unwrap_err()
+            .code,
+        DsErrorCode::ValidationStale
+    );
+    let manager = ConnectorManager::new(repository, Arc::new(NoSecretVault), catalog, policy);
+    let missing_binding = manager.resolve(RunId::new()).await;
+    assert!(
+        matches!(
+            missing_binding,
+            Err(DsError {
+                code: DsErrorCode::ConfigIncompatible,
+                ..
+            })
+        ),
+        "a legacy/non-terminal Run without a durable datasource binding cannot recover"
+    );
+}
+
+#[tokio::test]
+async fn switched_runs_query_their_immutable_sources_after_manager_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let path_a = root.join("source-a.db");
+    let path_b = root.join("source-b.db");
+    for (path, value) in [(&path_a, 11), (&path_b, 22)] {
+        let database = rusqlite::Connection::open(path).unwrap();
+        database
+            .execute_batch(&format!(
+                "CREATE TABLE readings(value INTEGER); INSERT INTO readings VALUES ({value})"
+            ))
+            .unwrap();
+    }
+    let policy = Arc::new(
+        SourcePolicy::from_json_bytes(
+            &serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "allowed_sources": {
+                    "source_a": {
+                        "relations": {"readings": {"columns": {"value": "allow"}}},
+                        "target": {"kind": "file", "adapter_id": "sqlite", "canonical_path": path_a, "allowed_roots": [root]}
+                    },
+                    "source_b": {
+                        "relations": {"readings": {"columns": {"value": "allow"}}},
+                        "target": {"kind": "file", "adapter_id": "sqlite", "canonical_path": path_b, "allowed_roots": [root]}
+                    }
+                }
+            }))
+            .unwrap(),
+            QueryBudget::default(),
+        )
+        .unwrap(),
+    );
+    let store = Arc::new(
+        SqliteRuntimeStore::open(root.join("runtime.db"))
+            .await
+            .unwrap(),
+    );
+    let repository = Arc::new(store.datasource_repository());
+    let vault = Arc::new(LocalEncryptedDatasourceVault::new(root.join("vault")));
+    let catalog = Arc::new(
+        BuiltinConnectorCatalog::new(
+            Arc::new(PostgresConnectorFactory),
+            Arc::new(DuckDbConnectorFactory),
+        )
+        .unwrap(),
+    );
+    let management = DatasourceService::new(
+        repository.clone(),
+        vault.clone(),
+        catalog.clone(),
+        policy.clone(),
+    );
+    let bootstrap_scope = DatasourceScope {
+        workspace_id: WorkspaceId::new(),
+        session_id: SessionId::new(),
+    };
+    let mut version = 0;
+    let mut revisions = Vec::new();
+    for (name, path) in [("Source A", &path_a), ("Source B", &path_b)] {
+        let saved = management
+            .save(SaveDatasource {
+                write: write(bootstrap_scope, version, None),
+                profile_id: None,
+                name: DatasourceName::new(name).unwrap(),
+                adapter_id: "sqlite".try_into().unwrap(),
+                adapter_version: "1".try_into().unwrap(),
+                config_version: 1,
+                fields: [(
+                    FieldId::new("database_path").unwrap(),
+                    FieldValue::Text(path.to_string_lossy().into_owned()),
+                )]
+                .into(),
+                context: DatabaseContext::File {
+                    canonical_path: path.clone(),
+                },
+                secret: SecretEdit::Keep,
+            })
+            .await
+            .unwrap();
+        version += 1;
+        management
+            .validate(ValidateDatasource {
+                write: write(bootstrap_scope, version, Some(1)),
+                revision: saved.revision.identity(),
+                mode: ValidationMode::Connection,
+                operation_id: OperationId::new(),
+            })
+            .await
+            .unwrap();
+        version += 1;
+        revisions.push(saved.revision.identity());
+    }
+    management
+        .select(SelectDatasource {
+            write: write(bootstrap_scope, version, Some(1)),
+            revision: revisions[0],
+            kind: DatasourceSelectionKind::WorkspaceDefault,
+        })
+        .await
+        .unwrap();
+    version += 1;
+
+    let artifacts = Arc::new(LocalArtifactStore::new(root.join("artifacts")).unwrap());
+    let provider = provider_fixture::persisted_test_active_provider(store.as_ref()).await;
+    let agent = InProcessAgentService::new(
+        bootstrap_scope.workspace_id,
+        store.clone(),
+        artifacts,
+        Arc::new(NoopRunScheduler),
+    )
+    .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::from_active(
+        provider,
+    )))
+    .with_run_datasource_binding_source(Arc::new(ActiveRunDatasourceBindingSource::new(
+        repository.clone(),
+        catalog.clone(),
+        policy.clone(),
+    )));
+    let session = agent
+        .create_session(CommandId::new(), Principal::local_operator("runtime-test"))
+        .await
+        .unwrap();
+    let run_a = match agent
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            session.id,
+            "read source A",
+        ))
+        .await
+        .unwrap()
+    {
+        ServiceReply::RunScheduled { run_id, .. } => run_id,
+        other => panic!("unexpected service reply: {other:?}"),
+    };
+    let session_scope = DatasourceScope {
+        workspace_id: bootstrap_scope.workspace_id,
+        session_id: session.id,
+    };
+    management
+        .select(SelectDatasource {
+            write: write(session_scope, version, Some(1)),
+            revision: revisions[1],
+            kind: DatasourceSelectionKind::Session,
+        })
+        .await
+        .unwrap();
+    let run_b = match agent
+        .send_message(SendMessageRequest::new(
+            CommandId::new(),
+            session.id,
+            "read source B",
+        ))
+        .await
+        .unwrap()
+    {
+        ServiceReply::RunScheduled { run_id, .. } => run_id,
+        other => panic!("unexpected service reply: {other:?}"),
+    };
+    assert_eq!(
+        repository.load_run_binding(run_a).await.unwrap().revision(),
+        revisions[0]
+    );
+    assert_eq!(
+        repository.load_run_binding(run_b).await.unwrap().revision(),
+        revisions[1]
+    );
+
+    let manager = Arc::new(ConnectorManager::new(
+        repository.clone(),
+        vault.clone(),
+        catalog.clone(),
+        policy.clone(),
+    ));
+    let registry = ConnectorRegistry::with_run_resolver(manager.clone());
+    let binding_b = repository.load_run_binding(run_b).await.unwrap();
+    let governance_b = policy
+        .governance_for(
+            &repository
+                .load_revision(revisions[1])
+                .await
+                .unwrap()
+                .revision,
+        )
+        .unwrap();
+    let result_b = registry
+        .resolve(run_b, binding_b.source_id())
+        .await
+        .unwrap()
+        .query
+        .execute_query(QueryRequest {
+            source_id: binding_b.source_id().clone(),
+            sql: "SELECT value FROM readings".into(),
+            parameters: vec![],
+            budget: governance_b.budget,
+            query_tag: "run-b".into(),
+            scope: governance_b.data_scope,
+            confirmation_granted: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result_b.rows[0][0], CellValue::Integer(22));
+    manager.close().await.unwrap();
+
+    let restarted = ConnectorManager::new(repository, vault, catalog, policy);
+    let resolved_a = restarted.resolve(run_a).await.unwrap();
+    let result_a = resolved_a
+        .connector
+        .execute_query(QueryRequest {
+            source_id: resolved_a.context.binding.source_id().clone(),
+            sql: "SELECT value FROM readings".into(),
+            parameters: vec![],
+            budget: resolved_a.context.query_budget.clone(),
+            query_tag: "run-a-after-restart".into(),
+            scope: resolved_a.context.data_scope.clone(),
+            confirmation_granted: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result_a.rows[0][0], CellValue::Integer(11));
+    restarted.close().await.unwrap();
 }
