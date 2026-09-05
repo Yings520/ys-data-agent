@@ -403,7 +403,7 @@ impl MetricSqlCompiler {
             .map(|dimension| quote_identifier(dimension))
             .collect::<CoreResult<Vec<_>>>()?;
         let (start_placeholder, end_placeholder) = match self.dialect {
-            MetricSqlDialect::Sqlite => ("?", "?"),
+            MetricSqlDialect::Sqlite | MetricSqlDialect::DuckDb => ("?", "?"),
             MetricSqlDialect::Postgres => ("$1", "$2"),
         };
         let sql = metric_sql(

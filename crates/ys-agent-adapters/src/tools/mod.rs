@@ -24,6 +24,7 @@ pub use resolve_metric::ResolveMetricTool;
 pub enum MetricSqlDialect {
     Sqlite,
     Postgres,
+    DuckDb,
 }
 
 #[derive(Clone)]

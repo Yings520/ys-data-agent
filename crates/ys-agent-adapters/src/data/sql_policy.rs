@@ -5,7 +5,7 @@ use sqlparser::ast::{
     Expr, ObjectName, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Visit,
     VisitMut, Visitor, VisitorMut,
 };
-use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{DuckDbDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use ys_agent_core::{AllowedDataScope, ColumnPolicy, CoreError, CoreResult};
 
@@ -13,6 +13,7 @@ use ys_agent_core::{AllowedDataScope, ColumnPolicy, CoreError, CoreResult};
 pub enum SupportedDialect {
     SQLite,
     Postgres,
+    DuckDB,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,8 +118,33 @@ impl SqlReadOnlyPolicy {
             .into_iter()
             .map(str::to_owned)
             .collect(),
+            SupportedDialect::DuckDB => [
+                "csv_scan",
+                "delta_scan",
+                "glob",
+                "httpfs",
+                "iceberg_scan",
+                "parquet_scan",
+                "postgres_scan",
+                "query",
+                "query_table",
+                "read_blob",
+                "read_csv",
+                "read_csv_auto",
+                "read_json",
+                "read_json_auto",
+                "read_parquet",
+                "sqlite_scan",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         };
-        let allowed_functions = (dialect == SupportedDialect::Postgres).then(|| {
+        let allowed_functions = matches!(
+            dialect,
+            SupportedDialect::Postgres | SupportedDialect::DuckDB
+        )
+        .then(|| {
             [
                 "abs",
                 "avg",
@@ -187,6 +213,7 @@ impl SqlReadOnlyPolicy {
         let parsed = match self.dialect {
             SupportedDialect::SQLite => Parser::parse_sql(&SQLiteDialect {}, sql),
             SupportedDialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
+            SupportedDialect::DuckDB => Parser::parse_sql(&DuckDbDialect {}, sql),
         };
 
         let mut statements = match parsed {
@@ -264,7 +291,9 @@ impl SqlReadOnlyPolicy {
                 let qualifier = parts.next();
                 parts.next().is_some()
                     || !allowed.contains(base)
-                    || qualifier.is_some_and(|schema| schema != "pg_catalog")
+                    || qualifier.is_some_and(|schema| {
+                        self.dialect != SupportedDialect::Postgres || schema != "pg_catalog"
+                    })
             })
         {
             return SqlPolicyDecision::rejected(

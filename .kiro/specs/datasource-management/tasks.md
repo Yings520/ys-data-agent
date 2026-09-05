@@ -39,7 +39,7 @@
   - _Boundary: PostgreSQL Connector 及共享 SQL/Result Policy 驱动边界_
   - _Depends: 3_
 
-- [ ] 5. 接通 DuckDB 本地文件
+- [x] 5. 接通 DuckDB 本地文件
   - 锁定并验证 Rust 依赖、原生构建和实际引擎版本；接通已有文件、只读 Config、元数据 probe、关闭与单句柄串行执行，不自行编写 FFI。
   - 禁用扩展安装/加载、外部访问、ATTACH、COPY/EXPORT 和临时 spill，锁定配置；接通 DuckDB SQL 与 Metric 方言、参数/类型转换、预算及实际 interrupt。
   - 完成态：真实 DuckDB 通过共享契约及 Metric 查询，缺文件不创建，禁止行为被拒绝；超时实际结束查询且可安全关闭。

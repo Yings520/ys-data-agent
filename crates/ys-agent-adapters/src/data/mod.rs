@@ -1,3 +1,4 @@
+mod duckdb;
 mod postgres;
 mod result_policy;
 mod sql_policy;
@@ -6,6 +7,7 @@ mod sqlite;
 pub use catalog::{
     BuiltinConnectorCatalog, ConnectorRegistration, SqliteConnectorFactory, builtin_descriptor,
 };
+pub use duckdb::{DuckDbConnector, DuckDbConnectorFactory};
 pub use postgres::{PostgresConnector, PostgresConnectorConfig, PostgresConnectorFactory};
 pub use result_policy::{
     ColumnAction, GovernedQueryResult, RestrictedResultContext, RestrictedResultPayload,
