@@ -1064,7 +1064,7 @@ fn artifact_footer_uses_the_shared_command_catalog_and_back_hint() {
     let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
     app.push_route(ContentRoute::Artifact);
     let rendered = render_to_string(&app, 100, 28);
-    assert!(rendered.contains("/mode  /model  /exit  Esc back"));
+    assert!(rendered.contains("/mode  /model  /datasource  /connections  /exit  Esc back"));
 }
 
 #[test]

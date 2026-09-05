@@ -10,28 +10,34 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 use ys_agent_adapters::{
-    ConnectorRegistry, DbtManifestAdapter, FileMetricRegistry, InspectSchemaTool, MetricSqlDialect,
-    PostgresConnector, PostgresConnectorConfig, QueryDataTool, ReadFreshnessTool,
-    ResolveMetricTool, ResultPolicy, RuntimeArtifactLookup, SqlReadOnlyPolicy, SqliteConnector,
-    SqliteConnectorConfig, SupportedDialect,
+    ConnectorRegistry, DbtManifestAdapter, DuckDbConnectorFactory, FileMetricRegistry,
+    InspectSchemaTool, MetricSqlDialect, PostgresConnectorFactory, QueryDataTool,
+    ReadFreshnessTool, ResolveMetricTool, ResultPolicy, RuntimeArtifactLookup, SqlReadOnlyPolicy,
+    SqliteConnector, SqliteConnectorConfig, SupportedDialect,
+    credential::datasource::LocalEncryptedDatasourceVault,
     credential::local::LocalEncryptedCredentialVault,
+    data::BuiltinConnectorCatalog,
     model::{ReplayModelProvider, discovery::LiterModelDiscovery, liter::LiterProviderFactory},
     oauth::chatgpt::ChatGptOAuthManager,
 };
 use ys_agent_core::{
-    AgentAction, ArtifactId, ArtifactStore, CoreError, CoreResult, CredentialMutationRepository,
-    CredentialReference, CredentialVault, MetricDefinition, MetricProvider, ModelCapabilities,
-    ModelProvider, ModelRequest, ModelResponse, ProfileRevisionRepository, ProviderClientFactory,
+    AgentAction, ArtifactId, ArtifactStore, ConnectorCatalog, CoreError, CoreResult,
+    CredentialMutationRepository, CredentialVault, DatasourceManagementApi, DatasourceRepository,
+    DatasourceVault, MetricDefinition, MetricProvider, ModelCapabilities, ModelProvider,
+    ModelRequest, ModelResponse, ProfileRevisionRepository, ProviderClientFactory,
     ProviderErrorCode, ProviderField, ProviderManagementApi, ProviderManagementError,
     ProviderProfileRepository, ProviderRemediation, ProviderResult, QueryBudget,
-    QueryContextProvider, QueryExecutionPlan, RunId, RunModelProviderResolver,
-    RunProviderBindingRepository, RunProviderBindingSource, RuntimeStore, SourceId, WorkspaceId,
+    QueryContextProvider, QueryExecutionPlan, RunDatasourceBindingSource, RunDatasourceResolver,
+    RunId, RunModelProviderResolver, RunProviderBindingRepository, RunProviderBindingSource,
+    RuntimeStore, SourceId, WorkspaceId,
 };
 use ys_agent_runtime::{
-    ActiveProfileModelProvider, ActiveRunProviderBindingSource, AgentServiceApi, ContextAssembler,
+    ActiveProfileModelProvider, ActiveRunDatasourceBindingSource, ActiveRunProviderBindingSource,
+    AgentServiceApi, ConnectorManager, ContextAssembler, DatasourceService,
     FixedRunModelProviderResolver, Harness, HarnessConfig, HarnessDependencies,
     InMemoryQueryContextProvider, InProcessAgentService, LoopDriver, PromptBuilder,
-    RunBoundProviderResolver, RunScheduler, ServiceEventPublisher, StaticRunProviderBindingSource,
+    RunBoundProviderResolver, RunScheduler, ServiceEventPublisher, SourcePolicy,
+    StaticRunProviderBindingSource,
     doctor::{
         DoctorInputs, DoctorProbe, DoctorReport, DoctorRunner, ModelReadiness, SourceReadiness,
         WorkspaceDoctor,
@@ -66,6 +72,58 @@ pub struct AppDependencies {
     pub workspace_id: WorkspaceId,
     pub principal: ys_agent_core::Principal,
     pub display: DisplayMetadata,
+    pub datasource_resolver: Arc<dyn RunDatasourceResolver>,
+}
+
+struct ProductionDatasourceRuntime {
+    management: Arc<dyn DatasourceManagementApi>,
+    bindings: Arc<dyn RunDatasourceBindingSource>,
+    resolver: Arc<dyn RunDatasourceResolver>,
+}
+
+async fn compose_production_datasource_runtime(
+    runtime: Arc<ys_agent_store::SqliteRuntimeStore>,
+    config: &AppConfig,
+    state_root: &Path,
+) -> CoreResult<ProductionDatasourceRuntime> {
+    let repository: Arc<dyn DatasourceRepository> = Arc::new(runtime.datasource_repository());
+    let vault: Arc<dyn DatasourceVault> = Arc::new(LocalEncryptedDatasourceVault::new(
+        state_root.join("datasources"),
+    ));
+    let catalog: Arc<dyn ConnectorCatalog> = Arc::new(
+        BuiltinConnectorCatalog::new(
+            Arc::new(PostgresConnectorFactory),
+            Arc::new(DuckDbConnectorFactory),
+        )
+        .map_err(datasource_bootstrap_error)?,
+    );
+    let policy = match tokio::fs::read(&config.query_policy_path).await {
+        Ok(bytes) => Arc::new(
+            SourcePolicy::from_json_bytes(&bytes, config.query_budget.clone())
+                .unwrap_or_else(|_| SourcePolicy::deny_all(config.query_budget.clone())),
+        ),
+        Err(_) => Arc::new(SourcePolicy::deny_all(config.query_budget.clone())),
+    };
+    let management: Arc<dyn DatasourceManagementApi> = Arc::new(DatasourceService::new(
+        repository.clone(),
+        vault.clone(),
+        catalog.clone(),
+        policy.clone(),
+    ));
+    let bindings: Arc<dyn RunDatasourceBindingSource> = Arc::new(
+        ActiveRunDatasourceBindingSource::new(repository.clone(), catalog.clone(), policy.clone()),
+    );
+    let resolver: Arc<dyn RunDatasourceResolver> =
+        Arc::new(ConnectorManager::new(repository, vault, catalog, policy));
+    Ok(ProductionDatasourceRuntime {
+        management,
+        bindings,
+        resolver,
+    })
+}
+
+fn datasource_bootstrap_error(error: ys_agent_core::DsError) -> CoreError {
+    CoreError::validation("datasource_bootstrap_failed", format!("{:?}", error.code))
 }
 
 /// Deterministic inputs for the production-shaped Query Eval composition.
@@ -241,10 +299,6 @@ impl RunScheduler for DeterministicRunScheduler {
 #[derive(Debug, Clone)]
 struct AppConfig {
     workspace_name: String,
-    source_kind: String,
-    source_id: SourceId,
-    source_url_ref: Option<CredentialReference>,
-    sqlite_path: PathBuf,
     metric_registry_path: PathBuf,
     dbt_manifest_path: Option<PathBuf>,
     query_policy_path: PathBuf,
@@ -259,8 +313,7 @@ struct AppConfig {
 
 impl AppConfig {
     fn from_env() -> CoreResult<Self> {
-        let source_kind = optional_env("YSDA_DATA_SOURCE_KIND", "sqlite");
-        let missing_config_keys = required_config_keys(&source_kind)
+        let missing_config_keys = required_config_keys()
             .into_iter()
             .filter(|key| nonempty_env(key).is_none())
             .map(str::to_owned)
@@ -269,12 +322,6 @@ impl AppConfig {
         let artifact_retention_days = artifact_retention_days_from_lookup(&nonempty_env)?;
         Ok(Self {
             workspace_name: optional_env("YSDA_WORKSPACE_NAME", "local"),
-            source_kind,
-            source_id: SourceId::new(optional_env("YSDA_DATA_SOURCE_ID", "local")),
-            source_url_ref: nonempty_env("YSDA_DATA_SOURCE_URL")
-                .map(|_| CredentialReference::new("env:YSDA_DATA_SOURCE_URL"))
-                .transpose()?,
-            sqlite_path: PathBuf::from(optional_env("YSDA_SQLITE_PATH", ".ysda/demo.db")),
             metric_registry_path: PathBuf::from(optional_env(
                 "YSDA_METRIC_REGISTRY_PATH",
                 ".ysda/missing-metrics.json",
@@ -295,21 +342,15 @@ impl AppConfig {
     }
 }
 
-fn required_config_keys(source_kind: &str) -> Vec<&'static str> {
-    let mut keys = vec![
+fn required_config_keys() -> Vec<&'static str> {
+    vec![
         "YSDA_QUERY_POLICY_PATH",
         "YSDA_TIMEZONE",
         "YSDA_QUERY_TIMEOUT_SECONDS",
         "YSDA_QUERY_MAX_ROWS",
         "YSDA_QUERY_MAX_RESULT_BYTES",
         "YSDA_ARTIFACT_RETENTION_DAYS",
-    ];
-    keys.push(if source_kind == "postgres" {
-        "YSDA_DATA_SOURCE_URL"
-    } else {
-        "YSDA_SQLITE_PATH"
-    });
-    keys
+    ]
 }
 
 fn query_budget_from_lookup(
@@ -680,7 +721,9 @@ impl DoctorProbe for RuntimeDoctorProbe {
         let mut inputs = self.readiness.clone();
         inputs.query_policy_valid = fs::read(&self.config.query_policy_path)
             .ok()
-            .and_then(|bytes| ResultPolicy::from_json_bytes(&bytes).ok())
+            .and_then(|bytes| {
+                SourcePolicy::from_json_bytes(&bytes, self.config.query_budget.clone()).ok()
+            })
             .is_some();
         inputs.metric_registry_valid = FileMetricRegistry::load(&self.config.metric_registry_path)
             .await
@@ -693,14 +736,6 @@ impl DoctorProbe for RuntimeDoctorProbe {
             owner_only_writable(&self.config.artifact_root);
         inputs.export_directory_private_and_writable =
             owner_only_writable(&self.config.export_root);
-        inputs.source.reachable = if self.config.source_kind == "sqlite" {
-            self.config.sqlite_path.is_file() && fs::File::open(&self.config.sqlite_path).is_ok()
-        } else {
-            inputs.source.reachable
-        };
-        inputs.source.query_capability &= inputs.source.reachable;
-        inputs.source.catalog_capability &= inputs.source.reachable;
-        inputs.source.freshness_capability &= inputs.source.reachable;
         Ok(inputs)
     }
 }
@@ -1038,12 +1073,8 @@ async fn assemble_scheduler(
     runtime_store: Arc<ys_agent_store::SqliteRuntimeStore>,
     artifact_store: Arc<dyn ArtifactStore>,
     model_resolver: Arc<dyn RunModelProviderResolver>,
+    datasource_resolver: Arc<dyn RunDatasourceResolver>,
 ) -> CoreResult<(Arc<BackgroundScheduler>, DoctorInputs)> {
-    let policy_bytes = tokio::fs::read(&config.query_policy_path)
-        .await
-        .map_err(|error| CoreError::validation("query_policy_read_failed", error.to_string()))?;
-    let result_policy = ResultPolicy::from_json_bytes(&policy_bytes)?;
-    let data_scope = result_policy.allowed_scope(workspace_id, &config.source_id)?;
     let metrics: Arc<dyn MetricProvider> =
         match FileMetricRegistry::load(&config.metric_registry_path).await {
             Ok(registry) => Arc::new(registry),
@@ -1057,76 +1088,7 @@ async fn assemble_scheduler(
         None => Arc::new(InMemoryQueryContextProvider::new()),
     };
     let run_context: Arc<dyn QueryContextProvider> = Arc::new(InMemoryQueryContextProvider::new());
-    let mut connectors = ConnectorRegistry::new();
-    let (dialect, source_read_only) = match config.source_kind.as_str() {
-        "sqlite" => {
-            if !config.sqlite_path.is_file() || fs::File::open(&config.sqlite_path).is_err() {
-                return Err(CoreError::validation(
-                    "sqlite_source_unavailable",
-                    "SQLite source is not readable",
-                ));
-            }
-            let connector = Arc::new(SqliteConnector::new(
-                SqliteConnectorConfig {
-                    source_id: config.source_id.clone(),
-                    database_path: config.sqlite_path.clone(),
-                    max_concurrency: config.query_budget.max_concurrency,
-                    freshness_columns: BTreeMap::new(),
-                },
-                SqlReadOnlyPolicy::new(SupportedDialect::SQLite, config.query_budget.max_sql_bytes),
-                result_policy,
-            ));
-            connectors.register(
-                config.source_id.clone(),
-                MetricSqlDialect::Sqlite,
-                connector,
-            )?;
-            (MetricSqlDialect::Sqlite, true)
-        }
-        "postgres" => {
-            let source_url = config.source_url_ref.as_ref().ok_or_else(|| {
-                CoreError::validation(
-                    "data_source_url_missing",
-                    "PostgreSQL source URL is required",
-                )
-            })?;
-            let connector = Arc::new(
-                PostgresConnector::connect(
-                    PostgresConnectorConfig {
-                        source_id: config.source_id.clone(),
-                        max_connections: config.query_budget.max_concurrency as u32,
-                        acquire_timeout: Duration::from_millis(
-                            config.query_budget.acquire_timeout_ms,
-                        ),
-                        default_statement_timeout: Duration::from_millis(
-                            config.query_budget.statement_timeout_ms,
-                        ),
-                        confirmation_cost_units: 1_000,
-                        freshness_columns: BTreeMap::new(),
-                    },
-                    &resolve_env_reference(source_url)?,
-                    SqlReadOnlyPolicy::new(
-                        SupportedDialect::Postgres,
-                        config.query_budget.max_sql_bytes,
-                    ),
-                    result_policy,
-                )
-                .await?,
-            );
-            connectors.register(
-                config.source_id.clone(),
-                MetricSqlDialect::Postgres,
-                connector,
-            )?;
-            (MetricSqlDialect::Postgres, true)
-        }
-        _ => {
-            return Err(CoreError::validation(
-                "unsupported_data_source",
-                "source kind must be sqlite or postgres",
-            ));
-        }
-    };
+    let connectors = ConnectorRegistry::with_run_resolver(datasource_resolver.clone());
     let artifact_lookup = Arc::new(RuntimeArtifactLookup::new(
         runtime_store.clone(),
         artifact_store.clone(),
@@ -1154,29 +1116,40 @@ async fn assemble_scheduler(
         catalog.register_arc(tool)?;
     }
     let telemetry = Arc::new(TelemetryDispatcher::new(Arc::new(TracingTelemetrySink)));
-    let harness = Arc::new(Harness::new(
-        HarnessDependencies {
-            store: runtime_store.clone(),
-            artifacts: artifact_store,
-            model_resolver,
-            catalog: Arc::new(catalog),
-            tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
-            context_assembler: Arc::new(ContextAssembler::new(metrics, dbt_context, run_context)),
-            telemetry,
-        },
-        PromptBuilder::new(),
-        HarnessConfig {
-            workspace_id,
-            principal,
-            workspace_timezone: config.timezone.clone(),
-            query_budget: config.query_budget.clone(),
-            data_scope,
-            connector_tools: ConnectorToolAvailability::all_query_tools(),
-            tool_policy,
-            context_token_budget: 8_000,
-            schema_ttl: Duration::from_secs(300),
-        },
-    ));
+    let harness = Arc::new(
+        Harness::new(
+            HarnessDependencies {
+                store: runtime_store.clone(),
+                artifacts: artifact_store,
+                model_resolver,
+                catalog: Arc::new(catalog),
+                tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
+                context_assembler: Arc::new(ContextAssembler::new(
+                    metrics,
+                    dbt_context,
+                    run_context,
+                )),
+                telemetry,
+            },
+            PromptBuilder::new(),
+            HarnessConfig {
+                workspace_id,
+                principal,
+                workspace_timezone: config.timezone.clone(),
+                query_budget: config.query_budget.clone(),
+                data_scope: ys_agent_core::AllowedDataScope {
+                    workspace_id,
+                    source_id: "unconfigured".into(),
+                    relations: BTreeMap::new(),
+                },
+                connector_tools: ConnectorToolAvailability::all_query_tools(),
+                tool_policy,
+                context_token_budget: 8_000,
+                schema_ttl: Duration::from_secs(300),
+            },
+        )
+        .with_run_datasource_resolver(datasource_resolver),
+    );
     let readiness = DoctorInputs {
         missing_config_keys: config.missing_config_keys.clone(),
         model: ModelReadiness {
@@ -1191,7 +1164,7 @@ async fn assemble_scheduler(
             query_capability: true,
             catalog_capability: true,
             freshness_capability: true,
-            database_read_only: source_read_only,
+            database_read_only: true,
         },
         query_policy_valid: true,
         metric_registry_valid: FileMetricRegistry::load(&config.metric_registry_path)
@@ -1207,7 +1180,6 @@ async fn assemble_scheduler(
         artifact_directory_private_and_writable: owner_only_writable(&config.artifact_root),
         export_directory_private_and_writable: owner_only_writable(&config.export_root),
     };
-    let _ = dialect;
     Ok((
         Arc::new(BackgroundScheduler::new(Arc::new(
             LoopDriver::with_defaults(harness),
@@ -1364,7 +1336,8 @@ pub async fn assemble_deterministic_query_runtime(
     })
 }
 
-async fn seed_deterministic_active_provider(
+#[doc(hidden)]
+pub async fn seed_deterministic_active_provider(
     runtime: &ys_agent_store::SqliteRuntimeStore,
 ) -> CoreResult<ys_agent_core::ActiveProviderSnapshot> {
     fn fixture_error(error: ys_agent_core::ProviderManagementError) -> CoreError {
@@ -1525,21 +1498,6 @@ fn query_phase_name(phase: QueryPhase) -> &'static str {
     }
 }
 
-fn resolve_env_reference(reference: &CredentialReference) -> CoreResult<String> {
-    let name = reference.environment_variable_name().ok_or_else(|| {
-        CoreError::validation(
-            "invalid_credential_reference",
-            "this configuration requires an environment reference",
-        )
-    })?;
-    nonempty_env(name).ok_or_else(|| {
-        CoreError::validation(
-            "required_config_missing",
-            "a required environment value is missing",
-        )
-    })
-}
-
 pub async fn bootstrap() -> CoreResult<AppDependencies> {
     let config = AppConfig::from_env()?;
     create_private_directory(Path::new(".ysda"))?;
@@ -1552,13 +1510,16 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
     let display = DisplayMetadata {
         workspace_name: config.workspace_name.clone(),
         model_label: "Provider Profile".to_owned(),
-        connection_label: config.source_kind.clone(),
+        connection_label: "not configured".to_owned(),
         permission_label: "read-only".to_owned(),
     };
     let runtime_store =
         Arc::new(ys_agent_store::SqliteRuntimeStore::open(".ysda/runtime.db").await?);
     let provider_runtime =
         compose_production_provider_runtime(runtime_store.clone(), Path::new(".ysda")).await?;
+    let datasource_runtime =
+        compose_production_datasource_runtime(runtime_store.clone(), &config, Path::new(".ysda"))
+            .await?;
     let artifact_store = Arc::new(ys_agent_store::LocalArtifactStore::new(
         &config.artifact_root,
     )?);
@@ -1571,6 +1532,7 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
         runtime_store.clone(),
         artifact_port.clone(),
         provider_runtime.resolver.clone(),
+        datasource_runtime.resolver.clone(),
     )
     .await
     {
@@ -1613,7 +1575,9 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
     )
     .with_front_door_agent(provider_runtime.conversation_model, "active-profile")
     .with_run_provider_binding_source(provider_runtime.bindings)
-    .with_provider_management_api(provider_runtime.management);
+    .with_run_datasource_binding_source(datasource_runtime.bindings)
+    .with_provider_management_api(provider_runtime.management)
+    .with_datasource_management_api(datasource_runtime.management);
     let service = if query_runtime_unavailable {
         service.with_query_submission_disabled(
             "Data querying is not configured. You can still chat; connect a read-only datasource to ask data questions.",
@@ -1630,6 +1594,7 @@ pub async fn bootstrap() -> CoreResult<AppDependencies> {
         workspace_id,
         principal,
         display,
+        datasource_resolver: datasource_runtime.resolver,
     })
 }
 
@@ -1650,16 +1615,17 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        BackgroundScheduler, acquire_workspace_id_lock, artifact_retention_days_from_lookup,
+        AppConfig, BackgroundScheduler, acquire_workspace_id_lock,
+        artifact_retention_days_from_lookup, compose_production_datasource_runtime,
         compose_production_provider_runtime, compose_provider_runtime, create_private_directory,
         query_budget_from_lookup, required_config_keys, resolve_workspace_id,
     };
     use ys_agent_adapters::credential::memory::InMemoryCredentialVault;
     use ys_agent_core::{
         CoreError, CoreResult, CredentialGeneration, CredentialKind, CredentialMutationIntent,
-        CredentialProtectionStatus, ProfileId, ProfileName, ProfileRevision, ProviderId,
-        ProviderModelId, ProviderParameters, RevisionPrecondition, RunId, RunSnapshot, RunStatus,
-        SaveProfileRevision, TaskId, WorkflowKind, WorkspaceId,
+        CredentialProtectionStatus, DatasourceScope, ProfileId, ProfileName, ProfileRevision,
+        ProviderId, ProviderModelId, ProviderParameters, QueryBudget, RevisionPrecondition, RunId,
+        RunSnapshot, RunStatus, SaveProfileRevision, SessionId, TaskId, WorkflowKind, WorkspaceId,
     };
     use ys_agent_runtime::{HarnessStep, LoopDriver, RunScheduler, StepAccounting, StepOutcome};
 
@@ -1750,7 +1716,7 @@ mod tests {
 
     #[test]
     fn artifact_retention_is_required_and_parsed_as_positive_days() {
-        assert!(required_config_keys("sqlite").contains(&"YSDA_ARTIFACT_RETENTION_DAYS"));
+        assert!(required_config_keys().contains(&"YSDA_ARTIFACT_RETENTION_DAYS"));
         assert_eq!(
             artifact_retention_days_from_lookup(&|key| {
                 (key == "YSDA_ARTIFACT_RETENTION_DAYS").then(|| "19".to_owned())
@@ -1762,7 +1728,7 @@ mod tests {
 
     #[test]
     fn legacy_llm_environment_variables_are_not_a_bootstrap_configuration_path() {
-        let required = required_config_keys("sqlite");
+        let required = required_config_keys();
 
         assert!(!required.contains(&"YSDA_LLM_BASE_URL"));
         assert!(!required.contains(&"YSDA_LLM_API_KEY"));
@@ -1791,6 +1757,49 @@ mod tests {
             CredentialProtectionStatus::ConfirmedLocal
         );
         assert!(!directory.path().join("provider-credentials.key").exists());
+    }
+
+    #[tokio::test]
+    async fn production_datasource_runtime_starts_manageable_without_a_legacy_source_env() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let state_root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical state root");
+        let runtime = Arc::new(
+            ys_agent_store::SqliteRuntimeStore::open(state_root.join("runtime.db"))
+                .await
+                .expect("open runtime store"),
+        );
+        let config = AppConfig {
+            workspace_name: "test".into(),
+            metric_registry_path: state_root.join("missing-metrics.json"),
+            dbt_manifest_path: None,
+            query_policy_path: state_root.join("missing-policy.json"),
+            timezone: "UTC".into(),
+            missing_config_keys: Vec::new(),
+            query_budget_explicit: true,
+            query_budget: QueryBudget::default(),
+            artifact_retention_days: 7,
+            artifact_root: state_root.join("artifacts"),
+            export_root: state_root.join("exports"),
+        };
+
+        let datasource = compose_production_datasource_runtime(runtime, &config, &state_root)
+            .await
+            .expect("compose datasource runtime without legacy source variables");
+        let view = datasource
+            .management
+            .view(DatasourceScope {
+                workspace_id: WorkspaceId::new(),
+                session_id: SessionId::new(),
+            })
+            .await
+            .expect("management remains available under deny-all policy");
+
+        assert_eq!(view.catalog.len(), 3);
+        assert!(view.snapshot.profiles.is_empty());
+        datasource.resolver.close().await.expect("close manager");
     }
 
     #[tokio::test]

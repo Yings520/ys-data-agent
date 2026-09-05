@@ -28,6 +28,7 @@ use super::{
         ResultsViewportRequest, project_results_viewport,
     },
     composer::ComposerState,
+    datasource_management::{DatasourceAction, DatasourceRequest, DatasourceScreen},
     mode_picker::{ModePickerAction, ModePickerOutcome, ModePickerState, TuiQueryMode},
     model_selection::{ModelSelectionAction, ModelSelectionOutcome, ModelSelectionState},
     navigation::{ContentRoute, FocusTarget, NavigationState, ProviderNavigationState},
@@ -57,7 +58,7 @@ pub enum DetailKind {
     Sql,
     Diagnostics,
     Tasks,
-    Connections,
+    Datasources,
     Providers,
     Model,
 }
@@ -370,6 +371,20 @@ impl TuiApp {
         self.header.context_unavailable = true;
     }
 
+    fn apply_datasource_snapshot(&mut self, snapshot: &ys_agent_core::DatasourceSnapshot) {
+        let label = snapshot
+            .selection
+            .header
+            .as_ref()
+            .map(|header| header.name.as_str())
+            .unwrap_or("Not configured");
+        self.connection_label = label.to_owned();
+        self.permission_label = "read-only".to_owned();
+        self.header.datasource = label.to_owned();
+        self.header.read_only = "read-only".to_owned();
+        self.header.context_unavailable = false;
+    }
+
     pub fn display_context_unavailable(&self) -> bool {
         self.header.context_unavailable
     }
@@ -541,6 +556,12 @@ pub struct TuiController {
     pending_command_id: Option<CommandId>,
     pending_submission: Option<JoinHandle<ys_agent_core::CoreResult<SubmissionCompletion>>>,
     provider_screen: Option<ProviderManagementScreen>,
+    datasource_screen: Option<DatasourceScreen>,
+    datasource_guard: AsyncResultGuard,
+    datasource_tasks: JoinSet<(
+        AsyncOperationTicket,
+        Result<DatasourceOperationPayload, ys_agent_core::DsError>,
+    )>,
     provider_operations: AsyncOperationRegistry<ProviderOperationPayload>,
     provider_route_key: Option<RouteKey>,
     pending_oauth_operation_id: Option<OperationId>,
@@ -637,6 +658,12 @@ pub(super) enum ProviderOperationPayload {
     },
 }
 
+pub(super) struct DatasourceOperationPayload {
+    view: ys_agent_core::DatasourceView,
+    message: String,
+    profile_id: Option<ProfileId>,
+}
+
 impl TuiController {
     pub fn new(
         service: Arc<dyn AgentServiceApi>,
@@ -655,6 +682,9 @@ impl TuiController {
             pending_command_id: None,
             pending_submission: None,
             provider_screen: None,
+            datasource_screen: None,
+            datasource_guard: AsyncResultGuard::default(),
+            datasource_tasks: JoinSet::new(),
             provider_operations: AsyncOperationRegistry::new(
                 ProviderOperationPolicy::new(Duration::from_secs(30), 2)
                     .expect("fixed Provider operation policy is valid"),
@@ -1698,16 +1728,7 @@ impl TuiController {
                 app.pending_preferences = Some(preferences);
             }
             InputAction::Help => app.transient = Some(TransientView::Help),
-            InputAction::Connections => app.show_detail(
-                DetailKind::Connections,
-                DetailView {
-                    title: "Connections".to_owned(),
-                    lines: vec![format!(
-                        "{} · {}",
-                        app.connection_label, app.permission_label
-                    )],
-                },
-            ),
+            InputAction::Datasource => self.open_datasource_management(app).await?,
             InputAction::Providers => self.open_provider_management(app, false).await?,
             InputAction::Mode => app.open_mode_picker(),
             InputAction::Model => self.open_model_selection(app).await?,
@@ -1859,6 +1880,200 @@ impl TuiController {
         );
         self.provider_screen = Some(screen);
         Ok(())
+    }
+
+    pub(super) async fn open_datasource_management(
+        &mut self,
+        app: &mut TuiApp,
+    ) -> ys_agent_core::CoreResult<()> {
+        let session_id = self.ensure_session().await?;
+        let scope = ys_agent_core::DatasourceScope {
+            workspace_id: self.workspace_id,
+            session_id,
+        };
+        let view = self
+            .service
+            .datasource_view(scope)
+            .await
+            .map_err(datasource_to_core)?;
+        let screen = DatasourceScreen::new(view);
+        app.apply_datasource_snapshot(&screen.view().snapshot);
+        app.show_detail(
+            DetailKind::Datasources,
+            DetailView {
+                title: "Datasource management".into(),
+                lines: screen.lines(),
+            },
+        );
+        self.datasource_screen = Some(screen);
+        Ok(())
+    }
+
+    pub(super) fn datasource_screen(&self) -> Option<&DatasourceScreen> {
+        self.datasource_screen.as_ref()
+    }
+
+    pub(super) fn apply_datasource_action(
+        &mut self,
+        app: &mut TuiApp,
+        action: DatasourceAction,
+    ) -> ys_agent_core::CoreResult<()> {
+        let request = self
+            .datasource_screen
+            .as_mut()
+            .and_then(|screen| screen.reduce(action));
+        self.refresh_datasource_detail(app);
+        if let Some(request) = request {
+            self.start_datasource_operation(app, request)?;
+        }
+        Ok(())
+    }
+
+    fn start_datasource_operation(
+        &mut self,
+        app: &mut TuiApp,
+        mut request: DatasourceRequest,
+    ) -> ys_agent_core::CoreResult<()> {
+        let ticket = self
+            .datasource_guard
+            .start(AsyncChannel::DatasourceMutation, app.navigation.route_key())
+            .map_err(|_| {
+                ys_agent_core::CoreError::validation(
+                    "datasource_operation_busy",
+                    "one datasource operation is already running",
+                )
+            })?;
+        if let DatasourceRequest::Validate(validate) = &mut request {
+            validate.operation_id = ticket.operation_id;
+        }
+        let service = self.service.clone();
+        self.datasource_tasks.spawn(async move {
+            let result = match request {
+                DatasourceRequest::Save(request) => {
+                    let scope = request.write.scope;
+                    match service.datasource_save(request).await {
+                        Ok(detail) => service.datasource_view(scope).await.map(|view| {
+                            DatasourceOperationPayload {
+                                view,
+                                message: "Profile saved. Press v to validate the real connection."
+                                    .into(),
+                                profile_id: Some(detail.profile.profile_id),
+                            }
+                        }),
+                        Err(error) => Err(error),
+                    }
+                }
+                DatasourceRequest::Validate(request) => {
+                    let scope = request.write.scope;
+                    let profile_id = request.revision.profile_id;
+                    match service.datasource_validate(request).await {
+                        Ok(report) => service.datasource_view(scope).await.map(|view| {
+                            DatasourceOperationPayload {
+                                view,
+                                message: format!("Connection validation: {:?}", report.state),
+                                profile_id: Some(profile_id),
+                            }
+                        }),
+                        Err(error) => Err(error),
+                    }
+                }
+                DatasourceRequest::Select(request) => {
+                    let scope = request.write.scope;
+                    let profile_id = request.revision.profile_id;
+                    let kind = request.kind;
+                    match service.datasource_select(request).await {
+                        Ok(_) => service.datasource_view(scope).await.map(|view| {
+                            DatasourceOperationPayload {
+                                view,
+                                message: format!("Datasource selected for {kind:?}."),
+                                profile_id: Some(profile_id),
+                            }
+                        }),
+                        Err(error) => Err(error),
+                    }
+                }
+                DatasourceRequest::Delete(request) => {
+                    let scope = request.write.scope;
+                    match service.datasource_delete(request).await {
+                        Ok(_) => service.datasource_view(scope).await.map(|view| {
+                            DatasourceOperationPayload {
+                                view,
+                                message: "Datasource deleted.".into(),
+                                profile_id: None,
+                            }
+                        }),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            (ticket, result)
+        });
+        Ok(())
+    }
+
+    pub(super) fn apply_ready_datasource_operation(&mut self, app: &mut TuiApp) -> bool {
+        let Some(joined) = self.datasource_tasks.try_join_next() else {
+            return false;
+        };
+        let Ok((ticket, result)) = joined else {
+            return false;
+        };
+        if !self
+            .datasource_guard
+            .accept_completion(ticket, app.navigation.route_key())
+        {
+            return false;
+        }
+        let Some(screen) = self.datasource_screen.as_mut() else {
+            return false;
+        };
+        match result {
+            Ok(payload) => {
+                screen.complete(payload.view, payload.message);
+                if let Some(profile_id) = payload.profile_id {
+                    screen.select_profile(profile_id);
+                }
+                app.apply_datasource_snapshot(&screen.view().snapshot);
+            }
+            Err(error) => screen.fail(format!(
+                "Datasource error: {:?}; action: {:?}",
+                error.code, error.remediation
+            )),
+        }
+        self.refresh_datasource_detail(app);
+        true
+    }
+
+    pub(super) async fn close_or_cancel_datasource(&mut self, app: &mut TuiApp) {
+        if let Some(ticket) = self
+            .datasource_guard
+            .active(AsyncChannel::DatasourceMutation)
+        {
+            self.datasource_guard.cancel(ticket);
+            let _ = self
+                .service
+                .cancel_datasource_operation(ticket.operation_id)
+                .await;
+            if let Some(screen) = self.datasource_screen.as_mut() {
+                screen.fail("Operation cancelled; committed operations remain recoverable.");
+            }
+            self.refresh_datasource_detail(app);
+            return;
+        }
+        self.datasource_screen = None;
+        app.close_transient();
+    }
+
+    fn refresh_datasource_detail(&self, app: &mut TuiApp) {
+        if let Some(screen) = &self.datasource_screen {
+            app.show_detail(
+                DetailKind::Datasources,
+                DetailView {
+                    title: "Datasource management".into(),
+                    lines: screen.lines(),
+                },
+            );
+        }
     }
 
     async fn open_model_selection(&mut self, app: &mut TuiApp) -> ys_agent_core::CoreResult<()> {
@@ -3281,6 +3496,13 @@ fn provider_to_core(error: ys_agent_core::ProviderManagementError) -> ys_agent_c
     ys_agent_core::CoreError::validation(error.code(), error.code())
 }
 
+fn datasource_to_core(error: ys_agent_core::DsError) -> ys_agent_core::CoreError {
+    ys_agent_core::CoreError::validation(
+        "datasource_management_failed",
+        format!("{:?}; action: {:?}", error.code, error.remediation),
+    )
+}
+
 impl Drop for TuiController {
     fn drop(&mut self) {
         if let Some(handle) = self.pending_submission.take() {
@@ -4278,7 +4500,7 @@ mod event_timeline_tests {
             for tab in ["Summary", "Results", "SQL", "Schema", "Evidence"] {
                 assert!(rendered.contains(tab));
             }
-            assert!(rendered.contains("/mode  /model  /exit  Esc back"));
+            assert!(rendered.contains("/mode  /model  /datasource"));
         }
         for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Esc] {
             crate::tui::event_loop::handle_terminal_event(

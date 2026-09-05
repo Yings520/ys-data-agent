@@ -4844,6 +4844,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.29.0",
+ "duckdb",
  "futures",
  "ratatui",
  "ratatui-textarea",

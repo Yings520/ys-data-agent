@@ -62,6 +62,22 @@ impl std::fmt::Debug for SourcePolicy {
 }
 
 impl SourcePolicy {
+    /// Keeps management available before a v2 policy is supplied while denying every physical
+    /// target. It cannot produce validation evidence or authorize a Run.
+    pub fn deny_all(budget: QueryBudget) -> Self {
+        let document = PolicyDocument {
+            schema_version: 2,
+            allowed_sources: BTreeMap::new(),
+        };
+        let digest = DatasourceDigest::of(&(&document, &budget))
+            .expect("the empty policy and validated budget serialize");
+        Self {
+            document,
+            budget,
+            digest,
+        }
+    }
+
     pub fn from_json_bytes(bytes: &[u8], budget: QueryBudget) -> DsResult<Self> {
         let document: PolicyDocument =
             serde_json::from_slice(bytes).map_err(|_| error(DsErrorCode::ConfigIncompatible))?;

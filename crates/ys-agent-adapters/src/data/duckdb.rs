@@ -95,7 +95,6 @@ impl DuckDbConnector {
             || revision.credential.is_some()
             || revision.fields.len() != 1
             || input.governance.allowed_roots.is_empty()
-            || input.governance.budget.max_concurrency != 1
             || input.governance.data_scope.relations.is_empty()
             || input.governance.result_policy != input.governance.data_scope.relations
             || revision.workspace_id != input.governance.data_scope.workspace_id

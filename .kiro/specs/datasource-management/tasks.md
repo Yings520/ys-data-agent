@@ -64,7 +64,7 @@
   - _Boundary: RuntimeStore、Run Service、Harness、Query Tools、Source Policy、Context、Doctor 与 Artifact 的运行集成_
   - _Depends: 6_
 
-- [ ] 8. 集成可直接使用的数据源 TUI
+- [x] 8. 集成可直接使用的数据源 TUI
   - 复用 palette.rs 的 Selector 与 async_guard，以 Connector 元数据生成表单；键盘完成新增、编辑、验证、搜索、选择、默认、删除，/connections 导向同一流程。
   - 接通生产 bootstrap、异步服务动作和统一 Header/列表快照；支持逐层 Esc、全部导航键、秘密遮蔽、保留非秘密输入、忙态取消及陈旧回包隔离；切换保留对话、Task 和 Artifact。
   - 完成态：真实按键分别配置 SQLite、PostgreSQL 直连、DuckDB，验证后从同一 Session 发起真实 Query；无需编辑连接配置或另开 Shell，重启可再次使用保存的 Profile。

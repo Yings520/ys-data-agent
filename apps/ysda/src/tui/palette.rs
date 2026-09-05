@@ -2,6 +2,7 @@
 pub enum CommandKind {
     Mode,
     Model,
+    Datasource,
     Exit,
 }
 
@@ -30,12 +31,22 @@ impl CommandSpec {
     }
 }
 
-const COMMAND_CATALOG: [CommandSpec; 3] = [
+const COMMAND_CATALOG: [CommandSpec; 5] = [
     CommandSpec::product(CommandKind::Mode, "mode", "Choose Auto or Query mode"),
     CommandSpec::product(
         CommandKind::Model,
         "model",
         "Choose active Provider and model",
+    ),
+    CommandSpec::product(
+        CommandKind::Datasource,
+        "datasource",
+        "Manage query datasources",
+    ),
+    CommandSpec::product(
+        CommandKind::Datasource,
+        "connections",
+        "Manage query datasources",
     ),
     CommandSpec::product(CommandKind::Exit, "exit", "Exit the CLI"),
 ];
@@ -157,6 +168,16 @@ where
     pub fn page_down(&mut self) {
         self.selected =
             (self.selected + self.visible_rows.max(1)).min(self.matches.len().saturating_sub(1));
+        self.keep_selected_visible();
+    }
+
+    pub fn home(&mut self) {
+        self.selected = 0;
+        self.keep_selected_visible();
+    }
+
+    pub fn end(&mut self) {
+        self.selected = self.matches.len().saturating_sub(1);
         self.keep_selected_visible();
     }
 
@@ -324,7 +345,7 @@ mod tests {
                 .rows()
                 .map(|(_, command)| command.name)
                 .collect::<Vec<_>>(),
-            vec!["mode", "model", "exit"]
+            vec!["mode", "model", "datasource", "connections", "exit"]
         );
         assert_eq!(palette.rows().filter(|(selected, _)| *selected).count(), 1);
         palette.move_down();
@@ -359,7 +380,7 @@ mod tests {
         palette.clear();
 
         assert!(palette.update("/"));
-        assert_eq!(palette.visible_row_count(), 3);
+        assert_eq!(palette.visible_row_count(), 5);
     }
 
     #[test]

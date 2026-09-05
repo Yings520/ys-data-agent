@@ -11,19 +11,22 @@ use ys_agent_core::{
     ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore, CellValue, CommandId,
     CommandReceipt, CommandResultKind, CompatibilityEvidence, CompatibilityEvidenceView,
     ContextManifest, CoreError, CoreResult, CredentialGeneration, CredentialKind,
-    CredentialMutationRequest, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
-    DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, EventActor, EventEnvelope,
-    ExportFormat, ListModelCandidatesRequest, ModelCandidateBatch, ModelMessage, ModelProvider,
-    ModelRequest, ModelRole, ModelSelectionSnapshot, OAuthConnectionView, OperationId,
-    PendingRunEvent, Principal, ProfileDetail, ProfileId, ProfileName, ProfileRevision,
-    ProfileRevisionRepository, ProfileSummary, ProviderCatalogView, ProviderCredentialReference,
-    ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi,
-    ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
-    ProviderResult, PutArtifact, QueryResult, RemoteRevocationOutcome, RetentionPolicy, Run,
-    RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
-    RunProviderBindingSource, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore,
-    Sensitivity, Session, SessionId, SwitchModelRequest, Task, TaskId, ValidateProfileRequest,
-    ValidationVersions, WorkflowKind, WorkspaceId,
+    CredentialMutationRequest, CredentialVault, CredentialViewStatus, DatasourceDetail,
+    DatasourceDoctorReport, DatasourceDoctorRequest, DatasourceManagementApi, DatasourceReceipt,
+    DatasourceScope, DatasourceView, DeleteDatasource, DeleteProfileRequest,
+    DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, DsError, DsErrorCode,
+    DsRemediation, DsResult, EventActor, EventEnvelope, ExportFormat, ListModelCandidatesRequest,
+    ModelCandidateBatch, ModelMessage, ModelProvider, ModelRequest, ModelRole,
+    ModelSelectionSnapshot, OAuthConnectionView, OperationId, PendingRunEvent, Principal,
+    ProfileDetail, ProfileId, ProfileName, ProfileRevision, ProfileRevisionRepository,
+    ProfileSummary, ProviderCatalogView, ProviderCredentialReference, ProviderDoctorView,
+    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi, ProviderManagementError,
+    ProviderModelId, ProviderParameters, ProviderRemediation, ProviderResult, PutArtifact,
+    QueryResult, RemoteRevocationOutcome, RetentionPolicy, Run, RunEventKind, RunId,
+    RunProviderBinding, RunProviderBindingRepository, RunProviderBindingSource, RunSnapshot,
+    RunStatus, RuntimeCommandBatch, RuntimeStore, SaveDatasource, SelectDatasource, Sensitivity,
+    Session, SessionId, SwitchModelRequest, Task, TaskId, ValidateDatasource,
+    ValidateProfileRequest, ValidationReport, ValidationVersions, WorkflowKind, WorkspaceId,
 };
 
 use crate::{
@@ -471,6 +474,54 @@ pub trait AgentServiceApi: Send + Sync {
 
     async fn doctor(&self) -> CoreResult<DoctorReport>;
 
+    fn datasource_management_api(&self) -> Option<&dyn DatasourceManagementApi> {
+        None
+    }
+
+    async fn datasource_view(&self, scope: DatasourceScope) -> DsResult<DatasourceView> {
+        datasource_api(self)?.view(scope).await
+    }
+
+    async fn datasource_save(&self, request: SaveDatasource) -> DsResult<DatasourceDetail> {
+        datasource_api(self)?.save(request).await
+    }
+
+    async fn datasource_validate(&self, request: ValidateDatasource) -> DsResult<ValidationReport> {
+        datasource_api(self)?.validate(request).await
+    }
+
+    async fn datasource_select(
+        &self,
+        request: SelectDatasource,
+    ) -> DsResult<ys_agent_core::SelectionSnapshot> {
+        datasource_api(self)?.select(request).await
+    }
+
+    async fn datasource_delete(
+        &self,
+        request: DeleteDatasource,
+    ) -> DsResult<ys_agent_core::SelectionSnapshot> {
+        datasource_api(self)?.delete(request).await
+    }
+
+    async fn datasource_doctor(
+        &self,
+        request: DatasourceDoctorRequest,
+    ) -> DsResult<DatasourceDoctorReport> {
+        datasource_api(self)?.doctor(request).await
+    }
+
+    async fn cancel_datasource_operation(&self, operation_id: OperationId) -> DsResult<()> {
+        datasource_api(self)?.cancel(operation_id).await
+    }
+
+    async fn datasource_receipt(
+        &self,
+        command_id: CommandId,
+    ) -> DsResult<Option<DatasourceReceipt>> {
+        datasource_api(self)?.receipt(command_id).await
+    }
+
     /// Returns the composed Provider-management boundary when this process has been bootstrapped
     /// for Provider management. TUI callers use only the default forwarding methods below.
     fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
@@ -662,6 +713,17 @@ fn provider_api<T: AgentServiceApi + ?Sized>(
     })
 }
 
+fn datasource_api<T: AgentServiceApi + ?Sized>(
+    service: &T,
+) -> DsResult<&dyn DatasourceManagementApi> {
+    service.datasource_management_api().ok_or(DsError {
+        code: DsErrorCode::Storage,
+        field: None,
+        remediation: DsRemediation::Retry,
+        operation_id: None,
+    })
+}
+
 pub struct InProcessAgentService {
     workspace_id: WorkspaceId,
     store: Arc<dyn RuntimeStore>,
@@ -677,6 +739,7 @@ pub struct InProcessAgentService {
     run_provider_bindings: Arc<dyn RunProviderBindingSource>,
     run_datasource_bindings: Option<Arc<dyn ys_agent_core::RunDatasourceBindingSource>>,
     provider_management: Option<Arc<dyn ProviderManagementApi>>,
+    datasource_management: Option<Arc<dyn DatasourceManagementApi>>,
     tui_display_context_source: Arc<dyn TuiDisplayContextSource>,
 }
 
@@ -1123,6 +1186,7 @@ impl InProcessAgentService {
             run_provider_bindings: Arc::new(UnavailableRunProviderBindingSource),
             run_datasource_bindings: None,
             provider_management: None,
+            datasource_management: None,
             tui_display_context_source: Arc::new(UnconfiguredTuiDisplayContextSource),
         }
     }
@@ -1178,6 +1242,14 @@ impl InProcessAgentService {
         provider_management: Arc<dyn ProviderManagementApi>,
     ) -> Self {
         self.provider_management = Some(provider_management);
+        self
+    }
+
+    pub fn with_datasource_management_api(
+        mut self,
+        datasource_management: Arc<dyn DatasourceManagementApi>,
+    ) -> Self {
+        self.datasource_management = Some(datasource_management);
         self
     }
 
@@ -1551,6 +1623,10 @@ impl AgentServiceApi for InProcessAgentService {
 
     fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
         self.provider_management.as_deref()
+    }
+
+    fn datasource_management_api(&self) -> Option<&dyn DatasourceManagementApi> {
+        self.datasource_management.as_deref()
     }
 
     async fn create_session(
