@@ -47,7 +47,7 @@
   - _Boundary: DuckDB Connector、依赖构建与既有 MetricSqlCompiler 的驱动集成_
   - _Depends: 4_
 
-- [ ] 6. 集成 Profile 管理与连接生命周期
+- [x] 6. 集成 Profile 管理与连接生命周期
   - 先完成 Source Policy v2 解析、物理目标精确匹配与 allowed_roots 检查及测试，作为 Ready/激活前提，不生成或扩大授权。
   - 实现元数据驱动保存/编辑/删除、本地及连接验证、Ready 判定、Session 选择和 Workspace 默认；操作完成返回统一已提交快照，支持取消、幂等回执、并发冲突与恢复。
   - Manager 按完整 binding 身份惰性创建并合并并发请求；验证连接关闭，激活先准备后提交，失败关闭候选；旧连接退休后仅供原 Run，终态释放，退出关闭。
