@@ -22,7 +22,7 @@
   - _Boundary: SqliteDatasourceRepository、RuntimeStore 命令事务与 DatasourceVault 的持久化集成_
   - _Depends: 1_
 
-- [ ] 3. 建立真实 Connector 目录并接通 SQLite
+- [x] 3. 建立真实 Connector 目录并接通 SQLite
   - 先验证 DuckDB 锁定依赖、原生链接、许可和平台构建，实际驱动在任务 5 接入；三驱动开发测试使用显式受信上下文，不伪造生产授权。
   - 按 Datus Registry/Manager 模式提供真实注册项、配置字段、能力、版本及 Factory；目录不建连接，冲突 fail closed，未通过证据门禁的驱动不标记 Supported。
   - 接通已有 SQLite 文件的配置、只读打开、无业务行 probe、Catalog/Preflight/Query/Freshness 和关闭；拒绝缺文件创建、越界路径、URI/ATTACH、扩展与写出。

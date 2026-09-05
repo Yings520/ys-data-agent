@@ -200,11 +200,19 @@ impl SqlReadOnlyPolicy {
             );
         }
 
-        if let Some(function) = facts
-            .functions
-            .iter()
-            .find(|name| self.blocked_functions.contains(*name))
-        {
+        if facts.has_dynamic_relation {
+            return SqlPolicyDecision::rejected(
+                "dynamic_relation_rejected",
+                "dynamic relation is not allowed",
+            );
+        }
+        if let Some(function) = facts.functions.iter().find(|name| {
+            self.blocked_functions.contains(*name)
+                || name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|part| self.blocked_functions.contains(part))
+        }) {
             return SqlPolicyDecision::rejected(
                 "function_not_allowed",
                 format!("function {function} is blocked by query policy"),
@@ -335,8 +343,11 @@ impl Visitor for AstFacts {
                 }
             }
             Expr::Function(function) => {
-                self.functions
-                    .insert(function.name.to_string().to_ascii_lowercase());
+                if let Some(name) = normalized_object_name(&function.name) {
+                    self.functions.insert(name);
+                } else {
+                    self.has_dynamic_relation = true;
+                }
             }
             _ => {}
         }

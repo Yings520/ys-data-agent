@@ -8,6 +8,7 @@ license.workspace = true
 async-trait.workspace = true
 bigdecimal.workspace = true
 chrono.workspace = true
+duckdb.workspace = true
 futures.workspace = true
 liter-llm.workspace = true
 oauth2.workspace = true
