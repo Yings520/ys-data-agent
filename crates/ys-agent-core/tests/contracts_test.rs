@@ -48,7 +48,10 @@ fn core_serializes_a_credential_reference_not_a_secret() {
 fn credential_reference_exposes_only_its_environment_variable_name() {
     let reference = CredentialReference::new("env:TEST_CREDENTIAL").expect("valid ref");
 
-    assert_eq!(reference.environment_variable_name(), "TEST_CREDENTIAL");
+    assert_eq!(
+        reference.environment_variable_name(),
+        Some("TEST_CREDENTIAL")
+    );
 }
 
 #[test]
@@ -64,6 +67,9 @@ fn sensitive_query_artifacts_require_retention_metadata() {
         .expect_err("restricted artifacts need retention and expiry");
     assert_eq!(error.code(), "missing_retention_policy");
 }
+
+#[path = "support/datasource.rs"]
+mod datasource_support;
 
 fn binding_for(run_id: ys_agent_core::RunId) -> ys_agent_core::RunProviderBinding {
     let profile_id = ProfileId::new();
@@ -103,6 +109,7 @@ fn production_run_command_requires_matching_binding_and_emits_provider_bound_fir
     let command = CreateRunCommand::new(
         snapshot,
         binding_for(run.id),
+        datasource_support::datasource_binding(run.id),
         vec![PendingRunEvent {
             actor: ys_agent_core::EventActor::System,
             kind: RunEventKind::RunStarted,
@@ -122,8 +129,18 @@ fn production_run_command_requires_matching_binding_and_emits_provider_bound_fir
     let mismatch = CreateRunCommand::new(
         other_run.snapshot(serde_json::json!({}), None, None, None),
         binding_for(run.id),
+        datasource_support::datasource_binding(other_run.id),
         Vec::new(),
     )
     .expect_err("a binding cannot be attached to a different Run");
     assert_eq!(mismatch.code(), "run_provider_binding_mismatch");
+
+    let mismatch = CreateRunCommand::new(
+        other_run.snapshot(serde_json::json!({}), None, None, None),
+        binding_for(other_run.id),
+        datasource_support::datasource_binding(run.id),
+        Vec::new(),
+    )
+    .expect_err("datasource binding must belong to the same Run");
+    assert_eq!(mismatch.code(), "run_datasource_binding_mismatch");
 }

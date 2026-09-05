@@ -2,6 +2,8 @@
 
 ## Introduction
 
+本期连接范围：SQLite 与 DuckDB 本地文件；PostgreSQL 普通 TCP 直连，包括 localhost、本机映射端口及可达远程主机。SSH 隧道不在本 Feature 范围。
+
 `datasource-management` 为 v0.2 Trustworthy Query Runtime 增加真实、受治理的本地数据源连接 Profile 管理。Data Engineer 与技术型分析师可以从 TUI 查看、创建、编辑、验证、选择和删除多个连接，并明确区分当前 Session 使用的数据源与 Workspace 默认数据源。v0.2 的正式支持范围是 SQLite、PostgreSQL 与 DuckDB；三者都必须完成真实连接、只读门禁、能力验证和 Query Run 绑定，不能只出现在选择列表中。
 
 该 Feature 参考已审核的外部数据源实现及其配置、Connector Registry、`DBManager`、`DatasourceApp`、`DatasourceCommands` 和契约测试，采用“配置驱动 + Connector 注册元数据 + Manager 生命周期 + 上层统一能力”以及 Datasource/Database 分离思路。YS Data Agent 同时保持自身的 Secret 隔离、原子持久化、不可变 Run 绑定和 fail-closed Query 契约，并修正参考实现中明文 Credential、仅按名称集合缓存、失败回滚不足和无治理运行时安装的风险。

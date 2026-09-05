@@ -2,6 +2,7 @@ mod app;
 mod artifact;
 mod async_guard;
 mod composer;
+pub mod datasource_management;
 mod event_loop;
 mod input;
 mod mode_picker;

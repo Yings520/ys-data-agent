@@ -30,12 +30,53 @@ rtk docker compose \
   --file "${compose_file}" \
   up --detach --wait
 
+rtk cargo test \
+  -p ys-agent-adapters \
+  --test datasource_release_evidence_test \
+  -- --nocapture
+
+rtk docker compose \
+  --project-name "${compose_project}" \
+  --file "${compose_file}" \
+  exec --no-TTY postgres \
+  psql --username ysda --dbname ysda_test --tuples-only --no-align \
+  --command 'SHOW server_version'
+
+rtk cargo test \
+  -p ys-agent-adapters \
+  --test managed_sqlite_test \
+  -- --nocapture
+
+rtk cargo test \
+  -p ys-agent-adapters \
+  --test managed_duckdb_test \
+  -- --nocapture
+
+rtk cargo test \
+  -p ys-agent-adapters \
+  --test managed_postgres_test \
+  -- --ignored --nocapture
+
 rtk env \
   YSDA_TEST_POSTGRES_URL=postgres://ysda:ysda-test@127.0.0.1:55432/ysda_test \
   cargo test \
   -p ys-agent-adapters \
   --test postgres_connector_test \
   -- --ignored
+
+rtk cargo test \
+  -p ys-agent-runtime \
+  --test datasource_runtime_test \
+  service_runs_real_postgres_save_validate_and_select \
+  -- --ignored --nocapture
+
+rtk env \
+  YSDA_TEST_POSTGRES_PASSWORD=ysda-reader-test \
+  cargo test \
+  -p ysda \
+  --test datasource_tui_test \
+  real_three_driver_forms_save_validate_select_and_set_default \
+  -- --ignored --nocapture
 
 rtk cargo test -p ysda --test query_eval_test
 rtk cargo test -p ysda model_protocol_probe --lib

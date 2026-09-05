@@ -577,6 +577,9 @@ fn verified_query_result_uses_a_full_artifact_panel_with_a_result_rail() {
                 metric: None,
                 semantic_status: SemanticStatus::Observed,
                 source_id: SourceId::new("warehouse"),
+                datasource_revision: None,
+                datasource_context: None,
+                datasource_binding: None,
                 source_relations: Vec::new(),
                 time_range: None,
                 executed_sql: None,
@@ -589,6 +592,7 @@ fn verified_query_result_uses_a_full_artifact_panel_with_a_result_rail() {
                     hard_failures: Vec::new(),
                     warnings: Vec::new(),
                     evidence_refs: Vec::new(),
+                    datasource_binding: None,
                 },
                 assumptions: Vec::new(),
                 warning_codes: Vec::new(),
@@ -1060,7 +1064,7 @@ fn artifact_footer_uses_the_shared_command_catalog_and_back_hint() {
     let mut app = TuiApp::for_principal(Principal::local_operator("ysc"));
     app.push_route(ContentRoute::Artifact);
     let rendered = render_to_string(&app, 100, 28);
-    assert!(rendered.contains("/mode  /model  /exit  Esc back"));
+    assert!(rendered.contains("/mode  /model  /datasource  /connections  /exit  Esc back"));
 }
 
 #[test]

@@ -18,47 +18,82 @@ impl SourceId {
 
 /// Opaque credential locator only. Never a DSN/password/token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct CredentialReference(String);
+#[serde(try_from = "String", into = "String")]
+pub struct CredentialReference(CredentialLocator);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialLocator {
+    Env(String),
+    DatasourceVault(crate::DatasourceSecretRef),
+}
 
 impl CredentialReference {
     pub fn new(value: impl Into<String>) -> CoreResult<Self> {
         let value = value.into();
-        if value.chars().any(|c| c.is_whitespace()) {
-            return Err(CoreError::validation(
-                "invalid_credential_reference",
-                "credential reference must not contain whitespace",
-            ));
+        if let Some(name) = value.strip_prefix("env:") {
+            let mut chars = name.chars();
+            if chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Ok(Self(CredentialLocator::Env(name.to_owned())));
+            }
+        } else if let Some(locator) = value.strip_prefix("datasource:") {
+            let parts: Vec<_> = locator.split(':').collect();
+            if let [workspace, profile, generation] = parts.as_slice()
+                && let (Ok(workspace), Ok(profile), Ok(generation)) =
+                    (workspace.parse(), profile.parse(), generation.parse())
+            {
+                return crate::DatasourceSecretRef::new(workspace, profile, generation)
+                    .map(Self::from_datasource);
+            }
         }
-
-        if value.contains("://") && value.starts_with("env:") {
-            return Err(CoreError::validation(
-                "inline_secret_rejected",
-                "credential reference must not embed URLs or other secrets",
-            ));
-        }
-
-        let Some((scheme, rest)) = value.split_once(':') else {
-            return Err(CoreError::validation(
-                "invalid_credential_reference",
-                "credential reference requires a scheme such as env:",
-            ));
-        };
-
-        if scheme != "env" || rest.is_empty() {
-            return Err(CoreError::validation(
-                "invalid_credential_reference",
-                "v0.2 only supports env:NAME credential references",
-            ));
-        }
-        Ok(Self(value))
+        Err(CoreError::validation(
+            "invalid_credential_reference",
+            "credential reference must identify an environment variable or datasource generation",
+        ))
     }
 
     /// Returns the name of the environment variable identified by this reference.
-    pub fn environment_variable_name(&self) -> &str {
-        self.0
-            .strip_prefix("env:")
-            .expect("CredentialReference only permits env references")
+    pub fn environment_variable_name(&self) -> Option<&str> {
+        match &self.0 {
+            CredentialLocator::Env(name) => Some(name),
+            CredentialLocator::DatasourceVault(_) => None,
+        }
+    }
+
+    pub fn from_datasource(reference: crate::DatasourceSecretRef) -> Self {
+        Self(CredentialLocator::DatasourceVault(reference))
+    }
+
+    pub fn datasource_reference(&self) -> Option<crate::DatasourceSecretRef> {
+        match &self.0 {
+            CredentialLocator::Env(_) => None,
+            CredentialLocator::DatasourceVault(reference) => Some(*reference),
+        }
+    }
+}
+
+impl TryFrom<String> for CredentialReference {
+    type Error = CoreError;
+
+    fn try_from(value: String) -> CoreResult<Self> {
+        Self::new(value)
+    }
+}
+
+impl From<CredentialReference> for String {
+    fn from(value: CredentialReference) -> Self {
+        match value.0 {
+            CredentialLocator::Env(name) => format!("env:{name}"),
+            CredentialLocator::DatasourceVault(reference) => format!(
+                "datasource:{}:{}:{}",
+                reference.workspace_id(),
+                reference.profile_id(),
+                reference.generation()
+            ),
+        }
     }
 }
 
@@ -73,6 +108,30 @@ pub struct CapabilityDescriptor {
     pub supports_explain: bool,
     pub supports_read_only_tx: bool,
     pub max_concurrency: usize,
+    #[serde(default)]
+    pub preflight_reader: bool,
+    #[serde(default)]
+    pub read_only_mechanism: Option<ReadOnlyMechanism>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOnlyMechanism {
+    FileReadOnly,
+    TransactionReadOnly,
+}
+
+impl CapabilityDescriptor {
+    /// A capability claim is necessary but not sufficient for Ready: probe and Policy evidence
+    /// must independently confirm the exact revision before activation.
+    pub fn supports_governed_query(&self) -> bool {
+        self.catalog_reader
+            && self.sql_query_executor
+            && self.freshness_reader
+            && self.preflight_reader
+            && self.read_only_mechanism.is_some()
+            && self.max_concurrency > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

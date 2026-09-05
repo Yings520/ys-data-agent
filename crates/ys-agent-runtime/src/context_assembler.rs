@@ -6,11 +6,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use ys_agent_core::{
-    ArtifactKind, ArtifactMetadata, ArtifactStore, ContextEvidence, ContextManifest,
-    ContextOmission, ContextSourceType, CoreError, CoreResult, EventActor, InstructionTrust,
-    MetricDefinition, MetricProvider, MetricStatus, ModelMessage, ModelRequest, ModelRole,
-    PendingRunEvent, PutArtifact, QueryContextProvider, RetentionPolicy, RunEventKind, RunId,
-    Sensitivity, TaskId, ToolSpec, WorkspaceId,
+    AllowedDataScope, ArtifactKind, ArtifactMetadata, ArtifactStore, ContextEvidence,
+    ContextManifest, ContextOmission, ContextSourceType, CoreError, CoreResult, EventActor,
+    InstructionTrust, MetricDefinition, MetricProvider, MetricStatus, ModelMessage, ModelRequest,
+    ModelRole, PendingRunEvent, PutArtifact, QueryContextProvider, RetentionPolicy, RunEventKind,
+    RunId, Sensitivity, TaskId, ToolSpec, WorkspaceId,
 };
 
 use crate::{
@@ -114,9 +114,24 @@ impl ContextAssembler {
         request: &ContextAssemblyRequest,
         tool_view: &ToolViewSnapshot,
     ) -> CoreResult<AssembledContext> {
+        self.assemble_scoped(request, tool_view, None).await
+    }
+
+    pub async fn assemble_scoped(
+        &self,
+        request: &ContextAssemblyRequest,
+        tool_view: &ToolViewSnapshot,
+        scope: Option<&AllowedDataScope>,
+    ) -> CoreResult<AssembledContext> {
         let mut candidates = Vec::<RankedEvidence>::new();
         let mut omissions = Vec::<ContextOmission>::new();
-        let metric = self.metrics.get_metric(&request.query).await?;
+        let metric = self
+            .metrics
+            .get_metric(&request.query)
+            .await?
+            .filter(|metric| {
+                scope.is_none_or(|scope| scope.relations.contains_key(&metric.source_relation))
+            });
         let relation_search = if let Some(metric) = metric.as_ref() {
             if metric.status != MetricStatus::Active {
                 return Err(CoreError::validation(
@@ -136,13 +151,27 @@ impl ContextAssembler {
         };
         for evidence in self.dbt.load_evidence(relation_search).await? {
             if evidence.source_type == ContextSourceType::DbtManifest {
-                candidates.push(RankedEvidence { rank: 1, evidence });
+                if scope.is_none_or(|scope| evidence_relation_allowed(&evidence, scope)) {
+                    candidates.push(RankedEvidence { rank: 1, evidence });
+                } else {
+                    omissions.push(ContextOmission {
+                        uri: evidence.source,
+                        reason: "datasource_scope_mismatch".to_owned(),
+                    });
+                }
             }
         }
 
         let mut has_valid_schema = false;
         let mut has_freshness = false;
         for evidence in self.run_evidence.load_evidence(relation_search).await? {
+            if scope.is_some_and(|scope| !evidence_source_allowed(&evidence, scope)) {
+                omissions.push(ContextOmission {
+                    uri: evidence.source,
+                    reason: "datasource_scope_mismatch".to_owned(),
+                });
+                continue;
+            }
             match evidence.source_type {
                 ContextSourceType::ObservedSchema => {
                     if evidence_is_within_ttl(&evidence, request.now.to_owned(), request.schema_ttl)
@@ -269,6 +298,37 @@ impl ContextAssembler {
             retrieval_needs,
         })
     }
+}
+
+fn evidence_relation_allowed(evidence: &ContextEvidence, scope: &AllowedDataScope) -> bool {
+    serde_json::from_str::<serde_json::Value>(&evidence.text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("relation_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|relation| {
+            scope.relations.keys().any(|allowed| {
+                relation.eq_ignore_ascii_case(allowed)
+                    || relation
+                        .to_ascii_lowercase()
+                        .ends_with(&format!(".{}", allowed.to_ascii_lowercase()))
+            })
+        })
+}
+
+fn evidence_source_allowed(evidence: &ContextEvidence, scope: &AllowedDataScope) -> bool {
+    serde_json::from_str::<serde_json::Value>(&evidence.text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("source_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|source| source == scope.source_id)
 }
 
 fn metric_evidence(

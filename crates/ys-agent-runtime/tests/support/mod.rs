@@ -311,6 +311,12 @@ impl QueryWorkflowFixture {
                 artifacts.clone(),
                 Arc::new(ys_agent_runtime::NoopRunScheduler),
             )
+            .with_run_datasource_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+                    workspace_id,
+                    Arc::new(runtime.datasource_repository()),
+                ),
+            ))
             .with_run_provider_binding_source(Arc::new(
                 ys_agent_runtime::StaticRunProviderBindingSource::from_active(active_provider),
             )),
@@ -391,16 +397,17 @@ impl QueryWorkflowFixture {
 }
 
 use ys_agent_adapters::{
-    ConnectorRegistry, InspectSchemaTool, MetricSqlDialect, QueryDataTool, ReadFreshnessTool,
-    ResolveMetricTool, RuntimeArtifactLookup,
+    ConnectorRegistry, InspectSchemaTool, QueryDataTool, ReadFreshnessTool, ResolveMetricTool,
+    RuntimeArtifactLookup,
 };
 use ys_agent_core::{
     AllowedDataScope, CatalogReader, CellValue, ColumnPolicy, FreshnessObservation,
-    FreshnessReader, MetricDefinition, MetricProvider, MetricStatus, ModelProvider, ObservedColumn,
-    ObservedRelation, ObservedSchema, Principal, QueryBudget, QueryCostEstimate, QueryParameter,
-    QueryPreflight, QueryPreflightDecision, QueryPreflightReader, QueryRequest, QueryResult,
-    SchemaKnowledgeKind, Sensitivity, SqlQueryExecutor, Tool, ToolExecutionContext, ToolOutcome,
-    WorkspaceId,
+    FreshnessReader, ManagedConnector, MetricDefinition, MetricProvider, MetricStatus,
+    ModelProvider, ObservedColumn, ObservedRelation, ObservedSchema, Principal, ProbeEvidence,
+    QueryBudget, QueryCostEstimate, QueryParameter, QueryPreflight, QueryPreflightDecision,
+    QueryPreflightReader, QueryRequest, QueryResult, ResolvedRunDatasource, RunDatasourceContext,
+    RunDatasourceResolver, RunId, SchemaKnowledgeKind, Sensitivity, SqlQueryExecutor, Tool,
+    ToolExecutionContext, ToolOutcome, WorkspaceId,
 };
 use ys_agent_runtime::{
     ContextAssembler, FixedRunModelProviderResolver, Harness, HarnessConfig, HarnessDependencies,
@@ -556,6 +563,74 @@ impl FreshnessReader for FixtureConnector {
     }
 }
 
+#[async_trait]
+impl ManagedConnector for FixtureConnector {
+    async fn probe(&self) -> ys_agent_core::DsResult<ProbeEvidence> {
+        Ok(ProbeEvidence {
+            authenticated: true,
+            target_verified: true,
+            read_only_verified: true,
+            least_privilege_verified: true,
+            capabilities_verified: true,
+        })
+    }
+
+    async fn close(&self) -> ys_agent_core::DsResult<()> {
+        Ok(())
+    }
+}
+
+struct FixtureDatasourceResolver {
+    repository: Arc<dyn ys_agent_core::DatasourceRepository>,
+    connector: Arc<FixtureConnector>,
+}
+
+#[async_trait]
+impl RunDatasourceResolver for FixtureDatasourceResolver {
+    async fn resolve(&self, run_id: RunId) -> ys_agent_core::DsResult<ResolvedRunDatasource> {
+        let binding = self.repository.load_run_binding(run_id).await?;
+        let mut columns = BTreeMap::new();
+        columns.insert("paid_at".to_owned(), ColumnPolicy::Allow);
+        columns.insert("channel".to_owned(), ColumnPolicy::Allow);
+        columns.insert("paid_amount".to_owned(), ColumnPolicy::Allow);
+        let relations: BTreeMap<String, BTreeMap<String, ColumnPolicy>> =
+            [("mart_orders".to_owned(), columns)].into();
+        Ok(ResolvedRunDatasource {
+            context: RunDatasourceContext {
+                schema_version: 1,
+                data_scope: AllowedDataScope {
+                    workspace_id: binding.scope().workspace_id,
+                    source_id: binding.source_id().as_str().to_owned(),
+                    relations: relations.clone(),
+                },
+                result_policy: relations,
+                query_budget: QueryBudget::default(),
+                tools: vec![
+                    "inspect_schema".to_owned(),
+                    "query_data".to_owned(),
+                    "read_freshness".to_owned(),
+                ],
+                context_namespace: binding.digest().map_err(|_| ys_agent_core::DsError {
+                    code: ys_agent_core::DsErrorCode::ValidationStale,
+                    field: None,
+                    remediation: ys_agent_core::DsRemediation::Revalidate,
+                    operation_id: None,
+                })?,
+                binding,
+            },
+            connector: self.connector.clone(),
+        })
+    }
+
+    async fn release(&self, _run_id: RunId) -> ys_agent_core::DsResult<()> {
+        Ok(())
+    }
+
+    async fn close(&self) -> ys_agent_core::DsResult<()> {
+        Ok(())
+    }
+}
+
 struct CountingTool {
     inner: Arc<dyn Tool>,
     calls: Arc<StdMutex<BTreeMap<String, usize>>>,
@@ -606,8 +681,11 @@ fn build_query_dependencies(
     };
     let metrics: Arc<dyn MetricProvider> = Arc::new(FixtureMetrics { metric });
     let connector = Arc::new(FixtureConnector);
-    let mut connectors = ConnectorRegistry::new();
-    connectors.register(source_id.clone(), MetricSqlDialect::Sqlite, connector)?;
+    let datasource_resolver = Arc::new(FixtureDatasourceResolver {
+        repository: Arc::new(runtime.datasource_repository()),
+        connector,
+    });
+    let connectors = ConnectorRegistry::with_run_resolver(datasource_resolver.clone());
 
     let artifact_store: Arc<dyn ArtifactStore> = artifacts.clone();
     let runtime_store: Arc<dyn RuntimeStore> = runtime.clone();
@@ -655,36 +733,39 @@ fn build_query_dependencies(
     let mut relations = BTreeMap::new();
     relations.insert("mart_orders".to_owned(), columns);
 
-    let harness = Arc::new(Harness::new(
-        HarnessDependencies {
-            store: runtime_store.clone(),
-            artifacts: artifact_store,
-            model_resolver: Arc::new(FixedRunModelProviderResolver::new(
-                Arc::new(runtime.run_binding_repository()),
-                model,
-            )),
-            catalog,
-            tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
-            context_assembler,
-            telemetry,
-        },
-        PromptBuilder::new(),
-        HarnessConfig {
-            workspace_id,
-            principal,
-            workspace_timezone: "UTC".to_owned(),
-            query_budget: QueryBudget::default(),
-            data_scope: AllowedDataScope {
-                workspace_id,
-                source_id: source_id.as_str().to_owned(),
-                relations,
+    let harness = Arc::new(
+        Harness::new(
+            HarnessDependencies {
+                store: runtime_store.clone(),
+                artifacts: artifact_store,
+                model_resolver: Arc::new(FixedRunModelProviderResolver::new(
+                    Arc::new(runtime.run_binding_repository()),
+                    model,
+                )),
+                catalog,
+                tool_runtime: Arc::new(ToolRuntime::with_max_same_call_retries(1)),
+                context_assembler,
+                telemetry,
             },
-            connector_tools: ConnectorToolAvailability::all_query_tools(),
-            tool_policy,
-            context_token_budget: 8_000,
-            schema_ttl: Duration::from_secs(300),
-        },
-    ));
+            PromptBuilder::new(),
+            HarnessConfig {
+                workspace_id,
+                principal,
+                workspace_timezone: "UTC".to_owned(),
+                query_budget: QueryBudget::default(),
+                data_scope: AllowedDataScope {
+                    workspace_id,
+                    source_id: source_id.as_str().to_owned(),
+                    relations,
+                },
+                connector_tools: ConnectorToolAvailability::all_query_tools(),
+                tool_policy,
+                context_token_budget: 8_000,
+                schema_ttl: Duration::from_secs(300),
+            },
+        )
+        .with_run_datasource_resolver(datasource_resolver),
+    );
 
     Ok(AssembledQueryDependencies {
         driver: LoopDriver::with_defaults(harness),
@@ -1368,6 +1449,12 @@ async fn open_runtime_components(
             artifacts,
             Arc::new(ys_agent_runtime::NoopRunScheduler),
         )
+        .with_run_datasource_binding_source(Arc::new(
+            ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+                workspace_id,
+                Arc::new(runtime.datasource_repository()),
+            ),
+        ))
         .with_run_provider_binding_source(Arc::new(
             ys_agent_runtime::StaticRunProviderBindingSource::from_active(active_provider),
         )),

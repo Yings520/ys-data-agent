@@ -224,7 +224,7 @@ impl Tool for InspectSchemaTool {
         }
 
         let source_id = SourceId::new(input.source_id);
-        let connector = match self.connectors.get(&source_id) {
+        let connector = match self.connectors.resolve(context.run_id, &source_id).await {
             Ok(connector) => connector,
             Err(error) => return Ok(safe_internal_failure(&error, CostClass::Low)),
         };

@@ -26,6 +26,7 @@ ys-agent-adapters = { path = "../../crates/ys-agent-adapters" }
 
 [dev-dependencies]
 chrono.workspace = true
+duckdb.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true
 

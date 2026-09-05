@@ -41,6 +41,45 @@ pub struct ResultPolicy {
 }
 
 impl ResultPolicy {
+    /// Consumes an already-authorized immutable scope; this does not grant target authority.
+    pub(crate) fn from_scope(scope: &AllowedDataScope) -> Self {
+        Self {
+            sources: [(
+                scope.source_id.clone(),
+                SourceRule {
+                    relations: scope
+                        .relations
+                        .iter()
+                        .map(|(name, columns)| {
+                            (
+                                name.clone(),
+                                RelationRule {
+                                    columns: columns
+                                        .iter()
+                                        .map(|(column, policy)| {
+                                            (
+                                                column.clone(),
+                                                match policy {
+                                                    ColumnPolicy::Allow => ColumnAction::Allow,
+                                                    ColumnPolicy::Redact => ColumnAction::Redact,
+                                                    ColumnPolicy::LocalArtifactOnly => {
+                                                        ColumnAction::LocalArtifactOnly
+                                                    }
+                                                    ColumnPolicy::Deny => ColumnAction::Deny,
+                                                },
+                                            )
+                                        })
+                                        .collect(),
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            )]
+            .into(),
+        }
+    }
+
     pub fn from_json_bytes(bytes: &[u8]) -> CoreResult<Self> {
         let parsed: PolicyFile = serde_json::from_slice(bytes).map_err(|error| {
             CoreError::validation("invalid_query_policy", safe_message("parse policy", error))
@@ -128,10 +167,13 @@ impl ResultPolicy {
         column: &str,
     ) -> Option<ColumnAction> {
         let source = self.sources.get(source_id.as_str())?;
-        relations.iter().find_map(|relation| {
-            find_relation(&source.relations, relation)
-                .and_then(|rule| rule.columns.get(&column.to_ascii_lowercase()).copied())
-        })
+        relations
+            .iter()
+            .filter_map(|relation| {
+                find_relation(&source.relations, relation)
+                    .and_then(|rule| rule.columns.get(&column.to_ascii_lowercase()).copied())
+            })
+            .max_by_key(|action| action_severity(*action))
     }
 
     pub fn column_sensitivity(
@@ -200,6 +242,17 @@ impl ResultPolicy {
         max_result_bytes: usize,
         restricted_context: Option<&RestrictedResultContext>,
     ) -> CoreResult<GovernedQueryResult> {
+        let mut output_names = BTreeSet::new();
+        if decoded
+            .columns
+            .iter()
+            .any(|column| !output_names.insert(column.to_ascii_lowercase()))
+        {
+            return Err(CoreError::validation(
+                "ambiguous_result_columns",
+                "duplicate output names cannot preserve column policy provenance",
+            ));
+        }
         let fallback_action = referenced_columns
             .iter()
             .filter_map(|column| self.action(source_id, referenced_relations, column))
@@ -222,10 +275,19 @@ impl ResultPolicy {
                 let output_name = decoded.columns.get(index).ok_or_else(|| {
                     CoreError::validation("result_shape_mismatch", "row is wider than columns")
                 })?;
-                let action = self
-                    .action(source_id, referenced_relations, output_name)
-                    .or(fallback_action)
-                    .unwrap_or(ColumnAction::Allow);
+                let direct = self.action(source_id, referenced_relations, output_name);
+                let output_is_input = referenced_columns
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(output_name));
+                let action = if output_is_input {
+                    direct
+                } else {
+                    direct
+                        .into_iter()
+                        .chain(fallback_action)
+                        .max_by_key(|action| action_severity(*action))
+                }
+                .unwrap_or(ColumnAction::Allow);
 
                 match action {
                     ColumnAction::Allow => {

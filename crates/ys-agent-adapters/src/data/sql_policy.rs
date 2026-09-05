@@ -5,7 +5,7 @@ use sqlparser::ast::{
     Expr, ObjectName, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Visit,
     VisitMut, Visitor, VisitorMut,
 };
-use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{DuckDbDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use ys_agent_core::{AllowedDataScope, ColumnPolicy, CoreError, CoreResult};
 
@@ -13,6 +13,7 @@ use ys_agent_core::{AllowedDataScope, ColumnPolicy, CoreError, CoreResult};
 pub enum SupportedDialect {
     SQLite,
     Postgres,
+    DuckDB,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +81,7 @@ pub struct SqlReadOnlyPolicy {
     dialect: SupportedDialect,
     max_sql_bytes: usize,
     blocked_functions: BTreeSet<String>,
+    allowed_functions: Option<BTreeSet<String>>,
 }
 
 impl SqlReadOnlyPolicy {
@@ -116,11 +118,74 @@ impl SqlReadOnlyPolicy {
             .into_iter()
             .map(str::to_owned)
             .collect(),
+            SupportedDialect::DuckDB => [
+                "csv_scan",
+                "delta_scan",
+                "glob",
+                "httpfs",
+                "iceberg_scan",
+                "parquet_scan",
+                "postgres_scan",
+                "query",
+                "query_table",
+                "read_blob",
+                "read_csv",
+                "read_csv_auto",
+                "read_json",
+                "read_json_auto",
+                "read_parquet",
+                "sqlite_scan",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         };
+        let allowed_functions = matches!(
+            dialect,
+            SupportedDialect::Postgres | SupportedDialect::DuckDB
+        )
+        .then(|| {
+            [
+                "abs",
+                "avg",
+                "ceil",
+                "ceiling",
+                "char_length",
+                "coalesce",
+                "concat",
+                "count",
+                "current_date",
+                "current_timestamp",
+                "date_part",
+                "date_trunc",
+                "extract",
+                "floor",
+                "greatest",
+                "least",
+                "length",
+                "lower",
+                "ltrim",
+                "max",
+                "min",
+                "nullif",
+                "replace",
+                "round",
+                "rtrim",
+                "substring",
+                "sum",
+                "to_char",
+                "trim",
+                "upper",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        });
         Self {
             dialect,
             max_sql_bytes,
             blocked_functions,
+            allowed_functions,
         }
     }
 
@@ -148,6 +213,7 @@ impl SqlReadOnlyPolicy {
         let parsed = match self.dialect {
             SupportedDialect::SQLite => Parser::parse_sql(&SQLiteDialect {}, sql),
             SupportedDialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
+            SupportedDialect::DuckDB => Parser::parse_sql(&DuckDbDialect {}, sql),
         };
 
         let mut statements = match parsed {
@@ -200,14 +266,39 @@ impl SqlReadOnlyPolicy {
             );
         }
 
-        if let Some(function) = facts
-            .functions
-            .iter()
-            .find(|name| self.blocked_functions.contains(*name))
-        {
+        if facts.has_dynamic_relation {
+            return SqlPolicyDecision::rejected(
+                "dynamic_relation_rejected",
+                "dynamic relation is not allowed",
+            );
+        }
+        if let Some(function) = facts.functions.iter().find(|name| {
+            self.blocked_functions.contains(*name)
+                || name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|part| self.blocked_functions.contains(part))
+        }) {
             return SqlPolicyDecision::rejected(
                 "function_not_allowed",
                 format!("function {function} is blocked by query policy"),
+            );
+        }
+        if let Some(allowed) = &self.allowed_functions
+            && let Some(function) = facts.functions.iter().find(|name| {
+                let mut parts = name.rsplit('.');
+                let base = parts.next().unwrap_or_default();
+                let qualifier = parts.next();
+                parts.next().is_some()
+                    || !allowed.contains(base)
+                    || qualifier.is_some_and(|schema| {
+                        self.dialect != SupportedDialect::Postgres || schema != "pg_catalog"
+                    })
+            })
+        {
+            return SqlPolicyDecision::rejected(
+                "function_not_allowed",
+                format!("function {function} is not in the audited read-only set"),
             );
         }
 
@@ -335,8 +426,11 @@ impl Visitor for AstFacts {
                 }
             }
             Expr::Function(function) => {
-                self.functions
-                    .insert(function.name.to_string().to_ascii_lowercase());
+                if let Some(name) = normalized_object_name(&function.name) {
+                    self.functions.insert(name);
+                } else {
+                    self.has_dynamic_relation = true;
+                }
             }
             _ => {}
         }
@@ -496,6 +590,31 @@ mod tests {
             &scope(),
         );
         assert_eq!(decision.reasons[0].code, "function_not_allowed");
+    }
+
+    #[test]
+    fn postgres_allows_only_audited_builtin_functions() {
+        let policy = SqlReadOnlyPolicy::new(SupportedDialect::Postgres, 1024);
+        assert_eq!(
+            policy
+                .evaluate(
+                    "SELECT pg_catalog.sum(paid_amount) FROM mart_orders",
+                    &scope()
+                )
+                .disposition,
+            SqlPolicyDisposition::Allowed
+        );
+        for sql in [
+            "SELECT public.sum(paid_amount) FROM mart_orders",
+            "SELECT custom_reader(customer_email) FROM mart_orders",
+            "SELECT pg_catalog.pg_sleep(1) FROM mart_orders",
+        ] {
+            assert_eq!(
+                policy.evaluate(sql, &scope()).disposition,
+                SqlPolicyDisposition::Rejected,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

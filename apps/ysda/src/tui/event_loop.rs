@@ -30,6 +30,7 @@ use super::{
     AsyncOperationBusy, ContentRoute, DisplayContextRefreshTrigger, RouteKey, TranscriptItem,
     TransientView, TuiApp, TuiController, UiPreferenceStore, UiPreferences,
     artifact::{ArtifactAction, ResultMove},
+    datasource_management::{DatasourceAction, DatasourceScreenState},
     model_selection::ModelSelectionAction,
     parse_input,
     provider_management::{
@@ -556,6 +557,15 @@ impl Drop for TerminalGuard {
 }
 
 pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
+    let datasource_resolver = dependencies.datasource_resolver.clone();
+    let result = run_tui_session(dependencies).await;
+    let close = datasource_resolver.close().await.map_err(|error| {
+        CoreError::validation("datasource_shutdown_failed", format!("{:?}", error.code))
+    });
+    result.and(close)
+}
+
+async fn run_tui_session(dependencies: AppDependencies) -> CoreResult<()> {
     let mut app = TuiApp::for_principal(dependencies.principal.clone());
     app.workspace_name = dependencies.display.workspace_name;
     app.model_label = dependencies.display.model_label;
@@ -578,6 +588,9 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
         dependencies.workspace_id,
         dependencies.principal,
     );
+    if let Err(error) = controller.initialize_datasource_snapshot(&mut app).await {
+        app.safe_warning = Some(error.code().to_owned());
+    }
     controller.request_display_context_refresh(&app, DisplayContextRefreshTrigger::Startup);
     if let Err(error) = controller.refresh_active_provider(&mut app).await {
         app.apply_active_provider_view(None);
@@ -620,6 +633,9 @@ pub async fn run_tui(dependencies: AppDependencies) -> CoreResult<()> {
                 &app,
                 DisplayContextRefreshTrigger::ProviderOperationCompleted,
             );
+            dirty = true;
+        }
+        if controller.apply_ready_datasource_operation(&mut app) {
             dirty = true;
         }
         if controller.apply_ready_display_context(&mut app) {
@@ -699,7 +715,11 @@ pub(crate) async fn handle_terminal_event(
     match event {
         Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
         Event::Paste(text) => {
-            if app.navigation.current() == ContentRoute::ModelSelection {
+            if app.transient == Some(TransientView::Detail(super::DetailKind::Datasources)) {
+                for character in text.chars().filter(|character| !character.is_control()) {
+                    controller.apply_datasource_action(app, DatasourceAction::Insert(character))?;
+                }
+            } else if app.navigation.current() == ContentRoute::ModelSelection {
                 let pasted = text
                     .chars()
                     .filter(|character| !character.is_control())
@@ -728,6 +748,10 @@ pub(crate) async fn handle_terminal_event(
         }
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if app.transient == Some(TransientView::Detail(super::DetailKind::Datasources)) {
+                    controller.close_or_cancel_datasource(app).await;
+                    return Ok(false);
+                }
                 if app.navigation.current() == ContentRoute::ModelSelection {
                     if controller.model_switch_in_flight() {
                         controller.cancel_model_switch(app).await;
@@ -749,6 +773,21 @@ pub(crate) async fn handle_terminal_event(
                 return Ok(true);
             }
             if key.code == KeyCode::Esc {
+                if app.transient == Some(TransientView::Detail(super::DetailKind::Datasources)) {
+                    match controller.datasource_screen().map(|screen| screen.state()) {
+                        Some(DatasourceScreenState::Browse) => {
+                            controller.close_or_cancel_datasource(app).await
+                        }
+                        Some(DatasourceScreenState::Busy) => {
+                            controller.close_or_cancel_datasource(app).await
+                        }
+                        Some(_) => {
+                            controller.apply_datasource_action(app, DatasourceAction::Back)?
+                        }
+                        None => app.close_transient(),
+                    }
+                    return Ok(false);
+                }
                 if app.navigation.current() == ContentRoute::Artifact {
                     controller.apply_artifact_action(app, ArtifactAction::Back);
                     return Ok(false);
@@ -790,6 +829,62 @@ pub(crate) async fn handle_terminal_event(
             }
             if app.transient == Some(TransientView::SlashPalette) {
                 handle_palette_key(app, controller, key).await?;
+                return Ok(false);
+            }
+            if app.transient == Some(TransientView::Detail(super::DetailKind::Datasources)) {
+                let state = controller.datasource_screen().map(|screen| screen.state());
+                let action = match key.code {
+                    KeyCode::Up => Some(DatasourceAction::MoveUp),
+                    KeyCode::Down => Some(DatasourceAction::MoveDown),
+                    KeyCode::PageUp => Some(DatasourceAction::PageUp),
+                    KeyCode::PageDown => Some(DatasourceAction::PageDown),
+                    KeyCode::Home => Some(DatasourceAction::Home),
+                    KeyCode::End => Some(DatasourceAction::End),
+                    KeyCode::Tab => Some(DatasourceAction::NextField),
+                    KeyCode::BackTab => Some(DatasourceAction::PreviousField),
+                    KeyCode::Enter => Some(DatasourceAction::Confirm),
+                    KeyCode::Backspace => Some(DatasourceAction::Backspace),
+                    KeyCode::Char('N') if state == Some(DatasourceScreenState::Browse) => {
+                        Some(DatasourceAction::New)
+                    }
+                    KeyCode::Char('A') if state == Some(DatasourceScreenState::Browse) => {
+                        Some(DatasourceAction::Actions)
+                    }
+                    KeyCode::Char('e') if state == Some(DatasourceScreenState::Actions) => {
+                        Some(DatasourceAction::Edit)
+                    }
+                    KeyCode::Char('v')
+                        if matches!(
+                            state,
+                            Some(DatasourceScreenState::Actions | DatasourceScreenState::Result)
+                        ) =>
+                    {
+                        Some(DatasourceAction::Validate)
+                    }
+                    KeyCode::Char('w') if state == Some(DatasourceScreenState::Actions) => {
+                        Some(DatasourceAction::SetDefault)
+                    }
+                    KeyCode::Char('d') if state == Some(DatasourceScreenState::Actions) => {
+                        Some(DatasourceAction::Delete)
+                    }
+                    KeyCode::Char('D') if state == Some(DatasourceScreenState::ConfirmDelete) => {
+                        Some(DatasourceAction::ConfirmDelete)
+                    }
+                    KeyCode::Char('r') if state == Some(DatasourceScreenState::Result) => {
+                        Some(DatasourceAction::Retry)
+                    }
+                    KeyCode::Char(character)
+                        if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                    {
+                        Some(DatasourceAction::Insert(character))
+                    }
+                    _ => None,
+                };
+                if let Some(action) = action
+                    && let Err(error) = controller.apply_datasource_action(app, action)
+                {
+                    app.push_transcript(TranscriptItem::Error(user_readable_error(&error)));
+                }
                 return Ok(false);
             }
             if app.navigation.current() == ContentRoute::Artifact {
@@ -1244,32 +1339,39 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use tempfile::tempdir;
     use tokio::sync::{Notify, Semaphore, oneshot};
-    use ys_agent_adapters::model::FakeModelProvider;
+    use ys_agent_adapters::{
+        DuckDbConnectorFactory, PostgresConnectorFactory,
+        credential::datasource::LocalEncryptedDatasourceVault, data::BuiltinConnectorCatalog,
+        model::FakeModelProvider,
+    };
     use ys_agent_core::{
         ActivateProfileRequest, ActiveProviderView, AgentAction, CompatibilityEvidenceView,
-        CredentialGeneration, CredentialKind, CredentialMutation, CredentialMutationRequest,
-        CredentialViewStatus, DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest,
-        DiscoveredModel, ModelResponse, ModelSelectionSnapshot, OAuthConnectionStatus,
-        OAuthConnectionView, OperationId, Principal, ProfileDetail, ProfileId, ProfileName,
-        ProfileState, ProfileSummary, ProviderCatalogView, ProviderDoctorView, ProviderErrorCode,
+        ConnectorCatalog, CredentialGeneration, CredentialKind, CredentialMutation,
+        CredentialMutationRequest, CredentialViewStatus, DatasourceRepository, DatasourceVault,
+        DeleteProfileRequest, DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel,
+        ModelResponse, ModelSelectionSnapshot, OAuthConnectionStatus, OAuthConnectionView,
+        OperationId, Principal, ProfileDetail, ProfileId, ProfileName, ProfileState,
+        ProfileSummary, ProviderCatalogView, ProviderDoctorView, ProviderErrorCode,
         ProviderManagementApi, ProviderManagementError, ProviderPlanId, ProviderRemediation,
         ProviderResult, ProviderSupportStatus, RemoteRevocationOutcome, SaveProfileRequest,
         SelectionAvailability, SelectionCurrentStatus, SelectionTarget, SelectionTargetView,
         ValidateProfileRequest, ValidationId, WorkspaceId,
     };
     use ys_agent_runtime::{
-        InProcessAgentService, NoopRunScheduler, StaticRunProviderBindingSource,
+        DatasourceService, InProcessAgentService, NoopRunScheduler, SourcePolicy,
+        StaticRunProviderBindingSource,
         doctor::{DoctorReport, QueryCapability},
     };
     use ys_agent_store::{LocalArtifactStore, SqliteRuntimeStore};
 
     use crate::tui::{
-        ContentRoute, InputAction, provider_management::ProviderOperationKind, render_to_string,
+        ContentRoute, InputAction, TaskSummary, provider_management::ProviderOperationKind,
+        render_to_string,
     };
 
     use super::{
-        AsyncOperationRegistry, ProviderOperationPolicy, RouteKey, TuiApp, TuiController,
-        apply_startup_doctor_report, handle_terminal_event, user_readable_error,
+        AsyncOperationRegistry, DatasourceScreenState, ProviderOperationPolicy, RouteKey, TuiApp,
+        TuiController, apply_startup_doctor_report, handle_terminal_event, user_readable_error,
     };
 
     #[test]
@@ -1311,7 +1413,7 @@ mod tests {
             Arc::new(NoopRunScheduler),
         ));
         let principal = Principal::local_operator("exit-command-test");
-        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut controller = TuiController::new(service.clone(), workspace_id, principal.clone());
         let mut app = TuiApp::for_principal(principal);
 
         for key in [KeyCode::Char('/'), KeyCode::Char('e'), KeyCode::Enter] {
@@ -2041,7 +2143,7 @@ mod tests {
                 .with_provider_management_api(provider_api.clone()),
         );
         let principal = Principal::local_operator("keyboard-provider-test");
-        let mut controller = TuiController::new(service, workspace_id, principal.clone());
+        let mut controller = TuiController::new(service.clone(), workspace_id, principal.clone());
         let mut app = TuiApp::for_principal(principal);
 
         controller
@@ -2314,10 +2416,19 @@ mod tests {
         );
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
-            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
-                .with_run_provider_binding_source(Arc::new(
-                    StaticRunProviderBindingSource::for_test(),
-                )),
+            InProcessAgentService::new(
+                workspace_id,
+                store.clone(),
+                artifacts,
+                Arc::new(NoopRunScheduler),
+            )
+            .with_run_datasource_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+                    workspace_id,
+                    Arc::new(store.datasource_repository()),
+                ),
+            ))
+            .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::for_test())),
         );
         let principal = Principal::local_operator("test-operator");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());
@@ -2336,7 +2447,7 @@ mod tests {
         assert!(matches!(
             app.transcript.last(),
             Some(super::TranscriptItem::Warning(text))
-                if text.contains("available commands: /mode  /model  /exit")
+                if text.contains("available commands: /mode  /model  /datasource  /connections  /exit")
         ));
     }
 
@@ -2464,11 +2575,20 @@ mod tests {
         }));
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
-            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
-                .with_run_provider_binding_source(Arc::new(
-                    StaticRunProviderBindingSource::for_test(),
-                ))
-                .with_conversation_model(model, "delayed-test-model"),
+            InProcessAgentService::new(
+                workspace_id,
+                store.clone(),
+                artifacts,
+                Arc::new(NoopRunScheduler),
+            )
+            .with_run_datasource_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+                    workspace_id,
+                    Arc::new(store.datasource_repository()),
+                ),
+            ))
+            .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::for_test()))
+            .with_conversation_model(model, "delayed-test-model"),
         );
         let principal = Principal::local_operator("test-operator");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());
@@ -2567,11 +2687,20 @@ mod tests {
         }));
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
-            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
-                .with_run_provider_binding_source(Arc::new(
-                    StaticRunProviderBindingSource::for_test(),
-                ))
-                .with_conversation_model(model, "timeout-test-model"),
+            InProcessAgentService::new(
+                workspace_id,
+                store.clone(),
+                artifacts,
+                Arc::new(NoopRunScheduler),
+            )
+            .with_run_datasource_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+                    workspace_id,
+                    Arc::new(store.datasource_repository()),
+                ),
+            ))
+            .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::for_test()))
+            .with_conversation_model(model, "timeout-test-model"),
         );
         let principal = Principal::local_operator("test-operator");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());
@@ -2608,5 +2737,202 @@ mod tests {
         let rendered = render_to_string(&app, 80, 20);
         assert!(rendered.contains("provider_timeout"));
         assert!(app.runtime_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn datasource_keyboard_flow_saves_validates_selects_and_reopens_through_alias() {
+        let directory = tempdir().expect("temporary directory");
+        let database = directory.path().join("warehouse.sqlite");
+        let connection = rusqlite::Connection::open(&database).expect("create source database");
+        connection
+            .execute_batch("CREATE TABLE orders(id INTEGER PRIMARY KEY, amount INTEGER); INSERT INTO orders(amount) VALUES (42);")
+            .expect("seed real SQLite source");
+        drop(connection);
+        let user_database_path = directory.path().join(".").join("warehouse.sqlite");
+        let database = std::fs::canonicalize(database).expect("canonical source path");
+        let allowed_root = std::fs::canonicalize(directory.path()).expect("canonical source root");
+
+        let runtime = Arc::new(
+            SqliteRuntimeStore::open(directory.path().join("runtime.db"))
+                .await
+                .expect("runtime store"),
+        );
+        let workspace_id = WorkspaceId::new();
+        let repository: Arc<dyn DatasourceRepository> = Arc::new(runtime.datasource_repository());
+        let vault: Arc<dyn DatasourceVault> = Arc::new(LocalEncryptedDatasourceVault::new(
+            directory.path().join("vault"),
+        ));
+        let catalog: Arc<dyn ConnectorCatalog> = Arc::new(
+            BuiltinConnectorCatalog::new(
+                Arc::new(PostgresConnectorFactory),
+                Arc::new(DuckDbConnectorFactory),
+            )
+            .expect("builtin connector catalog"),
+        );
+        let policy = format!(
+            r#"{{"schema_version":2,"allowed_sources":{{"local_orders":{{"relations":{{"orders":{{"columns":{{"id":"allow","amount":"allow"}}}}}},"target":{{"kind":"file","adapter_id":"sqlite","canonical_path":{},"allowed_roots":[{}]}}}}}}}}"#,
+            serde_json::to_string(&database).unwrap(),
+            serde_json::to_string(&allowed_root).unwrap(),
+        );
+        let policy = Arc::new(
+            SourcePolicy::from_json_bytes(policy.as_bytes(), ys_agent_core::QueryBudget::default())
+                .expect("v2 source policy"),
+        );
+        let management = Arc::new(DatasourceService::new(repository, vault, catalog, policy));
+        let artifacts = Arc::new(
+            LocalArtifactStore::new(directory.path().join("artifacts")).expect("artifact store"),
+        );
+        let service = Arc::new(
+            InProcessAgentService::new(
+                workspace_id,
+                runtime,
+                artifacts,
+                Arc::new(NoopRunScheduler),
+            )
+            .with_datasource_management_api(management)
+            .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::for_test())),
+        );
+        let principal = Principal::local_operator("keyboard-operator");
+        let mut controller = TuiController::new(service.clone(), workspace_id, principal.clone());
+        let mut app = TuiApp::for_principal(principal);
+
+        app.composer.set_text("/datasource");
+        key(&mut app, &mut controller, KeyCode::Enter).await;
+        assert_eq!(
+            controller.datasource_screen().unwrap().state(),
+            DatasourceScreenState::Browse
+        );
+        shifted_key(&mut app, &mut controller, KeyCode::Char('N')).await;
+        key(&mut app, &mut controller, KeyCode::End).await;
+        key(&mut app, &mut controller, KeyCode::Enter).await;
+        for character in "WareHouse".chars() {
+            if character.is_uppercase() {
+                shifted_key(&mut app, &mut controller, KeyCode::Char(character)).await;
+            } else {
+                key(&mut app, &mut controller, KeyCode::Char(character)).await;
+            }
+        }
+        key(&mut app, &mut controller, KeyCode::Tab).await;
+        handle_terminal_event(
+            &mut app,
+            &mut controller,
+            Event::Paste(user_database_path.to_string_lossy().into_owned()),
+        )
+        .await
+        .expect("paste path");
+        key(&mut app, &mut controller, KeyCode::Enter).await;
+        apply_datasource_completion(&mut controller, &mut app).await;
+        assert!(render_to_string(&app, 100, 30).contains("Profile saved"));
+        assert!(
+            controller
+                .datasource_screen()
+                .unwrap()
+                .view()
+                .snapshot
+                .profiles[0]
+                .profile
+                .source_id
+                .is_some(),
+            "saved target did not match v2 policy"
+        );
+
+        key(&mut app, &mut controller, KeyCode::Char('v')).await;
+        apply_datasource_completion(&mut controller, &mut app).await;
+        let validation_render = render_to_string(&app, 100, 30);
+        assert!(validation_render.contains("Ready"), "{validation_render}");
+        app.push_transcript(super::TranscriptItem::UserMessage(
+            "keep this conversation".into(),
+        ));
+        app.focused_task = Some(TaskSummary {
+            goal: "keep this task".into(),
+            status: "Running".into(),
+            needs_input: false,
+        });
+        let artifact_id = ys_agent_core::ArtifactId::new();
+        app.primary_artifact_id = Some(artifact_id);
+        key(&mut app, &mut controller, KeyCode::Enter).await;
+        key(&mut app, &mut controller, KeyCode::Enter).await;
+        apply_datasource_completion(&mut controller, &mut app).await;
+        let snapshot = controller
+            .datasource_screen()
+            .unwrap()
+            .view()
+            .snapshot
+            .clone();
+        assert!(snapshot.selection.current.is_some());
+        assert_eq!(app.connection_label, "WareHouse");
+        assert!(
+            matches!(app.transcript.last(), Some(super::TranscriptItem::UserMessage(message)) if message == "keep this conversation")
+        );
+        assert_eq!(
+            app.focused_task.as_ref().map(|task| task.goal.as_str()),
+            Some("keep this task")
+        );
+        assert_eq!(app.primary_artifact_id, Some(artifact_id));
+
+        key(&mut app, &mut controller, KeyCode::Enter).await;
+        key(&mut app, &mut controller, KeyCode::Char('A')).await;
+        key(&mut app, &mut controller, KeyCode::Char('w')).await;
+        apply_datasource_completion(&mut controller, &mut app).await;
+        assert!(
+            controller
+                .datasource_screen()
+                .unwrap()
+                .view()
+                .snapshot
+                .selection
+                .workspace_default
+                .is_some()
+        );
+        key(&mut app, &mut controller, KeyCode::Esc).await;
+        key(&mut app, &mut controller, KeyCode::Esc).await;
+
+        let restarted_principal = Principal::local_operator("keyboard-operator");
+        let mut restarted = TuiController::new(service, workspace_id, restarted_principal.clone());
+        let mut restarted_app = TuiApp::for_principal(restarted_principal);
+        restarted
+            .initialize_datasource_snapshot(&mut restarted_app)
+            .await
+            .expect("restore the default datasource before the first frame");
+        assert_eq!(restarted_app.connection_label, "WareHouse");
+        restarted_app.composer.set_text("/connections");
+        key(&mut restarted_app, &mut restarted, KeyCode::Enter).await;
+        let rendered = render_to_string(&restarted_app, 100, 30);
+        assert!(rendered.contains("WareHouse"));
+        assert!(rendered.contains("[current]"));
+        assert!(rendered.contains("[default]"));
+    }
+
+    async fn key(app: &mut TuiApp, controller: &mut TuiController, code: KeyCode) {
+        handle_terminal_event(
+            app,
+            controller,
+            Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+        )
+        .await
+        .expect("keyboard event");
+    }
+
+    async fn shifted_key(app: &mut TuiApp, controller: &mut TuiController, code: KeyCode) {
+        handle_terminal_event(
+            app,
+            controller,
+            Event::Key(KeyEvent::new(code, KeyModifiers::SHIFT)),
+        )
+        .await
+        .expect("shifted keyboard event");
+    }
+
+    async fn apply_datasource_completion(controller: &mut TuiController, app: &mut TuiApp) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if controller.apply_ready_datasource_operation(app) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("datasource operation completes");
     }
 }

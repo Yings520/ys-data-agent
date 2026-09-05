@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ys_agent_core::{
-    ArtifactRef, CoreError, CoreResult, FreshnessObservation, QueryIntent, QueryParameter,
-    RetentionPolicy, SemanticStatus, Sensitivity, SourceId, TimeRange,
+    ArtifactRef, CoreError, CoreResult, DatasourceDigest, DatasourceRevisionId,
+    FreshnessObservation, QueryIntent, QueryParameter, RetentionPolicy, SemanticStatus,
+    Sensitivity, SourceId, TimeRange,
 };
 
 use super::VerificationReport;
@@ -75,6 +76,12 @@ pub struct QueryArtifact {
     pub metric: Option<MetricReference>,
     pub semantic_status: SemanticStatus,
     pub source_id: SourceId,
+    #[serde(default)]
+    pub datasource_revision: Option<DatasourceRevisionId>,
+    #[serde(default)]
+    pub datasource_context: Option<DatasourceDigest>,
+    #[serde(default)]
+    pub datasource_binding: Option<DatasourceDigest>,
     pub source_relations: Vec<String>,
     pub time_range: Option<TimeRange>,
     pub executed_sql: Option<String>,
@@ -99,6 +106,9 @@ pub struct QueryArtifactInput {
     pub metric: Option<MetricReference>,
     pub semantic_status: SemanticStatus,
     pub source_id: SourceId,
+    pub datasource_revision: Option<DatasourceRevisionId>,
+    pub datasource_context: Option<DatasourceDigest>,
+    pub datasource_binding: Option<DatasourceDigest>,
     pub source_relations: Vec<String>,
     pub time_range: Option<TimeRange>,
     pub executed_sql: Option<String>,
@@ -116,6 +126,25 @@ pub struct QueryArtifactInput {
 
 impl QueryArtifact {
     pub fn package(input: QueryArtifactInput) -> CoreResult<Self> {
+        let datasource_identity = [
+            input.datasource_revision.is_some(),
+            input.datasource_context.is_some(),
+            input.datasource_binding.is_some(),
+        ];
+        if datasource_identity.iter().any(|present| *present)
+            && datasource_identity.iter().any(|present| !*present)
+        {
+            return Err(CoreError::validation(
+                "query_artifact_datasource_incomplete",
+                "QueryArtifact datasource revision, context, and binding must be recorded together",
+            ));
+        }
+        if input.verification.datasource_binding != input.datasource_binding {
+            return Err(CoreError::validation(
+                "query_artifact_datasource_mismatch",
+                "QueryArtifact and VerificationReport must reference the same datasource binding",
+            ));
+        }
         if !input.verification.hard_failures.is_empty() {
             return Err(CoreError::validation(
                 "completion_gate_failed",
@@ -197,6 +226,9 @@ impl QueryArtifact {
             metric: input.metric,
             semantic_status: input.semantic_status,
             source_id: input.source_id,
+            datasource_revision: input.datasource_revision,
+            datasource_context: input.datasource_context,
+            datasource_binding: input.datasource_binding,
             source_relations: input.source_relations,
             time_range: input.time_range,
             executed_sql: input.executed_sql,
@@ -243,6 +275,9 @@ mod tests {
             metric: None,
             semantic_status: SemanticStatus::Observed,
             source_id: SourceId::new("sqlite-demo"),
+            datasource_revision: None,
+            datasource_context: None,
+            datasource_binding: None,
             source_relations: vec!["mart_orders".to_owned()],
             time_range: None,
             executed_sql: None,
@@ -255,6 +290,7 @@ mod tests {
                 hard_failures: Vec::new(),
                 warnings: vec!["empty_result".to_owned()],
                 evidence_refs: Vec::new(),
+                datasource_binding: None,
             },
             assumptions: Vec::new(),
             sensitivity: Sensitivity::Internal,

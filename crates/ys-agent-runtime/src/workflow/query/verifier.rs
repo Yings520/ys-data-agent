@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use ys_agent_core::{
-    ArtifactId, ArtifactRef, PolicyDecision, QueryIntent, SemanticStatus, TimeRange,
+    ArtifactId, ArtifactRef, DatasourceDigest, PolicyDecision, QueryIntent, SemanticStatus,
+    TimeRange,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +17,8 @@ pub struct VerificationReport {
     pub hard_failures: Vec<String>,
     pub warnings: Vec<String>,
     pub evidence_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub datasource_binding: Option<DatasourceDigest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +31,7 @@ pub enum FreshnessState {
 
 #[derive(Debug, Clone)]
 pub struct VerificationInput {
+    pub datasource_binding: Option<DatasourceDigest>,
     pub intent: QueryIntent,
     pub policy_decision: Option<PolicyDecision>,
     pub data_query_permission_present: bool,
@@ -71,6 +75,7 @@ impl QueryVerifier {
             hard_failures: Vec::new(),
             warnings: Vec::new(),
             evidence_refs: Vec::new(),
+            datasource_binding: input.datasource_binding.clone(),
         };
 
         hard_check(
@@ -334,6 +339,7 @@ mod tests {
 
     fn common(intent: QueryIntent) -> VerificationInput {
         VerificationInput {
+            datasource_binding: None,
             intent,
             policy_decision: Some(PolicyDecision::Allow),
             data_query_permission_present: true,

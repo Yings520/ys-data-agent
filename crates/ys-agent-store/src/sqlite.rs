@@ -16,6 +16,7 @@ const MIGRATION_0003: &str = include_str!("../migrations/0003_credential_journal
 const MIGRATION_0004: &str = include_str!("../migrations/0004_run_binding_activation_revision.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_invalid_validation_state.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_profile_tombstone.sql");
+const MIGRATION_0007: &str = include_str!("../migrations/0007_datasource_management.sql");
 
 #[derive(Debug, Clone)]
 pub struct SqliteRuntimeStore {
@@ -146,7 +147,17 @@ fn apply_migrations(connection: &mut Connection) -> CoreResult<()> {
         foreign_key_result?;
         verify_foreign_keys(connection)?;
     }
-    apply_profile_tombstone_migration(connection)
+    apply_profile_tombstone_migration(connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+    if !migration_is_applied(&transaction, 7)? {
+        transaction
+            .execute_batch(MIGRATION_0007)
+            .map_err(storage_error)?;
+        record_migration(&transaction, 7)?;
+    }
+    transaction.commit().map_err(storage_error)
 }
 
 fn apply_invalid_validation_migration(connection: &mut Connection) -> CoreResult<()> {
@@ -600,6 +611,12 @@ fn commit_command_on_connection(
 
     if let Some(session) = &batch.new_session {
         insert_session(&transaction, session)?;
+        crate::datasource::initialize_session_selection(&transaction, session).map_err(|_| {
+            CoreError::validation(
+                "datasource_selection_conflict",
+                "Could not initialize the Session datasource selection",
+            )
+        })?;
     }
     if let Some(task) = &batch.new_task {
         insert_task(&transaction, task)?;
@@ -607,6 +624,14 @@ fn commit_command_on_connection(
     if let Some(command) = &batch.create_run {
         insert_run(&transaction, command.snapshot())?;
         insert_run_provider_binding(&transaction, command.provider_binding())?;
+        crate::datasource::insert_run_binding(&transaction, command.datasource_binding()).map_err(
+            |_| {
+                CoreError::validation(
+                    "datasource_binding_conflict",
+                    "Datasource selection or validation changed before Run creation",
+                )
+            },
+        )?;
     }
     if let Some(metadata) = &batch.new_artifact {
         insert_artifact(&transaction, metadata)?;

@@ -92,6 +92,13 @@ async fn query_completion_requires_execution_verification_and_artifact() {
     assert!(artifact.executed_sql.is_some());
     assert!(artifact.verification.hard_failures.is_empty());
     assert!(artifact.freshness.is_some());
+    assert!(artifact.datasource_revision.is_some());
+    assert!(artifact.datasource_context.is_some());
+    assert_eq!(
+        artifact.datasource_binding,
+        artifact.verification.datasource_binding
+    );
+    assert!(artifact.datasource_binding.is_some());
 }
 
 #[tokio::test]
