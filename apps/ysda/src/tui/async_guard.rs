@@ -12,6 +12,7 @@ pub enum AsyncChannel {
     Catalog,
     Artifact,
     ProviderMutation,
+    DatasourceMutation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +38,11 @@ impl AsyncResultGuard {
         channel: AsyncChannel,
         route_key: RouteKey,
     ) -> Result<AsyncOperationTicket, AsyncOperationBusy> {
-        if channel == AsyncChannel::ProviderMutation && self.active.contains_key(&channel) {
+        if matches!(
+            channel,
+            AsyncChannel::ProviderMutation | AsyncChannel::DatasourceMutation
+        ) && self.active.contains_key(&channel)
+        {
             return Err(AsyncOperationBusy);
         }
         let ticket = AsyncOperationTicket {

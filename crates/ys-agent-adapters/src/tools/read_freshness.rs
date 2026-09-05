@@ -94,7 +94,8 @@ impl ReadFreshnessTool {
 
         let connector = self
             .connectors
-            .get(source_id)
+            .resolve(context.run_id, source_id)
+            .await
             .map_err(|error| safe_internal_failure(&error, CostClass::Low))?;
         let schema = connector
             .catalog
@@ -189,7 +190,7 @@ impl Tool for ReadFreshnessTool {
             Ok(sla) => sla,
             Err(outcome) => return Ok(outcome),
         };
-        let connector = match self.connectors.get(&source_id) {
+        let connector = match self.connectors.resolve(context.run_id, &source_id).await {
             Ok(connector) => connector,
             Err(error) => return Ok(safe_internal_failure(&error, CostClass::Low)),
         };

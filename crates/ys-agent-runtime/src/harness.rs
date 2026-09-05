@@ -1,5 +1,6 @@
 use std::{
-    sync::Arc,
+    collections::HashMap,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -10,8 +11,9 @@ use serde_json::json;
 use ys_agent_core::{
     AllowedDataScope, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore, CoreError,
     CoreResult, CostClass, EventActor, PendingRunEvent, Principal, PutArtifact, QueryBudget,
-    RetentionPolicy, RunEventKind, RunId, RunModelProviderResolver, RunSnapshot, RunStatus,
-    Sensitivity, StepId, ToolExecutionContext, WorkspaceId,
+    RetentionPolicy, RunDatasourceContext, RunDatasourceResolver, RunEventKind, RunId,
+    RunModelProviderResolver, RunSnapshot, RunStatus, Sensitivity, StepId, ToolExecutionContext,
+    WorkspaceId,
 };
 
 use crate::{
@@ -50,6 +52,8 @@ pub struct Harness {
     workflow: QueryWorkflow,
     config: HarnessConfig,
     telemetry: Arc<TelemetryDispatcher>,
+    datasource_resolver: Option<Arc<dyn RunDatasourceResolver>>,
+    datasource_contexts: Mutex<HashMap<RunId, RunDatasourceContext>>,
 }
 
 pub struct HarnessDependencies {
@@ -81,6 +85,8 @@ struct ModelStepInput {
     response: ys_agent_core::ModelResponse,
     tokens: u32,
     telemetry: TelemetryEvent,
+    data_scope: AllowedDataScope,
+    query_budget: QueryBudget,
 }
 
 impl Harness {
@@ -102,7 +108,61 @@ impl Harness {
             workflow: QueryWorkflow::new(),
             config,
             telemetry: dependencies.telemetry,
+            datasource_resolver: None,
+            datasource_contexts: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_run_datasource_resolver(
+        mut self,
+        resolver: Arc<dyn RunDatasourceResolver>,
+    ) -> Self {
+        self.datasource_resolver = Some(resolver);
+        self
+    }
+
+    async fn ensure_datasource_context(&self, run_id: RunId) -> CoreResult<()> {
+        let Some(resolver) = &self.datasource_resolver else {
+            return Ok(());
+        };
+        if self
+            .datasource_contexts
+            .lock()
+            .map_err(|_| CoreError::validation("datasource_context_poisoned", "lock poisoned"))?
+            .contains_key(&run_id)
+        {
+            return Ok(());
+        }
+        let resolved = resolver.resolve(run_id).await.map_err(|error| {
+            CoreError::validation("run_datasource_unavailable", error.to_string())
+        })?;
+        self.datasource_contexts
+            .lock()
+            .map_err(|_| CoreError::validation("datasource_context_poisoned", "lock poisoned"))?
+            .insert(run_id, resolved.context);
+        Ok(())
+    }
+
+    fn datasource_context(&self, run_id: RunId) -> CoreResult<Option<RunDatasourceContext>> {
+        Ok(self
+            .datasource_contexts
+            .lock()
+            .map_err(|_| CoreError::validation("datasource_context_poisoned", "lock poisoned"))?
+            .get(&run_id)
+            .cloned())
+    }
+
+    async fn release_datasource(&self, run_id: RunId) -> CoreResult<()> {
+        if let Some(resolver) = &self.datasource_resolver {
+            resolver.release(run_id).await.map_err(|error| {
+                CoreError::validation("run_datasource_release_failed", error.to_string())
+            })?;
+            self.datasource_contexts
+                .lock()
+                .map_err(|_| CoreError::validation("datasource_context_poisoned", "lock poisoned"))?
+                .remove(&run_id);
+        }
+        Ok(())
     }
 
     fn next_snapshot(
@@ -252,10 +312,15 @@ impl Harness {
         &self,
         state: &QueryWorkflowState,
         now: &DateTime<Utc>,
+        datasource: Option<&RunDatasourceContext>,
     ) -> CoreResult<ys_agent_core::ModelMessage> {
+        let source_id = datasource.map_or_else(
+            || self.config.data_scope.source_id.as_str(),
+            |context| context.data_scope.source_id.as_str(),
+        );
         let content = serde_json::to_string(&json!({
             "phase": state.phase,
-            "source_id": self.config.data_scope.source_id,
+            "source_id": source_id,
             "intent": state.intent,
             "current_time_utc": now.to_rfc3339_opts(SecondsFormat::Secs, true),
             "workspace_timezone": self.config.workspace_timezone.as_str(),
@@ -449,6 +514,19 @@ impl Harness {
         state: QueryWorkflowState,
     ) -> CoreResult<StepOutcome> {
         let now = Utc::now();
+        let datasource = self.datasource_context(current.run_id)?;
+        let data_scope = datasource.as_ref().map_or_else(
+            || self.config.data_scope.clone(),
+            |value| value.data_scope.clone(),
+        );
+        let query_budget = datasource.as_ref().map_or_else(
+            || self.config.query_budget.clone(),
+            |value| value.query_budget.clone(),
+        );
+        let connector_tools = datasource.as_ref().map_or_else(
+            || self.config.connector_tools.clone(),
+            |value| ConnectorToolAvailability::from_names(value.tools.clone()),
+        );
         let resolved = self
             .model_resolver
             .resolve(current.run_id)
@@ -459,13 +537,13 @@ impl Harness {
             .for_workflow(current.workflow)
             .for_query_phase(state.phase)
             .for_principal(&self.config.principal)
-            .with_connector_tools(self.config.connector_tools.clone())
+            .with_connector_tools(connector_tools)
             .for_run_status(current.status)
             .build()?;
         let view_snapshot = ToolViewSnapshot::new(view.content_hash(), view.model_tools())?;
         let assembled = self
             .context_assembler
-            .assemble(
+            .assemble_scoped(
                 &ContextAssemblyRequest {
                     task_goal: state.question.clone(),
                     query: state.question.clone(),
@@ -480,6 +558,7 @@ impl Harness {
                     now,
                 },
                 &view_snapshot,
+                datasource.as_ref().map(|_| &data_scope),
             )
             .await?;
         let model_call_id = format!("model-{step_id}");
@@ -503,9 +582,11 @@ impl Harness {
             &assembled.manifest,
             &view_snapshot,
         )?;
-        request
-            .messages
-            .push(self.runtime_query_state_message(&state, &now)?);
+        request.messages.push(self.runtime_query_state_message(
+            &state,
+            &now,
+            datasource.as_ref(),
+        )?);
         request
             .messages
             .extend(self.clarification_messages(&state).await?);
@@ -564,6 +645,8 @@ impl Harness {
             response,
             tokens,
             telemetry: model_telemetry,
+            data_scope,
+            query_budget,
         })
         .await
     }
@@ -577,6 +660,8 @@ impl Harness {
             response,
             tokens,
             telemetry: model_telemetry,
+            data_scope,
+            query_budget,
         } = input;
         let effect = self.workflow.validate_action(&state, &response.action)?;
         let responded = system_event(RunEventKind::ModelResponded {
@@ -600,8 +685,8 @@ impl Harness {
                         task_id: current.task_id,
                         run_id: current.run_id,
                         principal: self.config.principal.clone(),
-                        query_budget: self.config.query_budget.clone(),
-                        data_scope: self.config.data_scope.clone(),
+                        query_budget,
+                        data_scope,
                         confirmation_granted: false,
                     },
                     call_id: call.id,
@@ -807,6 +892,19 @@ impl Harness {
         call: ys_agent_core::ToolCall,
     ) -> CoreResult<StepOutcome> {
         state.pending_recovery_call = None;
+        let datasource = self.datasource_context(current.run_id)?;
+        let data_scope = datasource.as_ref().map_or_else(
+            || self.config.data_scope.clone(),
+            |value| value.data_scope.clone(),
+        );
+        let query_budget = datasource.as_ref().map_or_else(
+            || self.config.query_budget.clone(),
+            |value| value.query_budget.clone(),
+        );
+        let connector_tools = datasource.as_ref().map_or_else(
+            || self.config.connector_tools.clone(),
+            |value| ConnectorToolAvailability::from_names(value.tools.clone()),
+        );
         let recovered_cost = state
             .pending_recovery_cost_class
             .take()
@@ -815,7 +913,7 @@ impl Harness {
             .for_workflow(current.workflow)
             .for_query_phase(state.phase)
             .for_principal(&self.config.principal)
-            .with_connector_tools(self.config.connector_tools.clone())
+            .with_connector_tools(connector_tools)
             .for_run_status(RunStatus::Running)
             .build()?;
         let tool = self
@@ -832,8 +930,8 @@ impl Harness {
                 task_id: current.task_id,
                 run_id: current.run_id,
                 principal: self.config.principal.clone(),
-                query_budget: self.config.query_budget.clone(),
-                data_scope: self.config.data_scope.clone(),
+                query_budget,
+                data_scope,
                 confirmation_granted: state.recovery_confirmation_granted,
             },
             call_id: call.id,
@@ -1076,29 +1174,39 @@ impl HarnessStep for Harness {
     async fn step(&self, run_id: &RunId) -> CoreResult<StepOutcome> {
         let current = self.store.load_run(run_id).await?;
         if current.status != RunStatus::Running {
+            self.release_datasource(*run_id).await?;
             return Ok(StepOutcome::Terminal {
                 snapshot: current,
                 accounting: StepAccounting::default(),
             });
         }
+        self.ensure_datasource_context(*run_id).await?;
         let state = QueryWorkflowState::from_snapshot(current.workflow_state.clone())?;
-        if let Some(call) = state.pending_recovery_call.clone() {
-            return self.recovered_tool_step(current, state, call).await;
+        let outcome = if let Some(call) = state.pending_recovery_call.clone() {
+            self.recovered_tool_step(current, state, call).await?
+        } else {
+            match self.workflow.next(&state)? {
+                WorkflowDirective::Advance(phase) => self.advance(current, state, phase).await,
+                WorkflowDirective::Classify(intent) => self.classify(current, state, intent).await,
+                WorkflowDirective::AskModel => self.model_step(current, state).await,
+                WorkflowDirective::Verify => self.verify(current, state).await,
+                WorkflowDirective::Wait {
+                    clarification_id,
+                    question,
+                    reason,
+                } => {
+                    self.wait(current, state, clarification_id, question, reason)
+                        .await
+                }
+            }?
+        };
+        if matches!(
+            outcome,
+            StepOutcome::Terminal { .. } | StepOutcome::Wait { .. }
+        ) {
+            self.release_datasource(*run_id).await?;
         }
-        match self.workflow.next(&state)? {
-            WorkflowDirective::Advance(phase) => self.advance(current, state, phase).await,
-            WorkflowDirective::Classify(intent) => self.classify(current, state, intent).await,
-            WorkflowDirective::AskModel => self.model_step(current, state).await,
-            WorkflowDirective::Verify => self.verify(current, state).await,
-            WorkflowDirective::Wait {
-                clarification_id,
-                question,
-                reason,
-            } => {
-                self.wait(current, state, clarification_id, question, reason)
-                    .await
-            }
-        }
+        Ok(outcome)
     }
 
     async fn emit_terminal_run_latency(&self, run_id: &RunId, elapsed: Duration) {
@@ -1230,6 +1338,7 @@ fn tool_outcome_code(outcome: &ys_agent_core::ToolOutcome) -> &'static str {
 impl Harness {
     async fn verification_input(
         &self,
+        run_id: RunId,
         state: &QueryWorkflowState,
     ) -> CoreResult<crate::workflow::query::VerificationInput> {
         use crate::workflow::query::FreshnessState;
@@ -1345,8 +1454,17 @@ impl Harness {
                     || (artifact.metadata.retention_policy.is_some()
                         && artifact.metadata.expires_at.is_some())
             });
-        let expected_scope_hash = verification_hash(&self.config.data_scope)?;
-        let expected_budget_hash = verification_hash(&self.config.query_budget)?;
+        let datasource = self.datasource_context(run_id)?;
+        let data_scope = datasource.as_ref().map_or_else(
+            || self.config.data_scope.clone(),
+            |value| value.data_scope.clone(),
+        );
+        let query_budget = datasource.as_ref().map_or_else(
+            || self.config.query_budget.clone(),
+            |value| value.query_budget.clone(),
+        );
+        let expected_scope_hash = verification_hash(&data_scope)?;
+        let expected_budget_hash = verification_hash(&query_budget)?;
         let preflight_scope_matches = preflight
             .as_ref()
             .is_some_and(|value| value.scope_hash == expected_scope_hash);
@@ -1355,6 +1473,10 @@ impl Harness {
             .is_some_and(|value| value.budget_hash == expected_budget_hash);
 
         Ok(crate::workflow::query::VerificationInput {
+            datasource_binding: datasource
+                .as_ref()
+                .map(|value| value.binding.digest())
+                .transpose()?,
             intent,
             policy_decision: state.policy_decision.clone().or_else(|| {
                 (intent == ys_agent_core::QueryIntent::Metadata)
@@ -1364,9 +1486,9 @@ impl Harness {
                 .config
                 .principal
                 .has_capability(Capability::DataQuery),
-            source_scope_matches: result.as_ref().is_none_or(|result| {
-                result.compiled.source_id.as_str() == self.config.data_scope.source_id
-            }),
+            source_scope_matches: result
+                .as_ref()
+                .is_none_or(|result| result.compiled.source_id.as_str() == data_scope.source_id),
             field_scope_matches: preflight_scope_matches
                 || intent == ys_agent_core::QueryIntent::Metadata,
             query_budget_passed: preflight_budget_matches
@@ -1416,8 +1538,8 @@ impl Harness {
         current: RunSnapshot,
         mut state: QueryWorkflowState,
     ) -> CoreResult<StepOutcome> {
-        let report =
-            crate::workflow::query::QueryVerifier.verify(self.verification_input(&state).await?);
+        let report = crate::workflow::query::QueryVerifier
+            .verify(self.verification_input(current.run_id, &state).await?);
         let bytes = serde_json::to_vec(&report).map_err(|error| {
             CoreError::validation("verification_serialization_failed", error.to_string())
         })?;
@@ -1489,6 +1611,7 @@ impl Harness {
         tokens: u32,
         model_telemetry: TelemetryEvent,
     ) -> CoreResult<StepOutcome> {
+        let datasource = self.datasource_context(current.run_id)?;
         if state.phase != QueryPhase::ReadyToComplete || state.verification_report.is_none() {
             let failed = self.next_snapshot(
                 &current,
@@ -1525,6 +1648,16 @@ impl Harness {
         let verification: crate::workflow::query::VerificationReport = self
             .read_json(state.verification_report.as_ref().expect("checked above"))
             .await?;
+        let binding_digest = datasource
+            .as_ref()
+            .map(|value| value.binding.digest())
+            .transpose()?;
+        if verification.datasource_binding != binding_digest {
+            return Err(CoreError::validation(
+                "query_artifact_datasource_mismatch",
+                "VerificationReport datasource binding does not match the completing Run",
+            ));
+        }
         let plan = match &state.execution_plan {
             Some(artifact) => Some(self.read_json::<ys_agent_core::QueryPlan>(artifact).await?),
             None => None,
@@ -1564,7 +1697,10 @@ impl Harness {
             .map(|plan| plan.source_id.clone())
             .or_else(|| freshness.as_ref().map(|value| value.source_id.clone()))
             .unwrap_or_else(|| {
-                ys_agent_core::SourceId::new(self.config.data_scope.source_id.clone())
+                ys_agent_core::SourceId::new(datasource.as_ref().map_or_else(
+                    || self.config.data_scope.source_id.clone(),
+                    |value| value.data_scope.source_id.clone(),
+                ))
             });
         let source_relations = result
             .as_ref()
@@ -1612,6 +1748,11 @@ impl Harness {
                     .map(|result| result.compiled.semantic_status)
                     .unwrap_or(ys_agent_core::SemanticStatus::Observed),
                 source_id,
+                datasource_revision: datasource.as_ref().map(|value| value.binding.revision()),
+                datasource_context: datasource
+                    .as_ref()
+                    .map(|value| value.binding.evidence().inputs().context_digest().clone()),
+                datasource_binding: binding_digest,
                 source_relations,
                 time_range,
                 executed_sql: result.as_ref().map(|result| result.compiled.sql.clone()),

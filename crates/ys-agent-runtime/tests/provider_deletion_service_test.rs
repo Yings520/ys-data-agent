@@ -1,3 +1,6 @@
+#[path = "../../ys-agent-core/tests/support/datasource.rs"]
+mod datasource_support;
+
 use std::sync::Arc;
 
 use tempfile::TempDir;
@@ -80,6 +83,12 @@ async fn create_nonterminal_run(
     );
     let run = Run::new(task.id, WorkflowKind::Query);
     let binding = RunProviderBinding::from_active(run.id, active).expect("bind exact active");
+    let datasource = datasource_support::persisted_binding(
+        &store.datasource_repository(),
+        run.id,
+        task.workspace_id,
+    )
+    .await;
     let snapshot = run.snapshot(serde_json::json!({"phase": "created"}), None, None, None);
     let command_id = CommandId::new();
     let command_fingerprint = format!("profile-deletion:{command_id}");
@@ -104,6 +113,7 @@ async fn create_nonterminal_run(
                 CreateRunCommand::new(
                     snapshot,
                     binding,
+                    datasource,
                     vec![PendingRunEvent {
                         actor: EventActor::System,
                         kind: RunEventKind::RunStarted,

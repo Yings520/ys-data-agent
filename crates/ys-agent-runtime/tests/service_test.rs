@@ -171,7 +171,13 @@ impl ServiceFixture {
             artifacts.clone(),
             scheduler.clone(),
             2,
-        );
+        )
+        .with_run_datasource_binding_source(Arc::new(
+            ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+                workspace_id,
+                Arc::new(store.datasource_repository()),
+            ),
+        ));
         if bind_runs {
             service = service.with_run_provider_binding_source(Arc::new(
                 StaticRunProviderBindingSource::from_active(
@@ -495,6 +501,12 @@ async fn production_run_creation_retries_with_the_committed_active_snapshot() {
         scheduler.clone(),
         2,
     )
+    .with_run_datasource_binding_source(Arc::new(
+        ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+            workspace_id,
+            Arc::new(store.datasource_repository()),
+        ),
+    ))
     .with_run_provider_binding_source(source);
     let session = service
         .create_session(CommandId::new(), Principal::local_operator("Data Engineer"))

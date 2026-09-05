@@ -11,19 +11,22 @@ use ys_agent_core::{
     ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactRef, ArtifactStore, CellValue, CommandId,
     CommandReceipt, CommandResultKind, CompatibilityEvidence, CompatibilityEvidenceView,
     ContextManifest, CoreError, CoreResult, CredentialGeneration, CredentialKind,
-    CredentialMutationRequest, CredentialVault, CredentialViewStatus, DeleteProfileRequest,
-    DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, EventActor, EventEnvelope,
-    ExportFormat, ListModelCandidatesRequest, ModelCandidateBatch, ModelMessage, ModelProvider,
-    ModelRequest, ModelRole, ModelSelectionSnapshot, OAuthConnectionView, OperationId,
-    PendingRunEvent, Principal, ProfileDetail, ProfileId, ProfileName, ProfileRevision,
-    ProfileRevisionRepository, ProfileSummary, ProviderCatalogView, ProviderCredentialReference,
-    ProviderDoctorView, ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi,
-    ProviderManagementError, ProviderModelId, ProviderParameters, ProviderRemediation,
-    ProviderResult, PutArtifact, QueryResult, RemoteRevocationOutcome, RetentionPolicy, Run,
-    RunEventKind, RunId, RunProviderBinding, RunProviderBindingRepository,
-    RunProviderBindingSource, RunSnapshot, RunStatus, RuntimeCommandBatch, RuntimeStore,
-    Sensitivity, Session, SessionId, SwitchModelRequest, Task, TaskId, ValidateProfileRequest,
-    ValidationVersions, WorkflowKind, WorkspaceId,
+    CredentialMutationRequest, CredentialVault, CredentialViewStatus, DatasourceDetail,
+    DatasourceDoctorReport, DatasourceDoctorRequest, DatasourceManagementApi, DatasourceReceipt,
+    DatasourceScope, DatasourceView, DeleteDatasource, DeleteProfileRequest,
+    DeviceAuthorizationView, DiscoverModelsRequest, DiscoveredModel, DsError, DsErrorCode,
+    DsRemediation, DsResult, EventActor, EventEnvelope, ExportFormat, ListModelCandidatesRequest,
+    ModelCandidateBatch, ModelMessage, ModelProvider, ModelRequest, ModelRole,
+    ModelSelectionSnapshot, OAuthConnectionView, OperationId, PendingRunEvent, Principal,
+    ProfileDetail, ProfileId, ProfileName, ProfileRevision, ProfileRevisionRepository,
+    ProfileSummary, ProviderCatalogView, ProviderCredentialReference, ProviderDoctorView,
+    ProviderErrorCode, ProviderField, ProviderId, ProviderManagementApi, ProviderManagementError,
+    ProviderModelId, ProviderParameters, ProviderRemediation, ProviderResult, PutArtifact,
+    QueryResult, RemoteRevocationOutcome, RetentionPolicy, Run, RunEventKind, RunId,
+    RunProviderBinding, RunProviderBindingRepository, RunProviderBindingSource, RunSnapshot,
+    RunStatus, RuntimeCommandBatch, RuntimeStore, SaveDatasource, SelectDatasource, Sensitivity,
+    Session, SessionId, SwitchModelRequest, Task, TaskId, ValidateDatasource,
+    ValidateProfileRequest, ValidationReport, ValidationVersions, WorkflowKind, WorkspaceId,
 };
 
 use crate::{
@@ -471,6 +474,54 @@ pub trait AgentServiceApi: Send + Sync {
 
     async fn doctor(&self) -> CoreResult<DoctorReport>;
 
+    fn datasource_management_api(&self) -> Option<&dyn DatasourceManagementApi> {
+        None
+    }
+
+    async fn datasource_view(&self, scope: DatasourceScope) -> DsResult<DatasourceView> {
+        datasource_api(self)?.view(scope).await
+    }
+
+    async fn datasource_save(&self, request: SaveDatasource) -> DsResult<DatasourceDetail> {
+        datasource_api(self)?.save(request).await
+    }
+
+    async fn datasource_validate(&self, request: ValidateDatasource) -> DsResult<ValidationReport> {
+        datasource_api(self)?.validate(request).await
+    }
+
+    async fn datasource_select(
+        &self,
+        request: SelectDatasource,
+    ) -> DsResult<ys_agent_core::SelectionSnapshot> {
+        datasource_api(self)?.select(request).await
+    }
+
+    async fn datasource_delete(
+        &self,
+        request: DeleteDatasource,
+    ) -> DsResult<ys_agent_core::SelectionSnapshot> {
+        datasource_api(self)?.delete(request).await
+    }
+
+    async fn datasource_doctor(
+        &self,
+        request: DatasourceDoctorRequest,
+    ) -> DsResult<DatasourceDoctorReport> {
+        datasource_api(self)?.doctor(request).await
+    }
+
+    async fn cancel_datasource_operation(&self, operation_id: OperationId) -> DsResult<()> {
+        datasource_api(self)?.cancel(operation_id).await
+    }
+
+    async fn datasource_receipt(
+        &self,
+        command_id: CommandId,
+    ) -> DsResult<Option<DatasourceReceipt>> {
+        datasource_api(self)?.receipt(command_id).await
+    }
+
     /// Returns the composed Provider-management boundary when this process has been bootstrapped
     /// for Provider management. TUI callers use only the default forwarding methods below.
     fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
@@ -662,6 +713,17 @@ fn provider_api<T: AgentServiceApi + ?Sized>(
     })
 }
 
+fn datasource_api<T: AgentServiceApi + ?Sized>(
+    service: &T,
+) -> DsResult<&dyn DatasourceManagementApi> {
+    service.datasource_management_api().ok_or(DsError {
+        code: DsErrorCode::Storage,
+        field: None,
+        remediation: DsRemediation::Retry,
+        operation_id: None,
+    })
+}
+
 pub struct InProcessAgentService {
     workspace_id: WorkspaceId,
     store: Arc<dyn RuntimeStore>,
@@ -675,12 +737,204 @@ pub struct InProcessAgentService {
     front_door: Option<FrontDoorAgent>,
     query_submission_disabled_message: Option<String>,
     run_provider_bindings: Arc<dyn RunProviderBindingSource>,
+    run_datasource_bindings: Option<Arc<dyn ys_agent_core::RunDatasourceBindingSource>>,
     provider_management: Option<Arc<dyn ProviderManagementApi>>,
+    datasource_management: Option<Arc<dyn DatasourceManagementApi>>,
     tui_display_context_source: Arc<dyn TuiDisplayContextSource>,
 }
 
 #[derive(Debug, Default)]
 pub struct UnavailableRunProviderBindingSource;
+
+/// Explicit deterministic assembly for contract tests and Replay only. Production leaves the
+/// datasource source absent until the management service supplies a durable selection.
+pub struct StaticRunDatasourceBindingSource {
+    scope: ys_agent_core::DatasourceScope,
+    revision: ys_agent_core::DatasourceRevision,
+    evidence: ys_agent_core::ValidationEvidence,
+    repository: Arc<dyn ys_agent_core::DatasourceRepository>,
+    initialized: tokio::sync::Mutex<bool>,
+}
+
+impl StaticRunDatasourceBindingSource {
+    pub fn for_test(
+        workspace_id: WorkspaceId,
+        repository: Arc<dyn ys_agent_core::DatasourceRepository>,
+    ) -> Self {
+        use ys_agent_core::*;
+        let source = SourceId::new("sqlite-demo");
+        let revision = DatasourceRevision::new(DatasourceRevisionInput {
+            schema_version: 1,
+            workspace_id,
+            profile_id: ProfileId::new(),
+            revision: 1,
+            adapter_id: "sqlite".try_into().expect("test adapter"),
+            adapter_version: "test".try_into().expect("test version"),
+            config_version: 1,
+            source_id: Some(source.clone()),
+            fields: Default::default(),
+            context: DatabaseContext::Database {
+                catalog: None,
+                database: "fixture".into(),
+                schema: "main".into(),
+            },
+            credential: None,
+        })
+        .expect("test revision");
+        let capability = CapabilityDescriptor {
+            source_id: source,
+            dialect: "sqlite".into(),
+            catalog_reader: true,
+            sql_query_executor: true,
+            freshness_reader: true,
+            supports_explain: false,
+            supports_read_only_tx: false,
+            max_concurrency: 1,
+            preflight_reader: true,
+            read_only_mechanism: Some(ReadOnlyMechanism::FileReadOnly),
+        };
+        let inputs = DatasourceValidationInputs::new(
+            &revision,
+            &capability,
+            DatasourceDigest::of(&"test-policy").expect("test policy"),
+        )
+        .expect("test inputs");
+        let evidence = ValidationEvidence::new(
+            inputs,
+            "test".try_into().expect("test version"),
+            ProbeEvidence {
+                authenticated: true,
+                target_verified: true,
+                read_only_verified: true,
+                least_privilege_verified: true,
+                capabilities_verified: true,
+            },
+            chrono::Utc::now(),
+        )
+        .expect("test evidence");
+        Self {
+            scope: DatasourceScope {
+                workspace_id,
+                session_id: SessionId::new(),
+            },
+            revision,
+            evidence,
+            repository,
+            initialized: tokio::sync::Mutex::new(false),
+        }
+    }
+
+    async fn initialize(
+        &self,
+        target_scope: ys_agent_core::DatasourceScope,
+    ) -> ys_agent_core::DsResult<()> {
+        use ys_agent_core::*;
+        let mut initialized = self.initialized.lock().await;
+        if !*initialized {
+            let profile = DatasourceProfile {
+                schema_version: 1,
+                workspace_id: self.scope.workspace_id,
+                profile_id: self.revision.identity().profile_id,
+                source_id: self.revision.input().source_id.clone(),
+                name: DatasourceName::new(format!(
+                    "Fixture {}",
+                    self.revision.identity().profile_id
+                ))
+                .expect("fixture name"),
+                head_revision: self.revision.identity().revision,
+                deleted_at: None,
+            };
+            let mut version = self.repository.load(self.scope).await?.version;
+            for change in [
+                DatasourceChange::SaveRevision {
+                    profile,
+                    revision: self.revision.clone(),
+                    mutation_id: None,
+                },
+                DatasourceChange::Validation {
+                    revision: self.revision.identity(),
+                    state: RevisionState::Ready,
+                    evidence: Some(self.evidence.clone()),
+                },
+            ] {
+                let expected_head_revision =
+                    if matches!(change, DatasourceChange::SaveRevision { .. }) {
+                        None
+                    } else {
+                        Some(self.revision.identity().revision)
+                    };
+                version = self
+                    .repository
+                    .commit(DatasourceCommit {
+                        schema_version: 1,
+                        write: DatasourceWriteContext {
+                            command_id: CommandId::new(),
+                            scope: self.scope,
+                            expected_version: version,
+                            expected_head_revision,
+                        },
+                        command_digest: DatasourceDigest::of(&change).expect("fixture digest"),
+                        change,
+                    })
+                    .await?
+                    .committed_version;
+            }
+            *initialized = true;
+        }
+        let snapshot = self.repository.load(target_scope).await?;
+        if snapshot.selection.current != Some(self.revision.identity()) {
+            let change = DatasourceChange::Selection {
+                revision: self.revision.identity(),
+                kind: DatasourceSelectionKind::Session,
+            };
+            self.repository
+                .commit(DatasourceCommit {
+                    schema_version: 1,
+                    write: DatasourceWriteContext {
+                        command_id: CommandId::new(),
+                        scope: target_scope,
+                        expected_version: snapshot.version,
+                        expected_head_revision: Some(self.revision.identity().revision),
+                    },
+                    command_digest: DatasourceDigest::of(&change).expect("fixture digest"),
+                    change,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ys_agent_core::RunDatasourceBindingSource for StaticRunDatasourceBindingSource {
+    async fn bind_new_run(
+        &self,
+        run_id: RunId,
+        scope: Option<ys_agent_core::DatasourceScope>,
+        _retry_of: Option<RunId>,
+    ) -> ys_agent_core::DsResult<ys_agent_core::RunDatasourceBinding> {
+        let scope = scope.unwrap_or(self.scope);
+        self.initialize(scope).await?;
+        ys_agent_core::RunDatasourceBinding::from_validated(
+            run_id,
+            scope,
+            self.repository
+                .load(scope)
+                .await?
+                .selection
+                .selection_version,
+            &self.revision,
+            &self.evidence,
+            self.evidence.inputs(),
+        )
+        .map_err(|_| ys_agent_core::DsError {
+            code: ys_agent_core::DsErrorCode::ValidationStale,
+            field: None,
+            remediation: ys_agent_core::DsRemediation::Revalidate,
+            operation_id: None,
+        })
+    }
+}
 
 #[async_trait]
 impl RunProviderBindingSource for UnavailableRunProviderBindingSource {
@@ -930,7 +1184,9 @@ impl InProcessAgentService {
             front_door: None,
             query_submission_disabled_message: None,
             run_provider_bindings: Arc::new(UnavailableRunProviderBindingSource),
+            run_datasource_bindings: None,
             provider_management: None,
+            datasource_management: None,
             tui_display_context_source: Arc::new(UnconfiguredTuiDisplayContextSource),
         }
     }
@@ -970,6 +1226,14 @@ impl InProcessAgentService {
         self
     }
 
+    pub fn with_run_datasource_binding_source(
+        mut self,
+        source: Arc<dyn ys_agent_core::RunDatasourceBindingSource>,
+    ) -> Self {
+        self.run_datasource_bindings = Some(source);
+        self
+    }
+
     /// Attaches the single masked Provider-management façade. Composition roots supply this after
     /// repositories, Vault, adapters, and reconciliation are ready; TUI code never receives any
     /// of those implementation dependencies.
@@ -978,6 +1242,14 @@ impl InProcessAgentService {
         provider_management: Arc<dyn ProviderManagementApi>,
     ) -> Self {
         self.provider_management = Some(provider_management);
+        self
+    }
+
+    pub fn with_datasource_management_api(
+        mut self,
+        datasource_management: Arc<dyn DatasourceManagementApi>,
+    ) -> Self {
+        self.datasource_management = Some(datasource_management);
         self
     }
 
@@ -1077,6 +1349,10 @@ impl InProcessAgentService {
             .commit_run(
                 command_id,
                 fingerprint,
+                Some(ys_agent_core::DatasourceScope {
+                    workspace_id: session.workspace_id,
+                    session_id: session.id,
+                }),
                 Some(task),
                 snapshot,
                 vec![system_event(RunEventKind::RunStarted)],
@@ -1209,6 +1485,7 @@ impl InProcessAgentService {
         &self,
         command_id: CommandId,
         fingerprint: String,
+        datasource_scope: Option<ys_agent_core::DatasourceScope>,
         task: Option<Task>,
         snapshot: RunSnapshot,
         events: Vec<PendingRunEvent>,
@@ -1230,8 +1507,26 @@ impl InProcessAgentService {
                 .bind_new_run(snapshot.run_id)
                 .await
                 .map_err(|error| CoreError::validation(error.code(), error.to_string()))?;
-            let create_run =
-                ys_agent_core::CreateRunCommand::new(snapshot.clone(), binding, events.clone())?;
+            let datasource = self
+                .run_datasource_bindings
+                .as_ref()
+                .ok_or_else(|| {
+                    CoreError::validation(
+                        "no_ready_datasource",
+                        "select a verified datasource before starting a Query",
+                    )
+                })?
+                .bind_new_run(snapshot.run_id, datasource_scope, snapshot.retry_of_run_id)
+                .await
+                .map_err(|error| {
+                    CoreError::validation("datasource_binding_unavailable", error.to_string())
+                })?;
+            let create_run = ys_agent_core::CreateRunCommand::new(
+                snapshot.clone(),
+                binding,
+                datasource,
+                events.clone(),
+            )?;
             let result = self
                 .store
                 .commit_command(RuntimeCommandBatch {
@@ -1292,7 +1587,10 @@ fn ensure_usable_credential(status: CredentialViewStatus) -> ProviderResult<()> 
 }
 
 fn active_snapshot_changed(error: &CoreError) -> bool {
-    error.code() == "active_provider_snapshot_changed"
+    matches!(
+        error.code(),
+        "active_provider_snapshot_changed" | "datasource_binding_conflict"
+    )
 }
 
 #[async_trait]
@@ -1325,6 +1623,10 @@ impl AgentServiceApi for InProcessAgentService {
 
     fn provider_management_api(&self) -> Option<&dyn ProviderManagementApi> {
         self.provider_management.as_deref()
+    }
+
+    fn datasource_management_api(&self) -> Option<&dyn DatasourceManagementApi> {
+        self.datasource_management.as_deref()
     }
 
     async fn create_session(
@@ -1518,6 +1820,10 @@ impl AgentServiceApi for InProcessAgentService {
                     .commit_run(
                         request.command_id,
                         fingerprint,
+                        Some(ys_agent_core::DatasourceScope {
+                            workspace_id: session.workspace_id,
+                            session_id: session.id,
+                        }),
                         None,
                         snapshot,
                         vec![system_event(RunEventKind::RunStarted)],
@@ -1545,6 +1851,10 @@ impl AgentServiceApi for InProcessAgentService {
                     .commit_run(
                         request.command_id,
                         fingerprint,
+                        Some(ys_agent_core::DatasourceScope {
+                            workspace_id: session.workspace_id,
+                            session_id: session.id,
+                        }),
                         None,
                         snapshot,
                         vec![
@@ -1606,6 +1916,7 @@ impl AgentServiceApi for InProcessAgentService {
                 command_id,
                 fingerprint,
                 None,
+                None,
                 snapshot,
                 vec![system_event(RunEventKind::RunStarted)],
             )
@@ -1632,6 +1943,7 @@ impl AgentServiceApi for InProcessAgentService {
             self.commit_run(
                 command_id,
                 fingerprint,
+                None,
                 None,
                 retry.clone(),
                 vec![system_event(RunEventKind::RunStarted)],

@@ -8,6 +8,7 @@ license.workspace = true
 async-trait.workspace = true
 bigdecimal.workspace = true
 chrono.workspace = true
+duckdb.workspace = true
 futures.workspace = true
 liter-llm.workspace = true
 oauth2.workspace = true
@@ -27,6 +28,9 @@ uuid.workspace = true
 webbrowser.workspace = true
 ys-agent-core = { path = "../ys-agent-core" }
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
