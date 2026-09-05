@@ -1909,6 +1909,23 @@ impl TuiController {
         Ok(())
     }
 
+    pub(super) async fn initialize_datasource_snapshot(
+        &mut self,
+        app: &mut TuiApp,
+    ) -> ys_agent_core::CoreResult<()> {
+        let session_id = self.ensure_session().await?;
+        let view = self
+            .service
+            .datasource_view(ys_agent_core::DatasourceScope {
+                workspace_id: self.workspace_id,
+                session_id,
+            })
+            .await
+            .map_err(datasource_to_core)?;
+        app.apply_datasource_snapshot(&view.snapshot);
+        Ok(())
+    }
+
     pub(super) fn datasource_screen(&self) -> Option<&DatasourceScreen> {
         self.datasource_screen.as_ref()
     }

@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 use zeroize::Zeroizing;
 
 use ys_agent_core::{
@@ -398,6 +401,14 @@ impl DatasourceScreen {
                 return None;
             }
         };
+        if normalize_existing_file_fields(form).is_err() {
+            self.state = DatasourceScreenState::Result;
+            self.result_back = DatasourceScreenState::Edit;
+            self.result = Some(
+                "Database file must already exist and resolve to a readable regular file.".into(),
+            );
+            return None;
+        }
         let has_secret = form.has_saved_secret || !form.secret.is_empty();
         if let Some(issue) = ys_agent_core::validate_datasource_fields(
             &form.descriptor.fields,
@@ -682,6 +693,28 @@ impl DatasourceScreen {
         }
         lines
     }
+}
+
+fn normalize_existing_file_fields(form: &mut DatasourceForm) -> Result<(), ()> {
+    let file_fields = form
+        .descriptor
+        .fields
+        .iter()
+        .filter(|field| matches!(field.input, FieldInput::ExistingFile))
+        .map(|field| field.id.clone())
+        .collect::<Vec<_>>();
+    for field_id in file_fields {
+        let Some(FieldValue::Text(path)) = form.values.get(&field_id).cloned() else {
+            continue;
+        };
+        let canonical = std::fs::canonicalize(Path::new(&path)).map_err(|_| ())?;
+        if !canonical.is_file() {
+            return Err(());
+        }
+        let canonical = canonical.to_str().ok_or(())?.to_owned();
+        form.values.insert(field_id, FieldValue::Text(canonical));
+    }
+    Ok(())
 }
 
 fn browse_selector(view: &DatasourceView) -> Selector<BrowseItem> {

@@ -588,6 +588,9 @@ async fn run_tui_session(dependencies: AppDependencies) -> CoreResult<()> {
         dependencies.workspace_id,
         dependencies.principal,
     );
+    if let Err(error) = controller.initialize_datasource_snapshot(&mut app).await {
+        app.safe_warning = Some(error.code().to_owned());
+    }
     controller.request_display_context_refresh(&app, DisplayContextRefreshTrigger::Startup);
     if let Err(error) = controller.refresh_active_provider(&mut app).await {
         app.apply_active_provider_view(None);
@@ -870,7 +873,9 @@ pub(crate) async fn handle_terminal_event(
                     KeyCode::Char('r') if state == Some(DatasourceScreenState::Result) => {
                         Some(DatasourceAction::Retry)
                     }
-                    KeyCode::Char(character) if key.modifiers.is_empty() => {
+                    KeyCode::Char(character)
+                        if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) =>
+                    {
                         Some(DatasourceAction::Insert(character))
                     }
                     _ => None,
@@ -2743,6 +2748,7 @@ mod tests {
             .execute_batch("CREATE TABLE orders(id INTEGER PRIMARY KEY, amount INTEGER); INSERT INTO orders(amount) VALUES (42);")
             .expect("seed real SQLite source");
         drop(connection);
+        let user_database_path = directory.path().join(".").join("warehouse.sqlite");
         let database = std::fs::canonicalize(database).expect("canonical source path");
         let allowed_root = std::fs::canonicalize(directory.path()).expect("canonical source root");
 
@@ -2796,17 +2802,21 @@ mod tests {
             controller.datasource_screen().unwrap().state(),
             DatasourceScreenState::Browse
         );
-        key(&mut app, &mut controller, KeyCode::Char('N')).await;
+        shifted_key(&mut app, &mut controller, KeyCode::Char('N')).await;
         key(&mut app, &mut controller, KeyCode::End).await;
         key(&mut app, &mut controller, KeyCode::Enter).await;
-        for character in "warehouse".chars() {
-            key(&mut app, &mut controller, KeyCode::Char(character)).await;
+        for character in "WareHouse".chars() {
+            if character.is_uppercase() {
+                shifted_key(&mut app, &mut controller, KeyCode::Char(character)).await;
+            } else {
+                key(&mut app, &mut controller, KeyCode::Char(character)).await;
+            }
         }
         key(&mut app, &mut controller, KeyCode::Tab).await;
         handle_terminal_event(
             &mut app,
             &mut controller,
-            Event::Paste(database.to_string_lossy().into_owned()),
+            Event::Paste(user_database_path.to_string_lossy().into_owned()),
         )
         .await
         .expect("paste path");
@@ -2850,7 +2860,7 @@ mod tests {
             .snapshot
             .clone();
         assert!(snapshot.selection.current.is_some());
-        assert_eq!(app.connection_label, "warehouse");
+        assert_eq!(app.connection_label, "WareHouse");
         assert!(
             matches!(app.transcript.last(), Some(super::TranscriptItem::UserMessage(message)) if message == "keep this conversation")
         );
@@ -2880,10 +2890,15 @@ mod tests {
         let restarted_principal = Principal::local_operator("keyboard-operator");
         let mut restarted = TuiController::new(service, workspace_id, restarted_principal.clone());
         let mut restarted_app = TuiApp::for_principal(restarted_principal);
+        restarted
+            .initialize_datasource_snapshot(&mut restarted_app)
+            .await
+            .expect("restore the default datasource before the first frame");
+        assert_eq!(restarted_app.connection_label, "WareHouse");
         restarted_app.composer.set_text("/connections");
         key(&mut restarted_app, &mut restarted, KeyCode::Enter).await;
         let rendered = render_to_string(&restarted_app, 100, 30);
-        assert!(rendered.contains("warehouse"));
+        assert!(rendered.contains("WareHouse"));
         assert!(rendered.contains("[current]"));
         assert!(rendered.contains("[default]"));
     }
@@ -2896,6 +2911,16 @@ mod tests {
         )
         .await
         .expect("keyboard event");
+    }
+
+    async fn shifted_key(app: &mut TuiApp, controller: &mut TuiController, code: KeyCode) {
+        handle_terminal_event(
+            app,
+            controller,
+            Event::Key(KeyEvent::new(code, KeyModifiers::SHIFT)),
+        )
+        .await
+        .expect("shifted keyboard event");
     }
 
     async fn apply_datasource_completion(controller: &mut TuiController, app: &mut TuiApp) {
