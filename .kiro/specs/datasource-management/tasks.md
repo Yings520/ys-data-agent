@@ -14,7 +14,7 @@
   - _Boundary: DatasourceDomain；core connector/ports/event/context；受契约影响的调用构造适配_
   - _Depends: none_
 
-- [ ] 2. 集成可恢复的配置与秘密存储
+- [x] 2. 集成可恢复的配置与秘密存储
   - 实现 Profile、revision、验证、当前/默认、凭证 generation、Run binding、回执及 journal 的存储与迁移；CAS、关联完整性和建 Run/删除竞争使用同一 SQLite 事务。
   - 复用本地加密文件引擎，保持 Provider 原格式；实现 Datasource 独立命名空间、Keep/Replace/Remove、权限检查、秘密轮换与旧 Run 引用保护。
   - 完成态：保存或删除失败及各 journal 阶段中断后，重启只得到完整旧/新状态；非终态 Run 的凭证不可删除，普通存储和输出无秘密，Provider 存储回归通过。

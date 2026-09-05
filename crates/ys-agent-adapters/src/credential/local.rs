@@ -5,18 +5,14 @@
 //! owner-only permissions, so normal startup and TUI refreshes never invoke platform prompts.
 
 use std::{
-    fmt,
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fmt, fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
+use super::encrypted::{self, EnvelopeError, KEY_LENGTH, write_new_private_file};
 use async_trait::async_trait;
-use ring::{
-    aead::{self, Aad, LessSafeKey, UnboundKey},
-    rand::{SecureRandom, SystemRandom},
-};
+use ring::rand::{SecureRandom, SystemRandom};
 use ys_agent_core::{
     CredentialLease, CredentialProtectionStatus, CredentialVault, CredentialViewStatus,
     ProtectedCredentialWrite, ProviderCredentialReference, ProviderErrorCode, ProviderField,
@@ -26,9 +22,6 @@ use zeroize::{Zeroize, Zeroizing};
 
 const KEY_FILE: &str = "provider-credentials.key";
 const ENTRIES_DIRECTORY: &str = "provider-credentials";
-const ENVELOPE_VERSION: u8 = 1;
-const KEY_LENGTH: usize = 32;
-const NONCE_LENGTH: usize = 12;
 
 /// The production credential vault. It never constructs or contacts an OS credential entry.
 #[derive(Clone)]
@@ -252,28 +245,6 @@ fn write_new_generation(
     }
 }
 
-fn write_new_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = open_new_private_file(path)?;
-    let result = file.write_all(bytes).and_then(|_| file.sync_all());
-    drop(file);
-    if let Err(error) = result {
-        let _ = fs::remove_file(path);
-        return Err(error);
-    }
-    enforce_private_file_permissions(path)
-}
-
-fn open_new_private_file(path: &Path) -> io::Result<fs::File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
-}
-
 #[cfg(unix)]
 fn enforce_private_directory_permissions(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -301,29 +272,7 @@ fn encrypt_generation(
     reference: &ProviderCredentialReference,
     secret: &str,
 ) -> ProviderResult<Vec<u8>> {
-    if secret.is_empty() {
-        return Err(storage_conflict());
-    }
-    let cipher = cipher(key)?;
-    let mut nonce_bytes = [0_u8; NONCE_LENGTH];
-    SystemRandom::new()
-        .fill(&mut nonce_bytes)
-        .map_err(|_| internal_error())?;
-    let aad = associated_data(reference);
-    let mut ciphertext = secret.as_bytes().to_vec();
-    cipher
-        .seal_in_place_append_tag(
-            aead::Nonce::assume_unique_for_key(nonce_bytes),
-            Aad::from(aad.as_slice()),
-            &mut ciphertext,
-        )
-        .map_err(|_| internal_error())?;
-    let mut encoded = Vec::with_capacity(1 + NONCE_LENGTH + ciphertext.len());
-    encoded.push(ENVELOPE_VERSION);
-    encoded.extend_from_slice(&nonce_bytes);
-    encoded.extend_from_slice(&ciphertext);
-    ciphertext.zeroize();
-    Ok(encoded)
+    encrypted::encrypt(key, &associated_data(reference), secret).map_err(envelope_error)
 }
 
 fn decrypt_generation(
@@ -331,36 +280,16 @@ fn decrypt_generation(
     reference: &ProviderCredentialReference,
     encrypted: Vec<u8>,
 ) -> ProviderResult<SecretValue> {
-    if encrypted.len() <= 1 + NONCE_LENGTH || encrypted[0] != ENVELOPE_VERSION {
-        return Err(storage_conflict());
-    }
-    let cipher = cipher(key)?;
-    let mut nonce_bytes = [0_u8; NONCE_LENGTH];
-    nonce_bytes.copy_from_slice(&encrypted[1..=NONCE_LENGTH]);
-    let mut ciphertext = Zeroizing::new(encrypted[(1 + NONCE_LENGTH)..].to_vec());
-    let aad = associated_data(reference);
-    let plaintext_length = cipher
-        .open_in_place(
-            aead::Nonce::assume_unique_for_key(nonce_bytes),
-            Aad::from(aad.as_slice()),
-            &mut ciphertext,
-        )
-        .map_err(|_| storage_conflict())?
-        .len();
-    let mut plaintext = ciphertext[..plaintext_length].to_vec();
-    ciphertext.zeroize();
-    let secret = String::from_utf8(std::mem::take(&mut plaintext)).map_err(|error| {
-        let mut malformed = error.into_bytes();
-        malformed.zeroize();
-        storage_conflict()
-    })?;
-    Ok(SecretValue::from_utf8(secret))
+    encrypted::decrypt(key, &associated_data(reference), &encrypted)
+        .map(SecretValue::from_utf8)
+        .map_err(envelope_error)
 }
 
-fn cipher(key: &[u8; KEY_LENGTH]) -> ProviderResult<LessSafeKey> {
-    UnboundKey::new(&aead::AES_256_GCM, key)
-        .map(LessSafeKey::new)
-        .map_err(|_| internal_error())
+fn envelope_error(error: EnvelopeError) -> ProviderManagementError {
+    match error {
+        EnvelopeError::Invalid => storage_conflict(),
+        EnvelopeError::Internal => internal_error(),
+    }
 }
 
 fn associated_data(reference: &ProviderCredentialReference) -> Vec<u8> {

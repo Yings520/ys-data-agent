@@ -627,6 +627,8 @@ pub struct DatasourceHeader {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasourceSnapshot {
     pub schema_version: u32,
+    /// Workspace-wide management CAS version, independent of each selection's version.
+    pub version: u64,
     pub profiles: Vec<DatasourceDetail>,
     pub selection: SelectionSnapshot,
 }
@@ -870,6 +872,16 @@ pub trait DatasourceRepository: Send + Sync {
         workspace: WorkspaceId,
     ) -> DsResult<Vec<SecretMutation>>;
     async fn load_run_binding(&self, run: crate::RunId) -> DsResult<RunDatasourceBinding>;
+    /// Retire an uncommitted/obsolete generation atomically after checking durable Run leases.
+    /// The caller may remove the vault file only after this succeeds. Repeated claims are safe.
+    async fn claim_secret_cleanup(&self, reference: DatasourceSecretRef) -> DsResult<()>;
+    async fn finish_secret_cleanup(&self, reference: DatasourceSecretRef) -> DsResult<()>;
+    async fn obsolete_secret_generations(
+        &self,
+        workspace: WorkspaceId,
+    ) -> DsResult<Vec<DatasourceSecretRef>>;
+    /// Acknowledge successful file cleanup; failed cleanup must retain the journal for retry.
+    async fn finish_secret_mutation(&self, mutation: crate::OperationId) -> DsResult<()>;
 }
 
 #[async_trait]

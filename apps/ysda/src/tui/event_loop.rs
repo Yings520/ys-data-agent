@@ -2314,13 +2314,19 @@ mod tests {
         );
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
-            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
-                .with_run_datasource_binding_source(Arc::new(
-                    ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(workspace_id),
-                ))
-                .with_run_provider_binding_source(Arc::new(
-                    StaticRunProviderBindingSource::for_test(),
-                )),
+            InProcessAgentService::new(
+                workspace_id,
+                store.clone(),
+                artifacts,
+                Arc::new(NoopRunScheduler),
+            )
+            .with_run_datasource_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+                    workspace_id,
+                    Arc::new(store.datasource_repository()),
+                ),
+            ))
+            .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::for_test())),
         );
         let principal = Principal::local_operator("test-operator");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());
@@ -2467,14 +2473,20 @@ mod tests {
         }));
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
-            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
-                .with_run_datasource_binding_source(Arc::new(
-                    ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(workspace_id),
-                ))
-                .with_run_provider_binding_source(Arc::new(
-                    StaticRunProviderBindingSource::for_test(),
-                ))
-                .with_conversation_model(model, "delayed-test-model"),
+            InProcessAgentService::new(
+                workspace_id,
+                store.clone(),
+                artifacts,
+                Arc::new(NoopRunScheduler),
+            )
+            .with_run_datasource_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+                    workspace_id,
+                    Arc::new(store.datasource_repository()),
+                ),
+            ))
+            .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::for_test()))
+            .with_conversation_model(model, "delayed-test-model"),
         );
         let principal = Principal::local_operator("test-operator");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());
@@ -2573,14 +2585,20 @@ mod tests {
         }));
         let workspace_id = WorkspaceId::new();
         let service = Arc::new(
-            InProcessAgentService::new(workspace_id, store, artifacts, Arc::new(NoopRunScheduler))
-                .with_run_datasource_binding_source(Arc::new(
-                    ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(workspace_id),
-                ))
-                .with_run_provider_binding_source(Arc::new(
-                    StaticRunProviderBindingSource::for_test(),
-                ))
-                .with_conversation_model(model, "timeout-test-model"),
+            InProcessAgentService::new(
+                workspace_id,
+                store.clone(),
+                artifacts,
+                Arc::new(NoopRunScheduler),
+            )
+            .with_run_datasource_binding_source(Arc::new(
+                ys_agent_runtime::StaticRunDatasourceBindingSource::for_test(
+                    workspace_id,
+                    Arc::new(store.datasource_repository()),
+                ),
+            ))
+            .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::for_test()))
+            .with_conversation_model(model, "timeout-test-model"),
         );
         let principal = Principal::local_operator("test-operator");
         let mut controller = TuiController::new(service, workspace_id, principal.clone());

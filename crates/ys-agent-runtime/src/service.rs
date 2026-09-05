@@ -689,10 +689,15 @@ pub struct StaticRunDatasourceBindingSource {
     scope: ys_agent_core::DatasourceScope,
     revision: ys_agent_core::DatasourceRevision,
     evidence: ys_agent_core::ValidationEvidence,
+    repository: Arc<dyn ys_agent_core::DatasourceRepository>,
+    initialized: tokio::sync::Mutex<bool>,
 }
 
 impl StaticRunDatasourceBindingSource {
-    pub fn for_test(workspace_id: WorkspaceId) -> Self {
+    pub fn for_test(
+        workspace_id: WorkspaceId,
+        repository: Arc<dyn ys_agent_core::DatasourceRepository>,
+    ) -> Self {
         use ys_agent_core::*;
         let source = SourceId::new("fixture");
         let revision = DatasourceRevision::new(DatasourceRevisionInput {
@@ -751,7 +756,68 @@ impl StaticRunDatasourceBindingSource {
             },
             revision,
             evidence,
+            repository,
+            initialized: tokio::sync::Mutex::new(false),
         }
+    }
+
+    async fn initialize(&self) -> ys_agent_core::DsResult<()> {
+        use ys_agent_core::*;
+        let mut initialized = self.initialized.lock().await;
+        if *initialized {
+            return Ok(());
+        }
+        let profile = DatasourceProfile {
+            schema_version: 1,
+            workspace_id: self.scope.workspace_id,
+            profile_id: self.revision.identity().profile_id,
+            source_id: self.revision.input().source_id.clone(),
+            name: DatasourceName::new(format!("Fixture {}", self.revision.identity().profile_id))
+                .expect("fixture name"),
+            head_revision: self.revision.identity().revision,
+            deleted_at: None,
+        };
+        let mut version = self.repository.load(self.scope).await?.version;
+        for change in [
+            DatasourceChange::SaveRevision {
+                profile,
+                revision: self.revision.clone(),
+                mutation_id: None,
+            },
+            DatasourceChange::Validation {
+                revision: self.revision.identity(),
+                state: RevisionState::Ready,
+                evidence: Some(self.evidence.clone()),
+            },
+            DatasourceChange::Selection {
+                revision: self.revision.identity(),
+                kind: DatasourceSelectionKind::Session,
+            },
+        ] {
+            let expected_head_revision = if matches!(change, DatasourceChange::SaveRevision { .. })
+            {
+                None
+            } else {
+                Some(self.revision.identity().revision)
+            };
+            version = self
+                .repository
+                .commit(DatasourceCommit {
+                    schema_version: 1,
+                    write: DatasourceWriteContext {
+                        command_id: CommandId::new(),
+                        scope: self.scope,
+                        expected_version: version,
+                        expected_head_revision,
+                    },
+                    command_digest: DatasourceDigest::of(&change).expect("fixture digest"),
+                    change,
+                })
+                .await?
+                .committed_version;
+        }
+        *initialized = true;
+        Ok(())
     }
 }
 
@@ -762,6 +828,7 @@ impl ys_agent_core::RunDatasourceBindingSource for StaticRunDatasourceBindingSou
         run_id: RunId,
         scope: Option<ys_agent_core::DatasourceScope>,
     ) -> ys_agent_core::DsResult<ys_agent_core::RunDatasourceBinding> {
+        self.initialize().await?;
         ys_agent_core::RunDatasourceBinding::from_validated(
             run_id,
             scope.unwrap_or(self.scope),

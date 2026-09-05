@@ -1492,7 +1492,11 @@ struct StoreFixture {
     store: SqliteRuntimeStore,
 }
 
-async fn create_run(store: &SqliteRuntimeStore, snapshot: RunSnapshot) -> CreateRunCommand {
+async fn create_run(
+    store: &SqliteRuntimeStore,
+    snapshot: RunSnapshot,
+    workspace: WorkspaceId,
+) -> CreateRunCommand {
     let profile_id = ProfileId::new();
     let repository = store.provider_repository();
     let model = ProviderModelId::new(ProviderId::DeepSeek, "deepseek/test-model")
@@ -1588,7 +1592,8 @@ async fn create_run(store: &SqliteRuntimeStore, snapshot: RunSnapshot) -> Create
     CreateRunCommand::new(
         snapshot,
         RunProviderBinding::from_active(run_id, active).expect("test Run binding"),
-        datasource_support::datasource_binding(run_id),
+        datasource_support::persisted_binding(&store.datasource_repository(), run_id, workspace)
+            .await,
         Vec::new(),
     )
     .expect("complete Run create command")
@@ -1632,7 +1637,7 @@ impl StoreFixture {
                 receipt,
                 new_session: None,
                 new_task: Some(task),
-                create_run: Some(create_run(&self.store, snapshot.clone()).await),
+                create_run: Some(create_run(&self.store, snapshot.clone(), workspace_id).await),
                 new_artifact: None,
                 pending_events: vec![],
                 snapshot_update: None,
@@ -1732,7 +1737,7 @@ async fn reopened_store_loads_the_latest_snapshot_and_events() {
             },
             new_session: None,
             new_task: Some(task),
-            create_run: Some(create_run(&store, initial.clone()).await),
+            create_run: Some(create_run(&store, initial.clone(), workspace_id).await),
             new_artifact: None,
             pending_events: vec![],
             snapshot_update: None,
@@ -1853,7 +1858,7 @@ async fn duplicate_command_id_returns_the_origianl_recepit() {
         },
         new_session: None,
         new_task: Some(task),
-        create_run: Some(create_run(&fixture.store, snapshot).await),
+        create_run: Some(create_run(&fixture.store, snapshot, workspace_id).await),
         new_artifact: None,
         pending_events: vec![],
         snapshot_update: None,

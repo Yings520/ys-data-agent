@@ -28,6 +28,9 @@ webbrowser.workspace = true
 ys-agent-core = { path = "../ys-agent-core" }
 zeroize.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true

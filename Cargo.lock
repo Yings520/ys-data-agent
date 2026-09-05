@@ -4230,6 +4230,7 @@ dependencies = [
  "reqwest 0.13.4",
  "ring",
  "rusqlite",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",

@@ -120,7 +120,19 @@ async fn seed_active_profile(
     }
 }
 
-fn create_batch(task: Option<Task>, run: &Run, binding: RunProviderBinding) -> RuntimeCommandBatch {
+async fn create_batch(
+    store: &SqliteRuntimeStore,
+    task: Option<Task>,
+    run: &Run,
+    binding: RunProviderBinding,
+) -> RuntimeCommandBatch {
+    let datasource = datasource_support::persisted_binding(
+        &store.datasource_repository(),
+        run.id,
+        task.as_ref()
+            .map_or_else(WorkspaceId::new, |t| t.workspace_id),
+    )
+    .await;
     let snapshot = run.snapshot(serde_json::json!({"phase": "created"}), None, None, None);
     let command_id = CommandId::new();
     let command_fingerprint = format!("create-run:{command_id}");
@@ -144,7 +156,7 @@ fn create_batch(task: Option<Task>, run: &Run, binding: RunProviderBinding) -> R
             CreateRunCommand::new(
                 snapshot,
                 binding,
-                datasource_support::datasource_binding(run.id),
+                datasource,
                 vec![PendingRunEvent {
                     actor: ys_agent_core::EventActor::System,
                     kind: RunEventKind::RunStarted,
@@ -176,7 +188,7 @@ async fn run_binding_is_atomic_insert_only_recoverable_and_tracks_nonterminal_re
         RunProviderBinding::from_active(run.id, active.snapshot).expect("immutable binding");
 
     store
-        .commit_command(create_batch(Some(task), &run, binding.clone()))
+        .commit_command(create_batch(&store, Some(task), &run, binding.clone()).await)
         .await
         .expect("atomically persist Run, binding, and events");
 
@@ -315,7 +327,7 @@ async fn active_snapshot_race_rolls_back_run_binding_events_and_receipt() {
     let run = Run::new(task.id, WorkflowKind::Query);
     let stale_binding =
         RunProviderBinding::from_active(run.id, original.snapshot).expect("stale binding");
-    let batch = create_batch(Some(task), &run, stale_binding);
+    let batch = create_batch(&store, Some(task), &run, stale_binding).await;
 
     seed_active_profile(
         &store,
@@ -374,7 +386,7 @@ async fn failure_after_binding_insert_rolls_back_every_run_creation_row() {
         RunProviderBinding::from_active(run.id, active.snapshot).expect("immutable binding");
 
     store
-        .commit_command(create_batch(None, &run, binding))
+        .commit_command(create_batch(&store, None, &run, binding).await)
         .await
         .expect_err("event construction cannot load the absent Task");
 
@@ -394,4 +406,190 @@ async fn failure_after_binding_insert_rolls_back_every_run_creation_row() {
         )
         .expect("count bindings");
     assert_eq!((run_count, binding_count), (0, 0));
+}
+
+#[tokio::test]
+async fn datasource_deleted_after_candidate_binding_cannot_create_a_run() {
+    use ys_agent_core::{
+        DatasourceChange, DatasourceCommit, DatasourceDigest, DatasourceRepository,
+        DatasourceWriteContext, DeleteDatasourceDisposition,
+    };
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.db");
+    let store = SqliteRuntimeStore::open(&database).await.unwrap();
+    let active = seed_active_profile(&store, &database, "Primary", "deepseek/model-a", None).await;
+    let task = Task::new(
+        WorkspaceId::new(),
+        ys_agent_core::PrincipalId::new(),
+        "Datasource deletion race",
+    );
+    let run = Run::new(task.id, WorkflowKind::Query);
+    let provider = RunProviderBinding::from_active(run.id, active.snapshot).unwrap();
+    let batch = create_batch(&store, Some(task), &run, provider).await;
+    let binding = batch.create_run.as_ref().unwrap().datasource_binding();
+    let repository = store.datasource_repository();
+    let state = repository.load(binding.scope()).await.unwrap();
+    let change = DatasourceChange::Delete {
+        profile_id: binding.revision().profile_id,
+        disposition: DeleteDatasourceDisposition::ConfirmUnconfigured,
+    };
+    repository
+        .commit(DatasourceCommit {
+            schema_version: 1,
+            write: DatasourceWriteContext {
+                command_id: CommandId::new(),
+                scope: binding.scope(),
+                expected_version: state.version,
+                expected_head_revision: Some(binding.revision().revision),
+            },
+            command_digest: DatasourceDigest::of(&change).unwrap(),
+            change,
+        })
+        .await
+        .unwrap();
+    assert!(store.commit_command(batch).await.is_err());
+    assert_eq!(store.run_count().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn rotated_datasource_credentials_remain_pinned_until_the_old_run_is_terminal() {
+    use ys_agent_core::*;
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.db");
+    let store = SqliteRuntimeStore::open(&database).await.unwrap();
+    let repository = store.datasource_repository();
+    let active = seed_active_profile(&store, &database, "Primary", "deepseek/model-a", None).await;
+    let task = Task::new(
+        WorkspaceId::new(),
+        PrincipalId::new(),
+        "Credential rotation",
+    );
+    let run = Run::new(task.id, WorkflowKind::Query);
+    let binding =
+        datasource_support::persisted_secret_binding(&repository, run.id, task.workspace_id).await;
+    let provider = RunProviderBinding::from_active(run.id, active.snapshot).unwrap();
+    let mut batch = create_batch(&store, Some(task), &run, provider.clone()).await;
+    batch.create_run = Some(
+        CreateRunCommand::new(
+            run.snapshot(serde_json::json!({}), None, None, None),
+            provider,
+            binding.clone(),
+            vec![PendingRunEvent {
+                actor: EventActor::System,
+                kind: RunEventKind::RunStarted,
+            }],
+        )
+        .unwrap(),
+    );
+    store.commit_command(batch).await.unwrap();
+    assert_eq!(repository.load_run_binding(run.id).await.unwrap(), binding);
+    let old = binding.credential().unwrap();
+    assert_eq!(
+        repository.claim_secret_cleanup(old).await.unwrap_err().code,
+        DsErrorCode::InUse
+    );
+
+    let detail = repository.load_revision(binding.revision()).await.unwrap();
+    let new = DatasourceSecretRef::new(old.workspace_id(), old.profile_id(), 2).unwrap();
+    let mut input = detail.revision.input().clone();
+    input.revision = 2;
+    input.credential = Some(new);
+    let revision = DatasourceRevision::new(input).unwrap();
+    let mut profile = detail.profile;
+    profile.head_revision = revision.identity().revision;
+    let id = OperationId::new();
+    let change = DatasourceChange::SaveRevision {
+        profile,
+        revision: revision.clone(),
+        mutation_id: Some(id),
+    };
+    let command = DatasourceCommit {
+        schema_version: 1,
+        write: DatasourceWriteContext {
+            command_id: CommandId::new(),
+            scope: binding.scope(),
+            expected_version: repository.load(binding.scope()).await.unwrap().version,
+            expected_head_revision: Some(binding.revision().revision),
+        },
+        command_digest: DatasourceDigest::of(&change).unwrap(),
+        change,
+    };
+    for phase in [
+        SecretMutationPhase::Prepared,
+        SecretMutationPhase::VaultWritten,
+    ] {
+        let mutation = SecretMutation {
+            schema_version: 1,
+            mutation_id: id,
+            write: command.write,
+            profile_id: old.profile_id(),
+            old: Some(old),
+            new: Some(new),
+            phase,
+            command_digest: command.command_digest.clone(),
+        };
+        repository
+            .commit(DatasourceCommit {
+                change: DatasourceChange::SecretJournal { mutation },
+                ..command.clone()
+            })
+            .await
+            .unwrap();
+    }
+    repository.commit(command).await.unwrap();
+    assert_eq!(
+        repository
+            .load_revision(binding.revision())
+            .await
+            .unwrap()
+            .state,
+        RevisionState::Invalid(DsErrorCode::CredentialExpired)
+    );
+    assert_eq!(
+        repository.claim_secret_cleanup(old).await.unwrap_err().code,
+        DsErrorCode::InUse
+    );
+    // Normal retention is not a failed cleanup: rotation can finish while the old Run owns its lease.
+    repository.finish_secret_mutation(id).await.unwrap();
+    assert_eq!(
+        repository
+            .obsolete_secret_generations(binding.scope().workspace_id)
+            .await
+            .unwrap(),
+        vec![old]
+    );
+    assert_eq!(
+        repository
+            .load_run_binding(run.id)
+            .await
+            .unwrap()
+            .credential(),
+        Some(old)
+    );
+    let mut snapshot = store.load_run(&run.id).await.unwrap();
+    let previous = snapshot.version;
+    snapshot.version += 1;
+    snapshot.status = RunStatus::Cancelled;
+    store
+        .append(&run.id, previous, vec![], vec![], &snapshot)
+        .await
+        .unwrap();
+    repository.claim_secret_cleanup(old).await.unwrap();
+    repository.finish_secret_cleanup(old).await.unwrap();
+    assert!(
+        repository
+            .obsolete_secret_generations(binding.scope().workspace_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        repository
+            .load_run_binding(run.id)
+            .await
+            .unwrap()
+            .credential(),
+        Some(old),
+        "historical identity must remain intact"
+    );
 }

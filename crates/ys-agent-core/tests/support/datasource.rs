@@ -1,7 +1,15 @@
 use ys_agent_core::*;
 
+#[allow(dead_code)] // Shared by pure core contracts and persistence integration tests.
 pub fn datasource_binding(run: RunId) -> RunDatasourceBinding {
-    let workspace = WorkspaceId::new();
+    binding_in(run, WorkspaceId::new(), false).0
+}
+
+fn binding_in(
+    run: RunId,
+    workspace: WorkspaceId,
+    secret: bool,
+) -> (RunDatasourceBinding, DatasourceRevision) {
     let profile = ProfileId::new();
     let source = SourceId::new("contract-test");
     let revision = DatasourceRevision::new(DatasourceRevisionInput {
@@ -19,7 +27,7 @@ pub fn datasource_binding(run: RunId) -> RunDatasourceBinding {
             database: "contract".into(),
             schema: "main".into(),
         },
-        credential: None,
+        credential: secret.then(|| DatasourceSecretRef::new(workspace, profile, 1).unwrap()),
     })
     .unwrap();
     let capability = CapabilityDescriptor {
@@ -53,7 +61,7 @@ pub fn datasource_binding(run: RunId) -> RunDatasourceBinding {
         chrono::Utc::now(),
     )
     .unwrap();
-    RunDatasourceBinding::from_validated(
+    let binding = RunDatasourceBinding::from_validated(
         run,
         DatasourceScope {
             workspace_id: workspace,
@@ -64,5 +72,119 @@ pub fn datasource_binding(run: RunId) -> RunDatasourceBinding {
         &evidence,
         &inputs,
     )
-    .unwrap()
+    .unwrap();
+    (binding, revision)
+}
+
+#[allow(dead_code)] // Store/runtime test fixtures must satisfy the same durable constraints.
+pub async fn persisted_binding(
+    repository: &dyn DatasourceRepository,
+    run: RunId,
+    workspace: WorkspaceId,
+) -> RunDatasourceBinding {
+    persist(repository, run, workspace, false).await
+}
+
+#[allow(dead_code)]
+pub async fn persisted_secret_binding(
+    repository: &dyn DatasourceRepository,
+    run: RunId,
+    workspace: WorkspaceId,
+) -> RunDatasourceBinding {
+    persist(repository, run, workspace, true).await
+}
+
+async fn persist(
+    repository: &dyn DatasourceRepository,
+    run: RunId,
+    workspace: WorkspaceId,
+    secret: bool,
+) -> RunDatasourceBinding {
+    let (binding, revision) = binding_in(run, workspace, secret);
+    let scope = binding.scope();
+    let profile = DatasourceProfile {
+        schema_version: 1,
+        workspace_id: workspace,
+        profile_id: revision.identity().profile_id,
+        source_id: revision.input().source_id.clone(),
+        name: DatasourceName::new(format!("Contract {}", revision.identity().profile_id)).unwrap(),
+        head_revision: revision.identity().revision,
+        deleted_at: None,
+    };
+    let mut version = repository.load(scope).await.unwrap().version;
+    let mutation_id = secret.then(OperationId::new);
+    for change in [
+        DatasourceChange::SaveRevision {
+            profile,
+            revision: revision.clone(),
+            mutation_id,
+        },
+        DatasourceChange::Validation {
+            revision: revision.identity(),
+            state: RevisionState::Ready,
+            evidence: Some(binding.evidence().clone()),
+        },
+        DatasourceChange::Selection {
+            revision: revision.identity(),
+            kind: DatasourceSelectionKind::Session,
+        },
+    ] {
+        let expected_head_revision = if matches!(change, DatasourceChange::SaveRevision { .. }) {
+            None
+        } else {
+            Some(revision.identity().revision)
+        };
+        let command = DatasourceCommit {
+            schema_version: 1,
+            write: DatasourceWriteContext {
+                command_id: CommandId::new(),
+                scope,
+                expected_version: version,
+                expected_head_revision,
+            },
+            command_digest: DatasourceDigest::of(&change).unwrap(),
+            change,
+        };
+        if let DatasourceChange::SaveRevision {
+            mutation_id: Some(id),
+            ..
+        } = command.change
+        {
+            for phase in [
+                SecretMutationPhase::Prepared,
+                SecretMutationPhase::VaultWritten,
+            ] {
+                let mutation = SecretMutation {
+                    schema_version: 1,
+                    mutation_id: id,
+                    write: command.write,
+                    profile_id: revision.identity().profile_id,
+                    old: None,
+                    new: revision.input().credential,
+                    phase,
+                    command_digest: command.command_digest.clone(),
+                };
+                repository
+                    .commit(DatasourceCommit {
+                        change: DatasourceChange::SecretJournal { mutation },
+                        ..command.clone()
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        version = repository
+            .commit(command.clone())
+            .await
+            .unwrap()
+            .committed_version;
+        if let DatasourceChange::SaveRevision {
+            mutation_id: Some(id),
+            ..
+        } = command.change
+        {
+            repository.finish_secret_mutation(id).await.unwrap();
+        }
+    }
+    binding
 }
