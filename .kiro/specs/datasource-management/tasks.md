@@ -72,7 +72,7 @@
   - _Boundary: DatasourceScreen、现有 TUI 导航/选择器、bootstrap 与管理服务的产品入口集成_
   - _Depends: 7_
 
-- [ ] 9. 验证三种连接的完整交付
+- [x] 9. 验证三种连接的完整交付
   - 将三驱动共享契约、真实 TUI→验证→选择→Query→Artifact→重启链路加入发布门禁；测试环境缺 PostgreSQL 或 DuckDB 构建失败必须报失败，不能跳过后宣称完成。
   - 覆盖事务故障、并发与引用保护、连接关闭、Secret canary、旧 Workspace/Run 迁移，以及现有 Provider、Doctor、Export 和 Query eval 回归。
   - 完成态：V1–V7 与工作区 fmt/clippy/test、现有 release gate 全部通过，三驱动有实际版本及连接/查询证据，此时才代表 Feature 可交付；凭证泄露、越权写入和严重静默切换均为 0。

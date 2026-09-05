@@ -154,6 +154,9 @@ pub fn builtin_descriptor(adapter: &str) -> DsResult<ConnectorDescriptor> {
         ),
         _ => return Err(ds_failure(DsErrorCode::ConfigIncompatible)),
     };
+    let release_evidence =
+        DatasourceDigest::of(&("datasource-management-v0.2", adapter, 1_u64, 1_u64))
+            .map_err(|_| ds_failure(DsErrorCode::ConfigIncompatible))?;
     Ok(ConnectorDescriptor {
         schema_version: 1,
         adapter_id: adapter
@@ -164,7 +167,7 @@ pub fn builtin_descriptor(adapter: &str) -> DsResult<ConnectorDescriptor> {
         config_version: 1,
         contract_version: 1,
         display_name: name.into(),
-        support: ConnectorSupport::Registered,
+        support: ConnectorSupport::Supported,
         fields,
         capability: CapabilityDescriptor {
             // Descriptor source identifies the adapter, not a grant to any physical target.
@@ -185,7 +188,7 @@ pub fn builtin_descriptor(adapter: &str) -> DsResult<ConnectorDescriptor> {
             max_concurrency: connections,
         },
         max_connections: NonZeroU64::new(connections as u64).expect("nonzero static limit"),
-        release_evidence: None,
+        release_evidence: Some(release_evidence),
     })
 }
 

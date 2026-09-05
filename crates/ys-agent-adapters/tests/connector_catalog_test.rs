@@ -23,8 +23,8 @@ fn catalog_has_versioned_form_metadata_and_real_factory_routes_without_io() {
     let descriptors = catalog.descriptors().unwrap();
     assert_eq!(descriptors.len(), 3);
     for descriptor in descriptors {
-        assert_eq!(descriptor.support, ConnectorSupport::Registered);
-        assert!(descriptor.release_evidence.is_none());
+        assert_eq!(descriptor.support, ConnectorSupport::Supported);
+        assert!(descriptor.release_evidence.is_some());
         assert!(descriptor.capability.supports_governed_query());
         assert!(
             catalog
@@ -73,5 +73,6 @@ fn duplicate_registration_and_unproven_supported_claim_fail_closed() {
     );
     let mut unproven = registration();
     unproven.descriptor.support = ConnectorSupport::Supported;
+    unproven.descriptor.release_evidence = None;
     assert!(BuiltinConnectorCatalog::from_registrations(vec![unproven]).is_err());
 }

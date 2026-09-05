@@ -165,15 +165,16 @@ async fn real_three_driver_forms_save_validate_select_and_set_default() {
         serde_json::to_string(&duckdb_path).unwrap(),
         serde_json::to_string(&canonical_root).unwrap(),
     );
+    let runtime_path = root.path().join("runtime.db");
+    let artifact_path = root.path().join("artifacts");
+    let vault_path = canonical_root.join("vault");
     let runtime = Arc::new(
-        ys_agent_store::SqliteRuntimeStore::open(root.path().join("runtime.db"))
+        ys_agent_store::SqliteRuntimeStore::open(&runtime_path)
             .await
             .unwrap(),
     );
     let repository: Arc<dyn DatasourceRepository> = Arc::new(runtime.datasource_repository());
-    let vault: Arc<dyn DatasourceVault> = Arc::new(LocalEncryptedDatasourceVault::new(
-        canonical_root.join("vault"),
-    ));
+    let vault: Arc<dyn DatasourceVault> = Arc::new(LocalEncryptedDatasourceVault::new(&vault_path));
     let catalog: Arc<dyn ConnectorCatalog> = Arc::new(
         BuiltinConnectorCatalog::new(
             Arc::new(PostgresConnectorFactory),
@@ -196,18 +197,19 @@ async fn real_three_driver_forms_save_validate_select_and_set_default() {
         catalog.clone(),
         policy.clone(),
     ));
-    let artifacts =
-        Arc::new(ys_agent_store::LocalArtifactStore::new(root.path().join("artifacts")).unwrap());
+    let artifacts = Arc::new(ys_agent_store::LocalArtifactStore::new(&artifact_path).unwrap());
     let active_provider = ysda::bootstrap::seed_deterministic_active_provider(runtime.as_ref())
         .await
         .unwrap();
     let agent =
         InProcessAgentService::new(workspace_id, runtime, artifacts, Arc::new(NoopRunScheduler))
             .with_run_provider_binding_source(Arc::new(
-                StaticRunProviderBindingSource::from_active(active_provider),
+                StaticRunProviderBindingSource::from_active(active_provider.clone()),
             ))
             .with_run_datasource_binding_source(Arc::new(ActiveRunDatasourceBindingSource::new(
-                repository, catalog, policy,
+                repository.clone(),
+                catalog.clone(),
+                policy.clone(),
             )));
     let session = agent
         .create_session(
@@ -295,6 +297,77 @@ async fn real_three_driver_forms_save_validate_select_and_set_default() {
     );
     assert!(final_view.snapshot.selection.current.is_some());
     assert!(final_view.snapshot.selection.workspace_default.is_some());
+
+    let restarted_runtime = Arc::new(
+        ys_agent_store::SqliteRuntimeStore::open(&runtime_path)
+            .await
+            .unwrap(),
+    );
+    let restarted_repository: Arc<dyn DatasourceRepository> =
+        Arc::new(restarted_runtime.datasource_repository());
+    let restarted_catalog: Arc<dyn ConnectorCatalog> = Arc::new(
+        BuiltinConnectorCatalog::new(
+            Arc::new(PostgresConnectorFactory),
+            Arc::new(DuckDbConnectorFactory),
+        )
+        .unwrap(),
+    );
+    let restarted_service: Arc<dyn DatasourceManagementApi> = Arc::new(DatasourceService::new(
+        restarted_repository.clone(),
+        Arc::new(LocalEncryptedDatasourceVault::new(&vault_path)),
+        restarted_catalog.clone(),
+        policy.clone(),
+    ));
+    let restarted_manager = Arc::new(ConnectorManager::new(
+        restarted_repository.clone(),
+        Arc::new(LocalEncryptedDatasourceVault::new(&vault_path)),
+        restarted_catalog.clone(),
+        policy.clone(),
+    ));
+    let restarted_agent =
+        InProcessAgentService::new(
+            workspace_id,
+            restarted_runtime,
+            Arc::new(ys_agent_store::LocalArtifactStore::new(&artifact_path).unwrap()),
+            Arc::new(NoopRunScheduler),
+        )
+        .with_run_provider_binding_source(Arc::new(StaticRunProviderBindingSource::from_active(
+            active_provider,
+        )))
+        .with_run_datasource_binding_source(Arc::new(
+            ActiveRunDatasourceBindingSource::new(restarted_repository, restarted_catalog, policy),
+        ));
+    let restarted_session = restarted_agent
+        .create_session(
+            ys_agent_core::CommandId::new(),
+            ys_agent_core::Principal::local_operator("real-tui-restarted-user"),
+        )
+        .await
+        .unwrap();
+    let restarted_scope = DatasourceScope {
+        workspace_id,
+        session_id: restarted_session.id,
+    };
+    let restarted_view = restarted_service.view(restarted_scope).await.unwrap();
+    assert_eq!(restarted_view.snapshot.profiles.len(), 3);
+    assert_eq!(
+        restarted_view.snapshot.selection.current,
+        restarted_view.snapshot.selection.workspace_default
+    );
+    runs.push(
+        query_selected(
+            &restarted_agent,
+            restarted_manager.as_ref(),
+            restarted_session.id,
+            "SELECT paid_amount FROM public.orders ORDER BY order_id LIMIT 1",
+        )
+        .await,
+    );
+    println!(
+        "datasource.release.tui=three-drivers query=real restart=verified profiles={}",
+        restarted_view.snapshot.profiles.len()
+    );
+    restarted_manager.close().await.unwrap();
 
     let mut delete_screen = DatasourceScreen::new(final_view);
     for character in "sqlite-ui".chars() {
